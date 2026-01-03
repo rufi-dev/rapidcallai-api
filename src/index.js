@@ -60,8 +60,9 @@ function computeCostUsdFromUsage(usage) {
 }
 
 const app = express();
-app.use(express.json({ limit: "2mb" }));
-const PROMPT_MAX = 20000;
+// Allow larger prompts (still bounded to protect the server).
+app.use(express.json({ limit: "10mb" }));
+const PROMPT_MAX = 200000;
 const WELCOME_TEXT_MAX = 400;
 
 const WelcomeConfigSchema = z
