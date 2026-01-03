@@ -13,6 +13,8 @@ const fs = require("fs");
 const multer = require("multer");
 
 const { readAgents, writeAgents, readCalls, writeCalls } = require("./storage");
+const { getPool, initSchema } = require("./db");
+const store = require("./store_pg");
 const { roomService, createParticipantToken } = require("./livekit");
 const { startCallEgress, stopEgress, getEgressInfo } = require("./egress");
 const { getObject } = require("./s3");
@@ -79,6 +81,8 @@ app.use(
   })
 );
 
+const USE_DB = Boolean(process.env.DATABASE_URL);
+
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
 // Serve uploaded call recordings (web-test recordings)
@@ -87,11 +91,15 @@ if (!fs.existsSync(RECORDINGS_DIR)) fs.mkdirSync(RECORDINGS_DIR, { recursive: tr
 app.use("/recordings", express.static(RECORDINGS_DIR));
 
 // --- Agent profiles (stored locally in ./data/agents.json) ---
-app.get("/api/agents", (_req, res) => {
-  res.json({ agents: readAgents() });
+app.get("/api/agents", async (_req, res) => {
+  if (USE_DB) {
+    const agents = await store.listAgents();
+    return res.json({ agents });
+  }
+  return res.json({ agents: readAgents() });
 });
 
-app.post("/api/agents", (req, res) => {
+app.post("/api/agents", async (req, res) => {
   const schema = z.object({
     name: z.string().min(1).max(60),
     promptDraft: z.string().max(PROMPT_MAX).optional(),
@@ -105,6 +113,11 @@ app.post("/api/agents", (req, res) => {
       details: parsed.error.flatten(),
       hint: `Prompt max length is ${PROMPT_MAX} characters`,
     });
+  }
+
+  if (USE_DB) {
+    const agent = await store.createAgent(parsed.data);
+    return res.status(201).json({ agent });
   }
 
   const agents = readAgents();
@@ -126,18 +139,17 @@ app.post("/api/agents", (req, res) => {
   };
   agents.unshift(agent);
   writeAgents(agents);
-  res.status(201).json({ agent });
+  return res.status(201).json({ agent });
 });
 
-app.get("/api/agents/:id", (req, res) => {
+app.get("/api/agents/:id", async (req, res) => {
   const { id } = req.params;
-  const agents = readAgents();
-  const agent = agents.find((a) => a.id === id);
+  const agent = USE_DB ? await store.getAgent(id) : readAgents().find((a) => a.id === id);
   if (!agent) return res.status(404).json({ error: "Agent not found" });
   res.json({ agent });
 });
 
-app.put("/api/agents/:id", (req, res) => {
+app.put("/api/agents/:id", async (req, res) => {
   const { id } = req.params;
   const schema = z.object({
     name: z.string().min(1).max(60).optional(),
@@ -152,6 +164,12 @@ app.put("/api/agents/:id", (req, res) => {
       details: parsed.error.flatten(),
       hint: `Prompt max length is ${PROMPT_MAX} characters`,
     });
+  }
+
+  if (USE_DB) {
+    const agent = await store.updateAgent(id, parsed.data);
+    if (!agent) return res.status(404).json({ error: "Agent not found" });
+    return res.json({ agent });
   }
 
   const agents = readAgents();
@@ -183,8 +201,12 @@ app.put("/api/agents/:id", (req, res) => {
   res.json({ agent: next });
 });
 
-app.delete("/api/agents/:id", (req, res) => {
+app.delete("/api/agents/:id", async (req, res) => {
   const { id } = req.params;
+  if (USE_DB) {
+    await store.deleteAgent(id);
+    return res.json({ ok: true });
+  }
   const agents = readAgents();
   const next = agents.filter((a) => a.id !== id);
   writeAgents(next);
@@ -204,8 +226,7 @@ app.post("/api/agents/:id/start", async (req, res) => {
     return res.status(400).json({ error: "Validation failed", details: startParsed.error.flatten() });
   }
 
-  const agents = readAgents();
-  const agent = agents.find((a) => a.id === id);
+  const agent = USE_DB ? await store.getAgent(id) : readAgents().find((a) => a.id === id);
   if (!agent) return res.status(404).json({ error: "Agent not found" });
   const promptDraft = agent.promptDraft ?? agent.prompt ?? "";
   const promptPublished = agent.promptPublished ?? "";
@@ -226,9 +247,8 @@ app.post("/api/agents/:id/start", async (req, res) => {
   const callId = `call_${nanoid(12)}`;
 
   // Persist a call record immediately (web test)
-  const calls = readCalls();
   const now = Date.now();
-  calls.unshift({
+  const callRecord = {
     id: callId,
     agentId: agent.id,
     agentName: agent.name,
@@ -241,10 +261,17 @@ app.post("/api/agents/:id/start", async (req, res) => {
     costUsd: null,
     transcript: [],
     recording: null, // will be filled if egress is enabled
+    metrics: null,
     createdAt: now,
     updatedAt: now,
-  });
-  writeCalls(calls);
+  };
+  if (USE_DB) {
+    await store.createCall(callRecord);
+  } else {
+    const calls = readCalls();
+    calls.unshift(callRecord);
+    writeCalls(calls);
+  }
 
   const rs = roomService();
   // Create the room and embed the agent prompt in room metadata so the Python agent can read it.
@@ -263,22 +290,23 @@ app.post("/api/agents/:id/start", async (req, res) => {
   try {
     const e = await startCallEgress({ roomName, callId });
     if (e.enabled) {
-      const calls2 = readCalls();
-      const idx = calls2.findIndex((c) => c.id === callId);
-      if (idx !== -1) {
-        calls2[idx] = {
-          ...calls2[idx],
-          recording: {
-            kind: "egress_s3",
-            egressId: e.egressId,
-            bucket: e.bucket,
-            key: e.key,
-            status: "recording",
-            url: `/api/calls/${callId}/recording`,
-          },
-          updatedAt: Date.now(),
-        };
-        writeCalls(calls2);
+      const recording = {
+        kind: "egress_s3",
+        egressId: e.egressId,
+        bucket: e.bucket,
+        key: e.key,
+        status: "recording",
+        url: `/api/calls/${callId}/recording`,
+      };
+      if (USE_DB) {
+        await store.updateCall(callId, { recording });
+      } else {
+        const calls2 = readCalls();
+        const idx = calls2.findIndex((c) => c.id === callId);
+        if (idx !== -1) {
+          calls2[idx] = { ...calls2[idx], recording, updatedAt: Date.now() };
+          writeCalls(calls2);
+        }
       }
     }
   } catch (e) {
@@ -305,9 +333,13 @@ app.post("/api/agents/:id/start", async (req, res) => {
 });
 
 // --- Call History (stored locally in ./data/calls.json) ---
-app.get("/api/calls", (_req, res) => {
+app.get("/api/calls", async (_req, res) => {
+  if (USE_DB) {
+    const calls = await store.listCalls();
+    return res.json({ calls });
+  }
   const calls = readCalls();
-  res.json({
+  return res.json({
     calls: calls.map((c) => ({
       id: c.id,
       agentId: c.agentId,
@@ -326,16 +358,15 @@ app.get("/api/calls", (_req, res) => {
   });
 });
 
-app.get("/api/calls/:id", (req, res) => {
+app.get("/api/calls/:id", async (req, res) => {
   const { id } = req.params;
-  const calls = readCalls();
-  const call = calls.find((c) => c.id === id);
+  const call = USE_DB ? await store.getCall(id) : readCalls().find((c) => c.id === id);
   if (!call) return res.status(404).json({ error: "Call not found" });
   res.json({ call });
 });
 
 // Called by the Python agent to attach per-call metrics (tokens/latency/cost) to the call record.
-app.post("/api/calls/:id/metrics", (req, res) => {
+app.post("/api/calls/:id/metrics", async (req, res) => {
   const { id } = req.params;
   const schema = z.object({
     usage: z
@@ -361,11 +392,8 @@ app.post("/api/calls/:id/metrics", (req, res) => {
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "Validation failed", details: parsed.error.flatten() });
 
-  const calls = readCalls();
-  const idx = calls.findIndex((c) => c.id === id);
-  if (idx === -1) return res.status(404).json({ error: "Call not found" });
-
-  const current = calls[idx];
+  const current = USE_DB ? await store.getCall(id) : readCalls().find((c) => c.id === id);
+  if (!current) return res.status(404).json({ error: "Call not found" });
   const usage = parsed.data.usage ?? current.metrics?.usage ?? null;
   const latency = parsed.data.latency ?? current.metrics?.latency ?? null;
 
@@ -386,15 +414,60 @@ app.post("/api/calls/:id/metrics", (req, res) => {
     updatedAt: Date.now(),
   };
 
+  if (USE_DB) {
+    const updated = await store.updateCall(id, { costUsd, metrics: next.metrics });
+    // eslint-disable-next-line no-console
+    console.log(
+      `Metrics saved for ${id}: tokens=${updated?.metrics?.tokensTotal ?? "—"} latencyMs=${updated?.metrics?.latency?.agent_turn_latency_ms_avg ?? "—"} costUsd=${updated?.costUsd ?? "—"}`
+    );
+    return res.json({ call: updated });
+  }
+
+  const calls = readCalls();
+  const idx = calls.findIndex((c) => c.id === id);
+  if (idx === -1) return res.status(404).json({ error: "Call not found" });
   calls[idx] = next;
   writeCalls(calls);
   // eslint-disable-next-line no-console
   console.log(`Metrics saved for ${id}: tokens=${next.metrics?.tokensTotal ?? "—"} latencyMs=${next.metrics?.latency?.agent_turn_latency_ms_avg ?? "—"} costUsd=${next.costUsd ?? "—"}`);
-  res.json({ call: next });
+  return res.json({ call: next });
 });
 
 // --- Analytics ---
-app.get("/api/analytics", (_req, res) => {
+app.get("/api/analytics", async (_req, res) => {
+  if (USE_DB) {
+    const p = getPool();
+    const { rows } = await p.query(`
+      SELECT
+        COUNT(*)::BIGINT AS call_count,
+        COUNT(*) FILTER (WHERE ended_at IS NOT NULL)::BIGINT AS completed_call_count,
+        AVG(duration_sec) FILTER (WHERE ended_at IS NOT NULL) AS avg_duration_sec,
+        AVG((metrics->'latency'->>'agent_turn_latency_ms_avg')::DOUBLE PRECISION)
+          FILTER (WHERE ended_at IS NOT NULL AND metrics IS NOT NULL AND (metrics->'latency'->>'agent_turn_latency_ms_avg') IS NOT NULL) AS avg_latency_ms,
+        SUM(cost_usd) FILTER (WHERE ended_at IS NOT NULL AND cost_usd IS NOT NULL) AS total_cost_usd,
+        SUM((metrics->>'tokensTotal')::BIGINT)
+          FILTER (WHERE ended_at IS NOT NULL AND metrics IS NOT NULL AND (metrics->>'tokensTotal') IS NOT NULL) AS total_tokens
+      FROM calls
+    `);
+
+    const r = rows[0] || {};
+    const avgDurationSec = r.avg_duration_sec == null ? null : Math.round(Number(r.avg_duration_sec));
+    const avgLatencyMs = r.avg_latency_ms == null ? null : Math.round(Number(r.avg_latency_ms));
+    const totalCostUsd = r.total_cost_usd == null ? null : Math.round(Number(r.total_cost_usd) * 10000) / 10000;
+    const totalTokens = r.total_tokens == null ? null : Number(r.total_tokens);
+
+    return res.json({
+      totals: {
+        callCount: Number(r.call_count || 0),
+        completedCallCount: Number(r.completed_call_count || 0),
+        avgDurationSec,
+        avgLatencyMs,
+        totalCostUsd,
+        totalTokens,
+      },
+    });
+  }
+
   const calls = readCalls();
   const completed = calls.filter((c) => c.endedAt);
   const count = calls.length;
@@ -417,7 +490,7 @@ app.get("/api/analytics", (_req, res) => {
     .filter((v) => typeof v === "number" && Number.isFinite(v));
   const totalTokens = tokenValues.length ? tokenValues.reduce((a, v) => a + v, 0) : null;
 
-  res.json({
+  return res.json({
     totals: {
       callCount: count,
       completedCallCount: completedCount,
@@ -429,8 +502,76 @@ app.get("/api/analytics", (_req, res) => {
   });
 });
 
-app.get("/api/agents/:id/analytics", (req, res) => {
+app.get("/api/agents/:id/analytics", async (req, res) => {
   const { id } = req.params;
+
+  if (USE_DB) {
+    const p = getPool();
+    const { rows } = await p.query(
+      `
+      SELECT
+        COUNT(*)::BIGINT AS call_count,
+        COUNT(*) FILTER (WHERE ended_at IS NOT NULL)::BIGINT AS completed_call_count,
+        AVG(duration_sec) FILTER (WHERE ended_at IS NOT NULL) AS avg_duration_sec,
+        AVG((metrics->'latency'->>'agent_turn_latency_ms_avg')::DOUBLE PRECISION)
+          FILTER (WHERE ended_at IS NOT NULL AND metrics IS NOT NULL AND (metrics->'latency'->>'agent_turn_latency_ms_avg') IS NOT NULL) AS avg_latency_ms,
+        SUM(cost_usd) FILTER (WHERE ended_at IS NOT NULL AND cost_usd IS NOT NULL) AS total_cost_usd,
+        SUM((metrics->>'tokensTotal')::BIGINT)
+          FILTER (WHERE ended_at IS NOT NULL AND metrics IS NOT NULL AND (metrics->>'tokensTotal') IS NOT NULL) AS total_tokens
+      FROM calls
+      WHERE agent_id=$1
+    `,
+      [id]
+    );
+
+    const { rows: latestRows } = await p.query(
+      `
+      SELECT
+        id,
+        ended_at,
+        duration_sec,
+        cost_usd,
+        (metrics->>'tokensTotal')::BIGINT AS tokens_total,
+        (metrics->'latency'->>'agent_turn_latency_ms_avg')::DOUBLE PRECISION AS latency_ms
+      FROM calls
+      WHERE agent_id=$1 AND ended_at IS NOT NULL
+      ORDER BY ended_at DESC
+      LIMIT 1
+    `,
+      [id]
+    );
+
+    const r = rows[0] || {};
+    const avgDurationSec = r.avg_duration_sec == null ? null : Math.round(Number(r.avg_duration_sec));
+    const avgLatencyMs = r.avg_latency_ms == null ? null : Math.round(Number(r.avg_latency_ms));
+    const totalCostUsd = r.total_cost_usd == null ? null : Math.round(Number(r.total_cost_usd) * 10000) / 10000;
+    const totalTokens = r.total_tokens == null ? null : Number(r.total_tokens);
+
+    const latest = latestRows[0] || null;
+
+    return res.json({
+      agentId: id,
+      totals: {
+        callCount: Number(r.call_count || 0),
+        completedCallCount: Number(r.completed_call_count || 0),
+        avgDurationSec,
+        avgLatencyMs,
+        totalCostUsd,
+        totalTokens,
+      },
+      latest: latest
+        ? {
+            callId: latest.id,
+            endedAt: latest.ended_at,
+            durationSec: latest.duration_sec,
+            costUsd: latest.cost_usd ?? null,
+            tokensTotal: latest.tokens_total ?? null,
+            latencyMs: latest.latency_ms ?? null,
+          }
+        : null,
+    });
+  }
+
   const calls = readCalls().filter((c) => c.agentId === id);
   const completed = calls.filter((c) => c.endedAt);
   const completedCount = completed.length;
@@ -481,8 +622,7 @@ app.get("/api/agents/:id/analytics", (req, res) => {
 // Stream the call recording (supports Range requests for <audio> playback).
 app.get("/api/calls/:id/recording", async (req, res) => {
   const { id } = req.params;
-  const calls = readCalls();
-  const call = calls.find((c) => c.id === id);
+  const call = USE_DB ? await store.getCall(id) : readCalls().find((c) => c.id === id);
   if (!call) return res.status(404).send("Call not found");
   if (!call.recording || call.recording.kind !== "egress_s3") return res.status(404).send("No recording");
 
@@ -513,7 +653,7 @@ app.get("/api/calls/:id/recording", async (req, res) => {
   }
 });
 
-app.post("/api/calls/:id/end", (req, res) => {
+app.post("/api/calls/:id/end", async (req, res) => {
   const { id } = req.params;
   const schema = z.object({
     outcome: z.string().min(1).max(80).optional(),
@@ -533,11 +673,8 @@ app.post("/api/calls/:id/end", (req, res) => {
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "Validation failed", details: parsed.error.flatten() });
 
-  const calls = readCalls();
-  const idx = calls.findIndex((c) => c.id === id);
-  if (idx === -1) return res.status(404).json({ error: "Call not found" });
-
-  const current = calls[idx];
+  const current = USE_DB ? await store.getCall(id) : readCalls().find((c) => c.id === id);
+  if (!current) return res.status(404).json({ error: "Call not found" });
   const now = Date.now();
   const endedAt = current.endedAt ?? now;
   const durationSec = Math.max(0, Math.round((endedAt - current.startedAt) / 1000));
@@ -574,29 +711,39 @@ app.post("/api/calls/:id/end", (req, res) => {
           const status = info?.status;
           if (status === 3) {
             // EGRESS_COMPLETE
-            const calls3 = readCalls();
-            const idx3 = calls3.findIndex((c) => c.id === id);
-            if (idx3 !== -1 && calls3[idx3].recording?.kind === "egress_s3") {
-              calls3[idx3] = {
-                ...calls3[idx3],
-                recording: { ...calls3[idx3].recording, status: "ready" },
-                updatedAt: Date.now(),
-              };
-              writeCalls(calls3);
+            if (USE_DB) {
+              const c = await store.getCall(id);
+              if (c?.recording?.kind === "egress_s3") await store.updateCall(id, { recording: { ...c.recording, status: "ready" } });
+            } else {
+              const calls3 = readCalls();
+              const idx3 = calls3.findIndex((c) => c.id === id);
+              if (idx3 !== -1 && calls3[idx3].recording?.kind === "egress_s3") {
+                calls3[idx3] = {
+                  ...calls3[idx3],
+                  recording: { ...calls3[idx3].recording, status: "ready" },
+                  updatedAt: Date.now(),
+                };
+                writeCalls(calls3);
+              }
             }
             return;
           }
           if (status === 4 || status === 5) {
             // EGRESS_FAILED / EGRESS_ABORTED
-            const calls3 = readCalls();
-            const idx3 = calls3.findIndex((c) => c.id === id);
-            if (idx3 !== -1 && calls3[idx3].recording?.kind === "egress_s3") {
-              calls3[idx3] = {
-                ...calls3[idx3],
-                recording: { ...calls3[idx3].recording, status: "failed" },
-                updatedAt: Date.now(),
-              };
-              writeCalls(calls3);
+            if (USE_DB) {
+              const c = await store.getCall(id);
+              if (c?.recording?.kind === "egress_s3") await store.updateCall(id, { recording: { ...c.recording, status: "failed" } });
+            } else {
+              const calls3 = readCalls();
+              const idx3 = calls3.findIndex((c) => c.id === id);
+              if (idx3 !== -1 && calls3[idx3].recording?.kind === "egress_s3") {
+                calls3[idx3] = {
+                  ...calls3[idx3],
+                  recording: { ...calls3[idx3].recording, status: "failed" },
+                  updatedAt: Date.now(),
+                };
+                writeCalls(calls3);
+              }
             }
             return;
           }
@@ -608,9 +755,24 @@ app.post("/api/calls/:id/end", (req, res) => {
     }, 0);
   }
 
+  if (USE_DB) {
+    const updated = await store.updateCall(id, {
+      endedAt: next.endedAt,
+      durationSec: next.durationSec,
+      outcome: next.outcome,
+      costUsd: next.costUsd,
+      transcript: next.transcript,
+      recording: next.recording ?? null,
+    });
+    return res.json({ call: updated });
+  }
+
+  const calls = readCalls();
+  const idx = calls.findIndex((c) => c.id === id);
+  if (idx === -1) return res.status(404).json({ error: "Call not found" });
   calls[idx] = next;
   writeCalls(calls);
-  res.json({ call: next });
+  return res.json({ call: next });
 });
 
 const upload = multer({
@@ -618,11 +780,11 @@ const upload = multer({
   limits: { fileSize: 50 * 1024 * 1024 },
 });
 
-app.post("/api/calls/:id/recording", upload.single("file"), (req, res) => {
+app.post("/api/calls/:id/recording", upload.single("file"), async (req, res) => {
   const { id } = req.params;
   const calls = readCalls();
   const idx = calls.findIndex((c) => c.id === id);
-  if (idx === -1) return res.status(404).json({ error: "Call not found" });
+  if (idx === -1 && !USE_DB) return res.status(404).json({ error: "Call not found" });
   if (!req.file) return res.status(400).json({ error: "Missing file" });
 
   const ext = req.file.mimetype.includes("webm") ? "webm" : req.file.mimetype.includes("ogg") ? "ogg" : "bin";
@@ -632,52 +794,76 @@ app.post("/api/calls/:id/recording", upload.single("file"), (req, res) => {
 
   const url = `/recordings/${filename}`;
   const now = Date.now();
-  const next = {
-    ...calls[idx],
-    recording: {
-      filename,
-      mime: req.file.mimetype,
-      sizeBytes: req.file.size,
-      url,
-    },
-    updatedAt: now,
+  const recording = {
+    filename,
+    mime: req.file.mimetype,
+    sizeBytes: req.file.size,
+    url,
   };
+
+  if (USE_DB) {
+    const updated = await store.updateCall(id, { recording });
+    if (!updated) return res.status(404).json({ error: "Call not found" });
+    return res.json({ ok: true, recordingUrl: url, call: updated });
+  }
+
+  const next = { ...calls[idx], recording, updatedAt: now };
   calls[idx] = next;
   writeCalls(calls);
-  res.json({ ok: true, recordingUrl: url, call: next });
+  return res.json({ ok: true, recordingUrl: url, call: next });
 });
 
 const port = Number(process.env.PORT || 8787);
-app.listen(port, () => {
-  // eslint-disable-next-line no-console
-  console.log(`Server listening on http://localhost:${port}`);
-  // eslint-disable-next-line no-console
-  console.log(`CORS origin: ${clientOrigin}`);
-  // eslint-disable-next-line no-console
-  console.log(
-    `Egress(S3) enabled: ${Boolean(process.env.EGRESS_S3_BUCKET && process.env.EGRESS_S3_REGION)} (bucket=${
-      process.env.EGRESS_S3_BUCKET || "—"
-    }, region=${process.env.EGRESS_S3_REGION || "—"})`
-  );
+async function main() {
+  if (USE_DB) {
+    try {
+      await initSchema();
+      // eslint-disable-next-line no-console
+      console.log("Postgres: schema ready.");
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.error("Postgres init failed:", e?.message || e);
+      process.exit(1);
+    }
+  } else {
+    // eslint-disable-next-line no-console
+    console.warn("DATABASE_URL not set; falling back to local JSON storage (./data/*.json).");
+  }
 
-  // Safe debug to catch common .env mistakes (like trailing spaces in keys).
-  // eslint-disable-next-line no-console
-  const envKeys = Object.keys(process.env);
-  const egressKeys = envKeys.filter((k) => k.includes("EGRESS_S3_")).sort();
-  const suspiciousKeys = envKeys
-    .filter((k) => k.trim().startsWith("EGRESS_S3_") && k !== k.trim())
-    .sort();
-  // eslint-disable-next-line no-console
-  console.log(
-    `Egress(S3) env keys loaded: ${egressKeys
-      .map((k) => {
-        const v = process.env[k];
-        const redacted =
-          k.includes("SECRET") || k.includes("ACCESS_KEY") ? (v ? "***set***" : "—") : v || "—";
-        return `${k}=${redacted}`;
-      })
-      .join(", ") || "none"}`
-  );
-  // eslint-disable-next-line no-console
-  if (suspiciousKeys.length) console.log(`Egress(S3) WARNING: suspicious keys (whitespace): ${suspiciousKeys.join(", ")}`);
-});
+  app.listen(port, () => {
+    // eslint-disable-next-line no-console
+    console.log(`Server listening on http://localhost:${port}`);
+    // eslint-disable-next-line no-console
+    console.log(`CORS origin: ${clientOrigin}`);
+    // eslint-disable-next-line no-console
+    console.log(
+      `Egress(S3) enabled: ${Boolean(process.env.EGRESS_S3_BUCKET && process.env.EGRESS_S3_REGION)} (bucket=${
+        process.env.EGRESS_S3_BUCKET || "—"
+      }, region=${process.env.EGRESS_S3_REGION || "—"})`
+    );
+
+    // Safe debug to catch common .env mistakes (like trailing spaces in keys).
+    // eslint-disable-next-line no-console
+    const envKeys = Object.keys(process.env);
+    const egressKeys = envKeys.filter((k) => k.includes("EGRESS_S3_")).sort();
+    const suspiciousKeys = envKeys
+      .filter((k) => k.trim().startsWith("EGRESS_S3_") && k !== k.trim())
+      .sort();
+    // eslint-disable-next-line no-console
+    console.log(
+      `Egress(S3) env keys loaded: ${egressKeys
+        .map((k) => {
+          const v = process.env[k];
+          const redacted =
+            k.includes("SECRET") || k.includes("ACCESS_KEY") ? (v ? "***set***" : "—") : v || "—";
+          return `${k}=${redacted}`;
+        })
+        .join(", ") || "none"}`
+    );
+    // eslint-disable-next-line no-console
+    if (suspiciousKeys.length)
+      console.log(`Egress(S3) WARNING: suspicious keys (whitespace): ${suspiciousKeys.join(", ")}`);
+  });
+}
+
+main();
