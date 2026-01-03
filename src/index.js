@@ -73,10 +73,21 @@ const WelcomeConfigSchema = z
   })
   .optional();
 
-const clientOrigin = process.env.CLIENT_ORIGIN || "http://localhost:5173";
+// Allow one or many origins. Use comma-separated list in CLIENT_ORIGIN, e.g.:
+// CLIENT_ORIGIN=https://dashboard.rapidcallai.com,http://localhost:5173
+const clientOrigins = String(process.env.CLIENT_ORIGIN || "http://localhost:5173")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
 app.use(
   cors({
-    origin: clientOrigin,
+    origin(origin, cb) {
+      // Allow non-browser requests (no Origin header)
+      if (!origin) return cb(null, true);
+      if (clientOrigins.includes(origin)) return cb(null, true);
+      return cb(new Error(`CORS blocked for origin: ${origin}`));
+    },
     credentials: true,
   })
 );
@@ -834,7 +845,7 @@ async function main() {
     // eslint-disable-next-line no-console
     console.log(`Server listening on http://localhost:${port}`);
     // eslint-disable-next-line no-console
-    console.log(`CORS origin: ${clientOrigin}`);
+    console.log(`CORS origin(s): ${clientOrigins.join(", ")}`);
     // eslint-disable-next-line no-console
     console.log(
       `Egress(S3) enabled: ${Boolean(process.env.EGRESS_S3_BUCKET && process.env.EGRESS_S3_REGION)} (bucket=${
