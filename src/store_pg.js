@@ -176,7 +176,9 @@ async function updatePhoneNumber(id, patch) {
   const existing = await getPhoneNumber(id);
   if (!existing) return null;
 
-  const next = { ...existing, ...patch, updatedAt: Date.now() };
+  // Ignore undefined patch fields so partial updates don't erase existing values.
+  const safePatch = Object.fromEntries(Object.entries(patch || {}).filter(([, v]) => v !== undefined));
+  const next = { ...existing, ...safePatch, updatedAt: Date.now() };
   const allowedIn = Array.isArray(next.allowedInboundCountries) ? next.allowedInboundCountries : ["all"];
   const allowedOut = Array.isArray(next.allowedOutboundCountries) ? next.allowedOutboundCountries : ["all"];
 

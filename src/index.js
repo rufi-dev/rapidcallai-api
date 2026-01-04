@@ -142,6 +142,10 @@ function normalizeCountries(v) {
   return ["all"];
 }
 
+function stripUndefined(obj) {
+  return Object.fromEntries(Object.entries(obj).filter(([, v]) => v !== undefined));
+}
+
 // Serve uploaded call recordings (web-test recordings)
 const RECORDINGS_DIR = path.join(__dirname, "..", "recordings");
 if (!fs.existsSync(RECORDINGS_DIR)) fs.mkdirSync(RECORDINGS_DIR, { recursive: true });
@@ -535,15 +539,19 @@ app.put("/api/phone-numbers/:id", async (req, res) => {
     return res.status(400).json({ error: "Validation failed", details: parsed.error.flatten() });
   }
 
-  const patch = {
+  // IMPORTANT: only apply fields the client actually sent.
+  // Otherwise undefined values would overwrite existing values (e.g. saving trunk clears agent).
+  const patch = stripUndefined({
     label: parsed.data.label,
     inboundAgentId: parsed.data.inboundAgentId,
     outboundAgentId: parsed.data.outboundAgentId,
     livekitInboundTrunkId: parsed.data.livekitInboundTrunkId,
     livekitOutboundTrunkId: parsed.data.livekitOutboundTrunkId,
-    allowedInboundCountries: normalizeCountries(parsed.data.allowedInboundCountries),
-    allowedOutboundCountries: normalizeCountries(parsed.data.allowedOutboundCountries),
-  };
+    allowedInboundCountries:
+      parsed.data.allowedInboundCountries === undefined ? undefined : normalizeCountries(parsed.data.allowedInboundCountries),
+    allowedOutboundCountries:
+      parsed.data.allowedOutboundCountries === undefined ? undefined : normalizeCountries(parsed.data.allowedOutboundCountries),
+  });
 
   if (USE_DB) {
     const phoneNumber = await store.updatePhoneNumber(id, patch);
