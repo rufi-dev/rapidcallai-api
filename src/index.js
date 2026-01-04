@@ -581,15 +581,22 @@ app.delete("/api/phone-numbers/:id", async (req, res) => {
 });
 
 // --- Twilio inbound webhook -> bridge into LiveKit SIP (Phase 3) ---
+app.get("/api/twilio/inbound", async (_req, res) => {
+  // Useful for quick connectivity tests from browser/curl.
+  res.json({ ok: true });
+});
+
 app.post("/api/twilio/inbound", async (req, res) => {
   // Twilio sends form fields like: To, From, CallSid, ...
   const to = String(req.body?.To || "").trim();
   const from = String(req.body?.From || "").trim();
+  const twilioCallSid = String(req.body?.CallSid || "").trim();
 
   const VoiceResponse = require("twilio").twiml.VoiceResponse;
   const vr = new VoiceResponse();
 
   if (!to) {
+    console.log("[twilio-inbound] missing To", { twilioCallSid, bodyKeys: Object.keys(req.body || {}) });
     vr.say("Missing To number.");
     res.type("text/xml").send(vr.toString());
     return;
@@ -638,6 +645,7 @@ app.post("/api/twilio/inbound", async (req, res) => {
 
   const sipTemplate = String(process.env.LIVEKIT_SIP_URI_TEMPLATE || "").trim();
   if (!sipTemplate || !sipTemplate.includes("{room}")) {
+    console.log("[twilio-inbound] LIVEKIT_SIP_URI_TEMPLATE not set", { twilioCallSid, to, from });
     vr.say("LiveKit SIP is not configured.");
     res.type("text/xml").send(vr.toString());
     return;
@@ -727,8 +735,19 @@ app.post("/api/twilio/inbound", async (req, res) => {
     // ignore recording errors for call setup
   }
 
-  const sipUri = sipTemplate.replaceAll("{room}", roomName);
-  vr.dial().sip(sipUri);
+  let sipUri = sipTemplate.replaceAll("{room}", roomName);
+  if (!sipUri.startsWith("sip:")) sipUri = `sip:${sipUri}`;
+
+  console.log("[twilio-inbound] dial", {
+    twilioCallSid,
+    to,
+    from,
+    roomName,
+    callId,
+    sipUri,
+  });
+
+  vr.dial({ answerOnBridge: true }).sip(sipUri);
   res.type("text/xml").send(vr.toString());
 });
 
