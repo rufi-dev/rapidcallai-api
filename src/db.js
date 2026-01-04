@@ -31,6 +31,16 @@ async function initSchema() {
   if (!p) return false;
 
   await p.query(`
+    CREATE TABLE IF NOT EXISTS workspaces (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      twilio_subaccount_sid TEXT NULL,
+      created_at BIGINT NOT NULL,
+      updated_at BIGINT NOT NULL
+    );
+  `);
+
+  await p.query(`
     CREATE TABLE IF NOT EXISTS agents (
       id TEXT PRIMARY KEY,
       name TEXT NOT NULL,
@@ -64,6 +74,27 @@ async function initSchema() {
   `);
 
   await p.query(`CREATE INDEX IF NOT EXISTS calls_agent_started_idx ON calls(agent_id, started_at DESC);`);
+
+  await p.query(`
+    CREATE TABLE IF NOT EXISTS phone_numbers (
+      id TEXT PRIMARY KEY,
+      workspace_id TEXT NOT NULL,
+      e164 TEXT NOT NULL,
+      label TEXT NOT NULL DEFAULT '',
+      provider TEXT NOT NULL DEFAULT 'twilio',
+      status TEXT NOT NULL DEFAULT 'unconfigured',
+      twilio_number_sid TEXT NULL,
+      inbound_agent_id TEXT NULL,
+      outbound_agent_id TEXT NULL,
+      allowed_inbound_countries JSONB NOT NULL DEFAULT '["all"]'::jsonb,
+      allowed_outbound_countries JSONB NOT NULL DEFAULT '["all"]'::jsonb,
+      created_at BIGINT NOT NULL,
+      updated_at BIGINT NOT NULL
+    );
+  `);
+
+  await p.query(`CREATE INDEX IF NOT EXISTS phone_numbers_workspace_idx ON phone_numbers(workspace_id, created_at DESC);`);
+  await p.query(`CREATE UNIQUE INDEX IF NOT EXISTS phone_numbers_workspace_e164_uniq ON phone_numbers(workspace_id, e164);`);
 
   return true;
 }
