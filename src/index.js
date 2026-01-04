@@ -305,14 +305,16 @@ app.post("/api/workspaces", async (req, res) => {
 // --- Twilio (Phase 2) ---
 app.get("/api/workspaces/:id/twilio", async (req, res) => {
   const id = String(req.params.id);
-  const ws = USE_DB ? await store.getWorkspace(id) : readWorkspaces().find((w) => w.id === id);
+  let ws = USE_DB ? await store.getWorkspace(id) : readWorkspaces().find((w) => w.id === id);
+  if (!ws && id === DEFAULT_WORKSPACE_ID) ws = await ensureDefaultWorkspace();
   if (!ws) return res.status(404).json({ error: "Workspace not found" });
   return res.json({ workspace: ws, twilioConfigured: Boolean(tw.getMasterCreds()) });
 });
 
 app.post("/api/workspaces/:id/twilio/subaccount", async (req, res) => {
   const id = String(req.params.id);
-  const ws = USE_DB ? await store.getWorkspace(id) : readWorkspaces().find((w) => w.id === id);
+  let ws = USE_DB ? await store.getWorkspace(id) : readWorkspaces().find((w) => w.id === id);
+  if (!ws && id === DEFAULT_WORKSPACE_ID) ws = await ensureDefaultWorkspace();
   if (!ws) return res.status(404).json({ error: "Workspace not found" });
 
   try {
@@ -339,7 +341,8 @@ app.post("/api/workspaces/:id/twilio/subaccount", async (req, res) => {
 
 app.get("/api/workspaces/:id/twilio/available-numbers", async (req, res) => {
   const id = String(req.params.id);
-  const ws = USE_DB ? await store.getWorkspace(id) : readWorkspaces().find((w) => w.id === id);
+  let ws = USE_DB ? await store.getWorkspace(id) : readWorkspaces().find((w) => w.id === id);
+  if (!ws && id === DEFAULT_WORKSPACE_ID) ws = await ensureDefaultWorkspace();
   if (!ws) return res.status(404).json({ error: "Workspace not found" });
 
   try {
@@ -358,7 +361,8 @@ app.get("/api/workspaces/:id/twilio/available-numbers", async (req, res) => {
 
 app.post("/api/workspaces/:id/twilio/buy-number", async (req, res) => {
   const id = String(req.params.id);
-  const ws = USE_DB ? await store.getWorkspace(id) : readWorkspaces().find((w) => w.id === id);
+  let ws = USE_DB ? await store.getWorkspace(id) : readWorkspaces().find((w) => w.id === id);
+  if (!ws && id === DEFAULT_WORKSPACE_ID) ws = await ensureDefaultWorkspace();
   if (!ws) return res.status(404).json({ error: "Workspace not found" });
 
   const schema = z.object({
