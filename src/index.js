@@ -523,6 +523,8 @@ app.put("/api/phone-numbers/:id", async (req, res) => {
     label: z.string().max(120).optional(),
     inboundAgentId: z.string().min(1).nullable().optional(),
     outboundAgentId: z.string().min(1).nullable().optional(),
+    livekitInboundTrunkId: z.string().min(1).nullable().optional(),
+    livekitOutboundTrunkId: z.string().min(1).nullable().optional(),
     allowedInboundCountries: z.union([z.array(z.string()), z.string()]).optional(),
     allowedOutboundCountries: z.union([z.array(z.string()), z.string()]).optional(),
   });
@@ -535,6 +537,8 @@ app.put("/api/phone-numbers/:id", async (req, res) => {
     label: parsed.data.label,
     inboundAgentId: parsed.data.inboundAgentId,
     outboundAgentId: parsed.data.outboundAgentId,
+    livekitInboundTrunkId: parsed.data.livekitInboundTrunkId,
+    livekitOutboundTrunkId: parsed.data.livekitOutboundTrunkId,
     allowedInboundCountries: normalizeCountries(parsed.data.allowedInboundCountries),
     allowedOutboundCountries: normalizeCountries(parsed.data.allowedOutboundCountries),
   };

@@ -84,6 +84,8 @@ async function initSchema() {
       provider TEXT NOT NULL DEFAULT 'twilio',
       status TEXT NOT NULL DEFAULT 'unconfigured',
       twilio_number_sid TEXT NULL,
+      livekit_inbound_trunk_id TEXT NULL,
+      livekit_outbound_trunk_id TEXT NULL,
       inbound_agent_id TEXT NULL,
       outbound_agent_id TEXT NULL,
       allowed_inbound_countries JSONB NOT NULL DEFAULT '["all"]'::jsonb,
@@ -92,6 +94,10 @@ async function initSchema() {
       updated_at BIGINT NOT NULL
     );
   `);
+
+  // Backward-compatible schema upgrades (when table already exists)
+  await p.query(`ALTER TABLE phone_numbers ADD COLUMN IF NOT EXISTS livekit_inbound_trunk_id TEXT NULL;`);
+  await p.query(`ALTER TABLE phone_numbers ADD COLUMN IF NOT EXISTS livekit_outbound_trunk_id TEXT NULL;`);
 
   await p.query(`CREATE INDEX IF NOT EXISTS phone_numbers_workspace_idx ON phone_numbers(workspace_id, created_at DESC);`);
   await p.query(`CREATE UNIQUE INDEX IF NOT EXISTS phone_numbers_workspace_e164_uniq ON phone_numbers(workspace_id, e164);`);

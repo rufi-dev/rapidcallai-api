@@ -53,6 +53,8 @@ function rowToPhoneNumber(r) {
     provider: r.provider ?? "twilio",
     status: r.status ?? "unconfigured",
     twilioNumberSid: r.twilio_number_sid ?? null,
+    livekitInboundTrunkId: r.livekit_inbound_trunk_id ?? null,
+    livekitOutboundTrunkId: r.livekit_outbound_trunk_id ?? null,
     inboundAgentId: r.inbound_agent_id ?? null,
     outboundAgentId: r.outbound_agent_id ?? null,
     allowedInboundCountries: r.allowed_inbound_countries ?? ["all"],
@@ -141,10 +143,11 @@ async function createPhoneNumber(input) {
   const { rows } = await p.query(
     `
     INSERT INTO phone_numbers
-      (id, workspace_id, e164, label, provider, status, twilio_number_sid, inbound_agent_id, outbound_agent_id,
+      (id, workspace_id, e164, label, provider, status, twilio_number_sid, livekit_inbound_trunk_id, livekit_outbound_trunk_id,
+       inbound_agent_id, outbound_agent_id,
        allowed_inbound_countries, allowed_outbound_countries, created_at, updated_at)
     VALUES
-      ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+      ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
     RETURNING *
   `,
     [
@@ -155,6 +158,8 @@ async function createPhoneNumber(input) {
       input.provider ?? "twilio",
       input.status ?? "unconfigured",
       input.twilioNumberSid ?? null,
+      input.livekitInboundTrunkId ?? null,
+      input.livekitOutboundTrunkId ?? null,
       input.inboundAgentId ?? null,
       input.outboundAgentId ?? null,
       JSON.stringify(allowedIn),
@@ -181,11 +186,13 @@ async function updatePhoneNumber(id, patch) {
     SET label=$2,
         status=$3,
         twilio_number_sid=$4,
-        inbound_agent_id=$5,
-        outbound_agent_id=$6,
-        allowed_inbound_countries=$7,
-        allowed_outbound_countries=$8,
-        updated_at=$9
+        livekit_inbound_trunk_id=$5,
+        livekit_outbound_trunk_id=$6,
+        inbound_agent_id=$7,
+        outbound_agent_id=$8,
+        allowed_inbound_countries=$9,
+        allowed_outbound_countries=$10,
+        updated_at=$11
     WHERE id=$1
     RETURNING *
   `,
@@ -194,6 +201,8 @@ async function updatePhoneNumber(id, patch) {
       next.label ?? "",
       next.status ?? "unconfigured",
       next.twilioNumberSid ?? null,
+      next.livekitInboundTrunkId ?? null,
+      next.livekitOutboundTrunkId ?? null,
       next.inboundAgentId ?? null,
       next.outboundAgentId ?? null,
       JSON.stringify(allowedIn),
