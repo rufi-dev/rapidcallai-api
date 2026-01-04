@@ -72,6 +72,8 @@ function computeCostUsdFromUsage(usage) {
 const app = express();
 // Allow larger prompts (still bounded to protect the server).
 app.use(express.json({ limit: "10mb" }));
+// Twilio webhooks POST as application/x-www-form-urlencoded by default.
+app.use(express.urlencoded({ extended: false }));
 const PROMPT_MAX = 200000;
 const WELCOME_TEXT_MAX = 400;
 
@@ -568,6 +570,158 @@ app.delete("/api/phone-numbers/:id", async (req, res) => {
   const rows = readPhoneNumbers().filter((p) => p.id !== id);
   writePhoneNumbers(rows);
   return res.json({ ok: true });
+});
+
+// --- Twilio inbound webhook -> bridge into LiveKit SIP (Phase 3) ---
+app.post("/api/twilio/inbound", async (req, res) => {
+  // Twilio sends form fields like: To, From, CallSid, ...
+  const to = String(req.body?.To || "").trim();
+  const from = String(req.body?.From || "").trim();
+
+  const VoiceResponse = require("twilio").twiml.VoiceResponse;
+  const vr = new VoiceResponse();
+
+  if (!to) {
+    vr.say("Missing To number.");
+    res.type("text/xml").send(vr.toString());
+    return;
+  }
+
+  // Find phone number config
+  const ws = await ensureDefaultWorkspace();
+  const workspaceId = ws.id;
+  let phoneRow = null;
+
+  if (USE_DB) {
+    const rows = await store.listPhoneNumbers(workspaceId);
+    phoneRow = rows.find((p) => p.e164 === to) ?? null;
+  } else {
+    phoneRow = readPhoneNumbers().find((p) => p.workspaceId === workspaceId && p.e164 === to) ?? null;
+  }
+
+  if (!phoneRow) {
+    vr.say("This number is not configured yet.");
+    res.type("text/xml").send(vr.toString());
+    return;
+  }
+
+  const agentId = phoneRow.inboundAgentId;
+  if (!agentId) {
+    vr.say("Inbound agent is not configured yet.");
+    res.type("text/xml").send(vr.toString());
+    return;
+  }
+
+  const agent = USE_DB ? await store.getAgent(agentId) : readAgents().find((a) => a.id === agentId);
+  if (!agent) {
+    vr.say("Inbound agent was not found.");
+    res.type("text/xml").send(vr.toString());
+    return;
+  }
+
+  const promptDraft = agent.promptDraft ?? agent.prompt ?? "";
+  const promptPublished = agent.promptPublished ?? "";
+  const promptUsed = (promptDraft && String(promptDraft).trim()) ? promptDraft : promptPublished;
+  if (!promptUsed || String(promptUsed).trim().length === 0) {
+    vr.say("Agent prompt is empty.");
+    res.type("text/xml").send(vr.toString());
+    return;
+  }
+
+  const sipTemplate = String(process.env.LIVEKIT_SIP_URI_TEMPLATE || "").trim();
+  if (!sipTemplate || !sipTemplate.includes("{room}")) {
+    vr.say("LiveKit SIP is not configured.");
+    res.type("text/xml").send(vr.toString());
+    return;
+  }
+
+  // Use the same naming scheme as web tests so your existing LiveKit Agent deployment joins.
+  const roomName = `agent-${agentId}-${nanoid(6)}`;
+  const callId = `call_${nanoid(12)}`;
+
+  // Persist call immediately
+  const now = Date.now();
+  const callRecord = {
+    id: callId,
+    agentId: agent.id,
+    agentName: agent.name,
+    // In call history, show caller as "to" so it's visible.
+    to: from || "unknown",
+    roomName,
+    startedAt: now,
+    endedAt: null,
+    durationSec: null,
+    outcome: "in_progress",
+    costUsd: null,
+    transcript: [],
+    recording: null,
+    metrics: null,
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  if (USE_DB) {
+    await store.createCall(callRecord);
+  } else {
+    const calls = readCalls();
+    calls.unshift(callRecord);
+    writeCalls(calls);
+  }
+
+  // Create room with metadata so the LiveKit Agent can read prompt/callId
+  const rs = roomService();
+  const welcome = {
+    mode: agent.welcome?.mode ?? "user",
+    aiMessageMode: agent.welcome?.aiMessageMode ?? "dynamic",
+    aiMessageText: agent.welcome?.aiMessageText ?? "",
+    aiDelaySeconds: agent.welcome?.aiDelaySeconds ?? 0,
+  };
+
+  const roomMeta = JSON.stringify({
+    agentId: agent.id,
+    agentName: agent.name,
+    prompt: promptUsed,
+    callId,
+    welcome,
+    direction: "inbound",
+    twilio: { to, from },
+  });
+
+  try {
+    await rs.createRoom({ name: roomName, emptyTimeout: 10, metadata: roomMeta });
+  } catch (e) {
+    // Room might already exist; ignore if so.
+  }
+
+  // Start recording if Egress is enabled (same as web test)
+  try {
+    const e = await startCallEgress({ roomName, callId });
+    if (e) {
+      const recording = {
+        kind: "egress_s3",
+        egressId: e.egressId,
+        bucket: e.bucket,
+        key: e.key,
+        status: "recording",
+        url: `/api/calls/${encodeURIComponent(callId)}/recording`,
+      };
+      if (USE_DB) await store.updateCall(callId, { recording });
+      else {
+        const calls = readCalls();
+        const idx = calls.findIndex((c) => c.id === callId);
+        if (idx >= 0) {
+          calls[idx] = { ...calls[idx], recording, updatedAt: Date.now() };
+          writeCalls(calls);
+        }
+      }
+    }
+  } catch {
+    // ignore recording errors for call setup
+  }
+
+  const sipUri = sipTemplate.replaceAll("{room}", roomName);
+  vr.dial().sip(sipUri);
+  res.type("text/xml").send(vr.toString());
 });
 
 // --- Start a voice session for an agent profile ---
