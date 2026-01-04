@@ -12,12 +12,22 @@ const path = require("path");
 const fs = require("fs");
 const multer = require("multer");
 
-const { readAgents, writeAgents, readCalls, writeCalls } = require("./storage");
+const {
+  readAgents,
+  writeAgents,
+  readCalls,
+  writeCalls,
+  readWorkspaces,
+  writeWorkspaces,
+  readPhoneNumbers,
+  writePhoneNumbers,
+} = require("./storage");
 const { getPool, initSchema } = require("./db");
 const store = require("./store_pg");
 const { roomService, createParticipantToken } = require("./livekit");
 const { startCallEgress, stopEgress, getEgressInfo } = require("./egress");
 const { getObject } = require("./s3");
+const tw = require("./twilio");
 
 function numEnv(name) {
   const v = process.env[name];
@@ -94,8 +104,41 @@ app.use(
 );
 
 const USE_DB = Boolean(process.env.DATABASE_URL);
+const DEFAULT_WORKSPACE_ID = "rapidcallai";
 
 app.get("/health", (_req, res) => res.json({ ok: true }));
+
+async function ensureDefaultWorkspace() {
+  if (USE_DB) {
+    return await store.ensureDefaultWorkspace();
+  }
+  const rows = readWorkspaces();
+  const found = rows[0];
+  if (found) return found;
+  const now = Date.now();
+  const ws = {
+    id: DEFAULT_WORKSPACE_ID,
+    name: DEFAULT_WORKSPACE_ID,
+    twilioSubaccountSid: null,
+    createdAt: now,
+    updatedAt: now,
+  };
+  writeWorkspaces([ws]);
+  return ws;
+}
+
+function normalizeCountries(v) {
+  if (!v) return ["all"];
+  if (Array.isArray(v)) return v.length ? v : ["all"];
+  if (typeof v === "string") {
+    const parts = v
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    return parts.length ? parts : ["all"];
+  }
+  return ["all"];
+}
 
 // Serve uploaded call recordings (web-test recordings)
 const RECORDINGS_DIR = path.join(__dirname, "..", "recordings");
@@ -223,6 +266,300 @@ app.delete("/api/agents/:id", async (req, res) => {
   const next = agents.filter((a) => a.id !== id);
   writeAgents(next);
   res.json({ ok: true });
+});
+
+// --- Workspaces (Phase 1) ---
+app.get("/api/workspaces", async (_req, res) => {
+  if (USE_DB) {
+    const workspaces = await store.listWorkspaces();
+    return res.json({ workspaces });
+  }
+  return res.json({ workspaces: readWorkspaces() });
+});
+
+app.post("/api/workspaces", async (req, res) => {
+  const schema = z.object({ name: z.string().min(1).max(80) });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: "Validation failed", details: parsed.error.flatten() });
+  }
+
+  if (USE_DB) {
+    const workspace = await store.createWorkspace({ name: parsed.data.name });
+    return res.status(201).json({ workspace });
+  }
+
+  const rows = readWorkspaces();
+  const now = Date.now();
+  const ws = {
+    id: nanoid(10),
+    name: parsed.data.name,
+    twilioSubaccountSid: null,
+    createdAt: now,
+    updatedAt: now,
+  };
+  writeWorkspaces([ws, ...rows]);
+  return res.status(201).json({ workspace: ws });
+});
+
+// --- Twilio (Phase 2) ---
+app.get("/api/workspaces/:id/twilio", async (req, res) => {
+  const id = String(req.params.id);
+  const ws = USE_DB ? await store.getWorkspace(id) : readWorkspaces().find((w) => w.id === id);
+  if (!ws) return res.status(404).json({ error: "Workspace not found" });
+  return res.json({ workspace: ws, twilioConfigured: Boolean(tw.getMasterCreds()) });
+});
+
+app.post("/api/workspaces/:id/twilio/subaccount", async (req, res) => {
+  const id = String(req.params.id);
+  const ws = USE_DB ? await store.getWorkspace(id) : readWorkspaces().find((w) => w.id === id);
+  if (!ws) return res.status(404).json({ error: "Workspace not found" });
+
+  try {
+    const { sid, created } = await tw.ensureSubaccount({
+      friendlyName: `rapidcallai:${ws.name || ws.id}`,
+      existingSid: ws.twilioSubaccountSid ?? null,
+    });
+
+    if (USE_DB) {
+      const updated = await store.updateWorkspace(id, { twilioSubaccountSid: sid });
+      return res.json({ workspace: updated, created });
+    }
+
+    const rows = readWorkspaces();
+    const idx = rows.findIndex((w) => w.id === id);
+    const next = { ...rows[idx], twilioSubaccountSid: sid, updatedAt: Date.now() };
+    rows[idx] = next;
+    writeWorkspaces(rows);
+    return res.json({ workspace: next, created });
+  } catch (e) {
+    return res.status(400).json({ error: e instanceof Error ? e.message : "Twilio subaccount failed" });
+  }
+});
+
+app.get("/api/workspaces/:id/twilio/available-numbers", async (req, res) => {
+  const id = String(req.params.id);
+  const ws = USE_DB ? await store.getWorkspace(id) : readWorkspaces().find((w) => w.id === id);
+  if (!ws) return res.status(404).json({ error: "Workspace not found" });
+
+  try {
+    const results = await tw.searchAvailableNumbers({
+      subaccountSid: ws.twilioSubaccountSid,
+      country: req.query.country,
+      type: req.query.type,
+      contains: req.query.contains,
+      limit: req.query.limit,
+    });
+    return res.json({ numbers: results });
+  } catch (e) {
+    return res.status(400).json({ error: e instanceof Error ? e.message : "Search failed" });
+  }
+});
+
+app.post("/api/workspaces/:id/twilio/buy-number", async (req, res) => {
+  const id = String(req.params.id);
+  const ws = USE_DB ? await store.getWorkspace(id) : readWorkspaces().find((w) => w.id === id);
+  if (!ws) return res.status(404).json({ error: "Workspace not found" });
+
+  const schema = z.object({
+    phoneNumber: z.string().min(3).max(32),
+    label: z.string().max(120).optional(),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: "Validation failed", details: parsed.error.flatten() });
+  }
+
+  try {
+    // Ensure we have a subaccount first.
+    const { sid: subSid } = await tw.ensureSubaccount({
+      friendlyName: `rapidcallai:${ws.name || ws.id}`,
+      existingSid: ws.twilioSubaccountSid ?? null,
+    });
+    if (!ws.twilioSubaccountSid) {
+      if (USE_DB) await store.updateWorkspace(id, { twilioSubaccountSid: subSid });
+      else {
+        const rows = readWorkspaces();
+        const idx = rows.findIndex((w) => w.id === id);
+        rows[idx] = { ...rows[idx], twilioSubaccountSid: subSid, updatedAt: Date.now() };
+        writeWorkspaces(rows);
+      }
+      ws.twilioSubaccountSid = subSid;
+    }
+
+    const purchased = await tw.buyNumber({
+      subaccountSid: ws.twilioSubaccountSid,
+      phoneNumber: parsed.data.phoneNumber,
+      friendlyName: parsed.data.label || undefined,
+    });
+
+    // Save as a phone number record.
+    if (USE_DB) {
+      const phoneNumber = await store.createPhoneNumber({
+        workspaceId: ws.id,
+        e164: purchased.phoneNumber,
+        label: parsed.data.label ?? "",
+        provider: "twilio",
+        status: "unconfigured",
+        twilioNumberSid: purchased.sid,
+        allowedInboundCountries: ["all"],
+        allowedOutboundCountries: ["all"],
+      });
+      return res.status(201).json({ phoneNumber, purchased });
+    }
+
+    const rows = readPhoneNumbers();
+    const now = Date.now();
+    const phoneNumber = {
+      id: nanoid(10),
+      workspaceId: ws.id,
+      e164: purchased.phoneNumber,
+      label: parsed.data.label ?? "",
+      provider: "twilio",
+      status: "unconfigured",
+      twilioNumberSid: purchased.sid,
+      inboundAgentId: null,
+      outboundAgentId: null,
+      allowedInboundCountries: ["all"],
+      allowedOutboundCountries: ["all"],
+      createdAt: now,
+      updatedAt: now,
+    };
+    writePhoneNumbers([phoneNumber, ...rows]);
+    return res.status(201).json({ phoneNumber, purchased });
+  } catch (e) {
+    return res.status(400).json({ error: e instanceof Error ? e.message : "Buy failed" });
+  }
+});
+
+// --- Phone Numbers (Phase 1) ---
+app.get("/api/phone-numbers", async (req, res) => {
+  const ws = await ensureDefaultWorkspace();
+  const workspaceId = String(req.query.workspaceId || ws.id);
+
+  if (USE_DB) {
+    const phoneNumbers = await store.listPhoneNumbers(workspaceId);
+    return res.json({ phoneNumbers });
+  }
+
+  const rows = readPhoneNumbers().filter((p) => p.workspaceId === workspaceId);
+  rows.sort((a, b) => Number(b.createdAt || 0) - Number(a.createdAt || 0));
+  return res.json({ phoneNumbers: rows });
+});
+
+app.post("/api/phone-numbers", async (req, res) => {
+  const ws = await ensureDefaultWorkspace();
+  const schema = z.object({
+    workspaceId: z.string().min(1).optional(),
+    e164: z.string().min(3).max(32),
+    label: z.string().max(120).optional(),
+    provider: z.enum(["twilio"]).optional(),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: "Validation failed", details: parsed.error.flatten() });
+  }
+
+  const workspaceId = parsed.data.workspaceId || ws.id;
+
+  if (USE_DB) {
+    try {
+      const phoneNumber = await store.createPhoneNumber({
+        workspaceId,
+        e164: parsed.data.e164,
+        label: parsed.data.label ?? "",
+        provider: parsed.data.provider ?? "twilio",
+        status: "unconfigured",
+        allowedInboundCountries: ["all"],
+        allowedOutboundCountries: ["all"],
+      });
+      return res.status(201).json({ phoneNumber });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Create phone number failed";
+      return res.status(400).json({ error: msg });
+    }
+  }
+
+  const rows = readPhoneNumbers();
+  const now = Date.now();
+  const phoneNumber = {
+    id: nanoid(10),
+    workspaceId,
+    e164: parsed.data.e164,
+    label: parsed.data.label ?? "",
+    provider: parsed.data.provider ?? "twilio",
+    status: "unconfigured",
+    twilioNumberSid: null,
+    inboundAgentId: null,
+    outboundAgentId: null,
+    allowedInboundCountries: ["all"],
+    allowedOutboundCountries: ["all"],
+    createdAt: now,
+    updatedAt: now,
+  };
+  writePhoneNumbers([phoneNumber, ...rows]);
+  return res.status(201).json({ phoneNumber });
+});
+
+app.get("/api/phone-numbers/:id", async (req, res) => {
+  const id = String(req.params.id);
+  if (USE_DB) {
+    const phoneNumber = await store.getPhoneNumber(id);
+    if (!phoneNumber) return res.status(404).json({ error: "Not found" });
+    return res.json({ phoneNumber });
+  }
+  const phoneNumber = readPhoneNumbers().find((p) => p.id === id);
+  if (!phoneNumber) return res.status(404).json({ error: "Not found" });
+  return res.json({ phoneNumber });
+});
+
+app.put("/api/phone-numbers/:id", async (req, res) => {
+  const id = String(req.params.id);
+  const schema = z.object({
+    label: z.string().max(120).optional(),
+    inboundAgentId: z.string().min(1).nullable().optional(),
+    outboundAgentId: z.string().min(1).nullable().optional(),
+    allowedInboundCountries: z.union([z.array(z.string()), z.string()]).optional(),
+    allowedOutboundCountries: z.union([z.array(z.string()), z.string()]).optional(),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: "Validation failed", details: parsed.error.flatten() });
+  }
+
+  const patch = {
+    label: parsed.data.label,
+    inboundAgentId: parsed.data.inboundAgentId,
+    outboundAgentId: parsed.data.outboundAgentId,
+    allowedInboundCountries: normalizeCountries(parsed.data.allowedInboundCountries),
+    allowedOutboundCountries: normalizeCountries(parsed.data.allowedOutboundCountries),
+  };
+
+  if (USE_DB) {
+    const phoneNumber = await store.updatePhoneNumber(id, patch);
+    if (!phoneNumber) return res.status(404).json({ error: "Not found" });
+    return res.json({ phoneNumber });
+  }
+
+  const rows = readPhoneNumbers();
+  const idx = rows.findIndex((p) => p.id === id);
+  if (idx < 0) return res.status(404).json({ error: "Not found" });
+  const current = rows[idx];
+  const next = { ...current, ...patch, updatedAt: Date.now() };
+  rows[idx] = next;
+  writePhoneNumbers(rows);
+  return res.json({ phoneNumber: next });
+});
+
+app.delete("/api/phone-numbers/:id", async (req, res) => {
+  const id = String(req.params.id);
+  if (USE_DB) {
+    await store.deletePhoneNumber(id);
+    return res.json({ ok: true });
+  }
+  const rows = readPhoneNumbers().filter((p) => p.id !== id);
+  writePhoneNumbers(rows);
+  return res.json({ ok: true });
 });
 
 // --- Start a voice session for an agent profile ---
