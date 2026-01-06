@@ -744,12 +744,6 @@ app.post("/api/twilio/inbound", async (req, res) => {
     res.type("text/xml").send(vr.toString());
     return;
   }
-  if (!sipUser || !sipPass) {
-    console.log("[twilio-inbound] missing LiveKit SIP auth on phone number", { twilioCallSid, to });
-    vr.say("This number is missing LiveKit SIP credentials.");
-    res.type("text/xml").send(vr.toString());
-    return;
-  }
 
   let dest = `${to}@${sipEndpoint}`;
   if (!dest.startsWith("sip:")) dest = `sip:${dest}`;
@@ -759,9 +753,14 @@ app.post("/api/twilio/inbound", async (req, res) => {
     to,
     from,
     dest,
+    hasAuth: Boolean(sipUser && sipPass),
   });
 
-  vr.dial({ answerOnBridge: true }).sip({ username: sipUser, password: sipPass }, dest);
+  const dial = vr.dial({ answerOnBridge: true });
+  // SIP auth is optional: it is recommended for Twilio Programmable Voice to prevent arbitrary calls hitting your SIP endpoint,
+  // but LiveKit inbound trunks can also work without auth when configured by allowed numbers/dispatch rules.
+  if (sipUser && sipPass) dial.sip({ username: sipUser, password: sipPass }, dest);
+  else dial.sip(dest);
   res.type("text/xml").send(vr.toString());
 });
 
