@@ -28,7 +28,7 @@ const { getPool, initSchema } = require("./db");
 const store = require("./store_pg");
 const { roomService, createParticipantToken } = require("./livekit");
 const { startCallEgress, stopEgress, getEgressInfo } = require("./egress");
-const { getObject } = require("./s3");
+const { getObject, presignGetObject } = require("./s3");
 const tw = require("./twilio");
 
 function numEnv(name) {
@@ -1132,6 +1132,15 @@ app.post("/api/calls/:id/metrics", requireAgentSecret, async (req, res) => {
 
 // --- Analytics ---
 app.get("/api/analytics", requireAuth, async (req, res) => {
+  const fromMs = req.query.from ? Number(req.query.from) : null;
+  const toMs = req.query.to ? Number(req.query.to) : null;
+  const hasFrom = typeof fromMs === "number" && Number.isFinite(fromMs);
+  const hasTo = typeof toMs === "number" && Number.isFinite(toMs);
+  const now = Date.now();
+  const defaultFrom = now - 7 * 24 * 60 * 60 * 1000;
+  const qFrom = hasFrom ? fromMs : defaultFrom;
+  const qTo = hasTo ? toMs : now;
+
   if (USE_DB) {
     const p = getPool();
     const { rows } = await p.query(
@@ -1146,9 +1155,9 @@ app.get("/api/analytics", requireAuth, async (req, res) => {
         SUM((metrics->>'tokensTotal')::BIGINT)
           FILTER (WHERE ended_at IS NOT NULL AND metrics IS NOT NULL AND (metrics->>'tokensTotal') IS NOT NULL) AS total_tokens
       FROM calls
-      WHERE workspace_id=$1
+      WHERE workspace_id=$1 AND started_at >= $2 AND started_at <= $3
     `,
-      [req.workspace.id]
+      [req.workspace.id, qFrom, qTo]
     );
 
     const r = rows[0] || {};
@@ -1157,7 +1166,22 @@ app.get("/api/analytics", requireAuth, async (req, res) => {
     const totalCostUsd = r.total_cost_usd == null ? null : Math.round(Number(r.total_cost_usd) * 10000) / 10000;
     const totalTokens = r.total_tokens == null ? null : Number(r.total_tokens);
 
+    const { rows: seriesRows } = await p.query(
+      `
+      SELECT
+        to_char(date_trunc('day', to_timestamp(started_at / 1000.0) AT TIME ZONE 'UTC'), 'YYYY-MM-DD') AS day,
+        COUNT(*)::BIGINT AS calls,
+        SUM(duration_sec)::BIGINT FILTER (WHERE ended_at IS NOT NULL AND duration_sec IS NOT NULL) AS seconds
+      FROM calls
+      WHERE workspace_id=$1 AND started_at >= $2 AND started_at <= $3
+      GROUP BY 1
+      ORDER BY 1 ASC
+    `,
+      [req.workspace.id, qFrom, qTo]
+    );
+
     return res.json({
+      range: { from: qFrom, to: qTo, tz: "UTC" },
       totals: {
         callCount: Number(r.call_count || 0),
         completedCallCount: Number(r.completed_call_count || 0),
@@ -1166,11 +1190,17 @@ app.get("/api/analytics", requireAuth, async (req, res) => {
         totalCostUsd,
         totalTokens,
       },
+      series: seriesRows.map((row) => ({
+        day: row.day,
+        calls: Number(row.calls || 0),
+        minutes: row.seconds == null ? 0 : Math.round(Number(row.seconds) / 60),
+      })),
     });
   }
 
   const calls = readCalls();
-  const completed = calls.filter((c) => c.endedAt);
+  const inRange = calls.filter((c) => (c.startedAt || 0) >= qFrom && (c.startedAt || 0) <= qTo);
+  const completed = inRange.filter((c) => c.endedAt);
   const count = calls.length;
   const completedCount = completed.length;
 
@@ -1191,7 +1221,22 @@ app.get("/api/analytics", requireAuth, async (req, res) => {
     .filter((v) => typeof v === "number" && Number.isFinite(v));
   const totalTokens = tokenValues.length ? tokenValues.reduce((a, v) => a + v, 0) : null;
 
+  const byDay = new Map();
+  for (const c of inRange) {
+    const d = new Date(c.startedAt || 0);
+    const day = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(
+      2,
+      "0"
+    )}`;
+    const entry = byDay.get(day) || { day, calls: 0, minutes: 0 };
+    entry.calls += 1;
+    entry.minutes += Math.round(((c.durationSec || 0) / 60) * 100) / 100;
+    byDay.set(day, entry);
+  }
+  const series = Array.from(byDay.values()).sort((a, b) => (a.day < b.day ? -1 : 1));
+
   return res.json({
+    range: { from: qFrom, to: qTo, tz: "UTC" },
     totals: {
       callCount: count,
       completedCallCount: completedCount,
@@ -1200,6 +1245,7 @@ app.get("/api/analytics", requireAuth, async (req, res) => {
       totalCostUsd,
       totalTokens,
     },
+    series,
   });
 });
 
@@ -1354,6 +1400,38 @@ app.get("/api/calls/:id/recording", requireAuth, async (req, res) => {
     console.warn("Recording stream failed:", e?.name || e?.message || e);
     return res.status(500).send("Failed to stream recording");
   }
+});
+
+// Return a playback-friendly recording URL (audio tag can't send Authorization headers).
+app.get("/api/calls/:id/recording-url", requireAuth, async (req, res) => {
+  const { id } = req.params;
+  const call = USE_DB ? await store.getCall(req.workspace.id, id) : readCalls().find((c) => c.id === id);
+  if (!call) return res.status(404).json({ error: "Call not found" });
+  if (!call.recording) return res.status(404).json({ error: "No recording" });
+
+  // S3 egress recording (preferred): return a short-lived presigned URL.
+  if (call.recording.kind === "egress_s3") {
+    if (call.recording.status !== "ready") {
+      return res.status(409).json({ error: "Recording not ready", status: call.recording.status });
+    }
+    try {
+      const url = await presignGetObject({
+        bucket: call.recording.bucket,
+        key: call.recording.key,
+        expiresInSeconds: 60 * 30,
+      });
+      return res.json({ url, expiresInSeconds: 60 * 30 });
+    } catch (e) {
+      return res.status(500).json({ error: "Failed to presign recording URL" });
+    }
+  }
+
+  // Local uploaded recording: served by express.static(/recordings) with no auth required.
+  if (call.recording.url) {
+    return res.json({ url: call.recording.url });
+  }
+
+  return res.status(404).json({ error: "No recording URL" });
 });
 
 app.post("/api/calls/:id/end", requireAuth, async (req, res) => {
