@@ -6,6 +6,8 @@ require("dotenv").config({
 
 const express = require("express");
 const cors = require("cors");
+const crypto = require("crypto");
+const bcrypt = require("bcryptjs");
 const { nanoid } = require("nanoid");
 const { z } = require("zod");
 const path = require("path");
@@ -129,6 +131,117 @@ async function ensureDefaultWorkspace() {
   return ws;
 }
 
+function makeSessionToken() {
+  // 48-char hex token (cryptographically strong)
+  return crypto.randomBytes(24).toString("hex");
+}
+
+function getBearerToken(req) {
+  const h = String(req.headers.authorization || "").trim();
+  const m = h.match(/^Bearer\s+(.+)$/i);
+  if (!m) return null;
+  return m[1].trim();
+}
+
+async function requireAuth(req, res, next) {
+  // Local JSON mode stays "demo" for now.
+  if (!USE_DB) {
+    req.user = null;
+    req.workspace = await ensureDefaultWorkspace();
+    return next();
+  }
+
+  const token = getBearerToken(req);
+  if (!token) return res.status(401).json({ error: "Missing Authorization header" });
+
+  const session = await store.getSession(token);
+  if (!session) return res.status(401).json({ error: "Invalid session" });
+  if (session.expiresAt && session.expiresAt < Date.now()) {
+    await store.deleteSession(token);
+    return res.status(401).json({ error: "Session expired" });
+  }
+
+  const user = await store.getUserById(session.userId);
+  if (!user) return res.status(401).json({ error: "User not found" });
+
+  const workspace = await store.ensureWorkspaceForUser({
+    user,
+    nameHint: `${user.name || user.email} workspace`,
+  });
+
+  req.user = user;
+  req.workspace = workspace;
+  req.sessionToken = token;
+  return next();
+}
+
+// --- Auth (real auth when using Postgres) ---
+app.post("/api/auth/register", async (req, res) => {
+  const schema = z.object({
+    name: z.string().min(1).max(80),
+    email: z.string().email().max(200),
+    password: z.string().min(6).max(200),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "Validation failed", details: parsed.error.flatten() });
+
+  if (!USE_DB) {
+    const token = `token:${parsed.data.email}:${Date.now()}`;
+    const workspace = await ensureDefaultWorkspace();
+    return res.status(201).json({
+      token,
+      user: { id: "demo", email: parsed.data.email, name: parsed.data.name },
+      workspace,
+    });
+  }
+
+  const existing = await store.getUserByEmail(parsed.data.email);
+  if (existing) return res.status(400).json({ error: "Email already registered" });
+
+  const passwordHash = await bcrypt.hash(parsed.data.password, 10);
+  const user = await store.createUser({ email: parsed.data.email, name: parsed.data.name, passwordHash });
+  const token = makeSessionToken();
+  await store.createSession({ userId: user.id, token });
+  const workspace = await store.ensureWorkspaceForUser({ user, nameHint: `${user.name || user.email} workspace` });
+
+  return res.status(201).json({ token, user, workspace });
+});
+
+app.post("/api/auth/login", async (req, res) => {
+  const schema = z.object({
+    email: z.string().email().max(200),
+    password: z.string().min(1).max(200),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "Validation failed", details: parsed.error.flatten() });
+
+  if (!USE_DB) {
+    const token = `token:${parsed.data.email}:${Date.now()}`;
+    const workspace = await ensureDefaultWorkspace();
+    return res.json({ token, user: { id: "demo", email: parsed.data.email, name: parsed.data.email }, workspace });
+  }
+
+  const u = await store.getUserByEmail(parsed.data.email);
+  if (!u) return res.status(401).json({ error: "Invalid email or password" });
+  const ok = await bcrypt.compare(parsed.data.password, u.passwordHash);
+  if (!ok) return res.status(401).json({ error: "Invalid email or password" });
+
+  const user = { id: u.id, email: u.email, name: u.name, createdAt: u.createdAt, updatedAt: u.updatedAt };
+  const token = makeSessionToken();
+  await store.createSession({ userId: user.id, token });
+  const workspace = await store.ensureWorkspaceForUser({ user, nameHint: `${user.name || user.email} workspace` });
+  return res.json({ token, user, workspace });
+});
+
+app.post("/api/auth/logout", requireAuth, async (req, res) => {
+  if (USE_DB && req.sessionToken) await store.deleteSession(req.sessionToken);
+  return res.json({ ok: true });
+});
+
+app.get("/api/me", requireAuth, async (req, res) => {
+  return res.json({ user: req.user, workspace: req.workspace });
+});
+
 function normalizeCountries(v) {
   if (!v) return ["all"];
   if (Array.isArray(v)) return v.length ? v : ["all"];
@@ -152,15 +265,15 @@ if (!fs.existsSync(RECORDINGS_DIR)) fs.mkdirSync(RECORDINGS_DIR, { recursive: tr
 app.use("/recordings", express.static(RECORDINGS_DIR));
 
 // --- Agent profiles (stored locally in ./data/agents.json) ---
-app.get("/api/agents", async (_req, res) => {
+app.get("/api/agents", requireAuth, async (req, res) => {
   if (USE_DB) {
-    const agents = await store.listAgents();
+    const agents = await store.listAgents(req.workspace.id);
     return res.json({ agents });
   }
   return res.json({ agents: readAgents() });
 });
 
-app.post("/api/agents", async (req, res) => {
+app.post("/api/agents", requireAuth, async (req, res) => {
   const schema = z.object({
     name: z.string().min(1).max(60),
     promptDraft: z.string().max(PROMPT_MAX).optional(),
@@ -177,7 +290,7 @@ app.post("/api/agents", async (req, res) => {
   }
 
   if (USE_DB) {
-    const agent = await store.createAgent(parsed.data);
+    const agent = await store.createAgent({ ...parsed.data, workspaceId: req.workspace.id });
     return res.status(201).json({ agent });
   }
 
@@ -203,14 +316,14 @@ app.post("/api/agents", async (req, res) => {
   return res.status(201).json({ agent });
 });
 
-app.get("/api/agents/:id", async (req, res) => {
+app.get("/api/agents/:id", requireAuth, async (req, res) => {
   const { id } = req.params;
-  const agent = USE_DB ? await store.getAgent(id) : readAgents().find((a) => a.id === id);
+  const agent = USE_DB ? await store.getAgent(req.workspace.id, id) : readAgents().find((a) => a.id === id);
   if (!agent) return res.status(404).json({ error: "Agent not found" });
   res.json({ agent });
 });
 
-app.put("/api/agents/:id", async (req, res) => {
+app.put("/api/agents/:id", requireAuth, async (req, res) => {
   const { id } = req.params;
   const schema = z.object({
     name: z.string().min(1).max(60).optional(),
@@ -228,7 +341,7 @@ app.put("/api/agents/:id", async (req, res) => {
   }
 
   if (USE_DB) {
-    const agent = await store.updateAgent(id, parsed.data);
+    const agent = await store.updateAgent(req.workspace.id, id, parsed.data);
     if (!agent) return res.status(404).json({ error: "Agent not found" });
     return res.json({ agent });
   }
@@ -262,10 +375,10 @@ app.put("/api/agents/:id", async (req, res) => {
   res.json({ agent: next });
 });
 
-app.delete("/api/agents/:id", async (req, res) => {
+app.delete("/api/agents/:id", requireAuth, async (req, res) => {
   const { id } = req.params;
   if (USE_DB) {
-    await store.deleteAgent(id);
+    await store.deleteAgent(req.workspace.id, id);
     return res.json({ ok: true });
   }
   const agents = readAgents();
@@ -275,15 +388,12 @@ app.delete("/api/agents/:id", async (req, res) => {
 });
 
 // --- Workspaces (Phase 1) ---
-app.get("/api/workspaces", async (_req, res) => {
-  if (USE_DB) {
-    const workspaces = await store.listWorkspaces();
-    return res.json({ workspaces });
-  }
-  return res.json({ workspaces: readWorkspaces() });
+app.get("/api/workspaces", requireAuth, async (req, res) => {
+  // Single-workspace-per-user for now.
+  return res.json({ workspaces: [req.workspace] });
 });
 
-app.post("/api/workspaces", async (req, res) => {
+app.post("/api/workspaces", requireAuth, async (req, res) => {
   const schema = z.object({ name: z.string().min(1).max(80) });
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) {
@@ -291,8 +401,8 @@ app.post("/api/workspaces", async (req, res) => {
   }
 
   if (USE_DB) {
-    const workspace = await store.createWorkspace({ name: parsed.data.name });
-    return res.status(201).json({ workspace });
+    const workspace = await store.updateWorkspace(req.workspace.id, { name: parsed.data.name });
+    return res.json({ workspace });
   }
 
   const rows = readWorkspaces();
@@ -309,19 +419,17 @@ app.post("/api/workspaces", async (req, res) => {
 });
 
 // --- Twilio (Phase 2) ---
-app.get("/api/workspaces/:id/twilio", async (req, res) => {
+app.get("/api/workspaces/:id/twilio", requireAuth, async (req, res) => {
   const id = String(req.params.id);
-  let ws = USE_DB ? await store.getWorkspace(id) : readWorkspaces().find((w) => w.id === id);
-  if (!ws && id === DEFAULT_WORKSPACE_ID) ws = await ensureDefaultWorkspace();
-  if (!ws) return res.status(404).json({ error: "Workspace not found" });
+  if (id !== req.workspace.id) return res.status(403).json({ error: "Forbidden" });
+  const ws = req.workspace;
   return res.json({ workspace: ws, twilioConfigured: Boolean(tw.getMasterCreds()) });
 });
 
-app.post("/api/workspaces/:id/twilio/subaccount", async (req, res) => {
+app.post("/api/workspaces/:id/twilio/subaccount", requireAuth, async (req, res) => {
   const id = String(req.params.id);
-  let ws = USE_DB ? await store.getWorkspace(id) : readWorkspaces().find((w) => w.id === id);
-  if (!ws && id === DEFAULT_WORKSPACE_ID) ws = await ensureDefaultWorkspace();
-  if (!ws) return res.status(404).json({ error: "Workspace not found" });
+  if (id !== req.workspace.id) return res.status(403).json({ error: "Forbidden" });
+  let ws = req.workspace;
 
   try {
     const { sid, created } = await tw.ensureSubaccount({
@@ -345,11 +453,10 @@ app.post("/api/workspaces/:id/twilio/subaccount", async (req, res) => {
   }
 });
 
-app.get("/api/workspaces/:id/twilio/available-numbers", async (req, res) => {
+app.get("/api/workspaces/:id/twilio/available-numbers", requireAuth, async (req, res) => {
   const id = String(req.params.id);
-  let ws = USE_DB ? await store.getWorkspace(id) : readWorkspaces().find((w) => w.id === id);
-  if (!ws && id === DEFAULT_WORKSPACE_ID) ws = await ensureDefaultWorkspace();
-  if (!ws) return res.status(404).json({ error: "Workspace not found" });
+  if (id !== req.workspace.id) return res.status(403).json({ error: "Forbidden" });
+  const ws = req.workspace;
 
   try {
     const results = await tw.searchAvailableNumbers({
@@ -365,11 +472,10 @@ app.get("/api/workspaces/:id/twilio/available-numbers", async (req, res) => {
   }
 });
 
-app.post("/api/workspaces/:id/twilio/buy-number", async (req, res) => {
+app.post("/api/workspaces/:id/twilio/buy-number", requireAuth, async (req, res) => {
   const id = String(req.params.id);
-  let ws = USE_DB ? await store.getWorkspace(id) : readWorkspaces().find((w) => w.id === id);
-  if (!ws && id === DEFAULT_WORKSPACE_ID) ws = await ensureDefaultWorkspace();
-  if (!ws) return res.status(404).json({ error: "Workspace not found" });
+  if (id !== req.workspace.id) return res.status(403).json({ error: "Forbidden" });
+  let ws = req.workspace;
 
   const schema = z.object({
     phoneNumber: z.string().min(3).max(32),
@@ -443,9 +549,8 @@ app.post("/api/workspaces/:id/twilio/buy-number", async (req, res) => {
 });
 
 // --- Phone Numbers (Phase 1) ---
-app.get("/api/phone-numbers", async (req, res) => {
-  const ws = await ensureDefaultWorkspace();
-  const workspaceId = String(req.query.workspaceId || ws.id);
+app.get("/api/phone-numbers", requireAuth, async (req, res) => {
+  const workspaceId = req.workspace.id;
 
   if (USE_DB) {
     const phoneNumbers = await store.listPhoneNumbers(workspaceId);
@@ -457,10 +562,8 @@ app.get("/api/phone-numbers", async (req, res) => {
   return res.json({ phoneNumbers: rows });
 });
 
-app.post("/api/phone-numbers", async (req, res) => {
-  const ws = await ensureDefaultWorkspace();
+app.post("/api/phone-numbers", requireAuth, async (req, res) => {
   const schema = z.object({
-    workspaceId: z.string().min(1).optional(),
     e164: z.string().min(3).max(32),
     label: z.string().max(120).optional(),
     provider: z.enum(["twilio"]).optional(),
@@ -470,7 +573,7 @@ app.post("/api/phone-numbers", async (req, res) => {
     return res.status(400).json({ error: "Validation failed", details: parsed.error.flatten() });
   }
 
-  const workspaceId = parsed.data.workspaceId || ws.id;
+  const workspaceId = req.workspace.id;
 
   if (USE_DB) {
     try {
@@ -511,19 +614,21 @@ app.post("/api/phone-numbers", async (req, res) => {
   return res.status(201).json({ phoneNumber });
 });
 
-app.get("/api/phone-numbers/:id", async (req, res) => {
+app.get("/api/phone-numbers/:id", requireAuth, async (req, res) => {
   const id = String(req.params.id);
   if (USE_DB) {
     const phoneNumber = await store.getPhoneNumber(id);
     if (!phoneNumber) return res.status(404).json({ error: "Not found" });
+    if (phoneNumber.workspaceId !== req.workspace.id) return res.status(404).json({ error: "Not found" });
     return res.json({ phoneNumber });
   }
   const phoneNumber = readPhoneNumbers().find((p) => p.id === id);
   if (!phoneNumber) return res.status(404).json({ error: "Not found" });
+  if (phoneNumber.workspaceId !== req.workspace.id) return res.status(404).json({ error: "Not found" });
   return res.json({ phoneNumber });
 });
 
-app.put("/api/phone-numbers/:id", async (req, res) => {
+app.put("/api/phone-numbers/:id", requireAuth, async (req, res) => {
   const id = String(req.params.id);
   const schema = z.object({
     label: z.string().max(120).optional(),
@@ -554,6 +659,8 @@ app.put("/api/phone-numbers/:id", async (req, res) => {
   });
 
   if (USE_DB) {
+    const existing = await store.getPhoneNumber(id);
+    if (!existing || existing.workspaceId !== req.workspace.id) return res.status(404).json({ error: "Not found" });
     const phoneNumber = await store.updatePhoneNumber(id, patch);
     if (!phoneNumber) return res.status(404).json({ error: "Not found" });
     return res.json({ phoneNumber });
@@ -563,15 +670,18 @@ app.put("/api/phone-numbers/:id", async (req, res) => {
   const idx = rows.findIndex((p) => p.id === id);
   if (idx < 0) return res.status(404).json({ error: "Not found" });
   const current = rows[idx];
+  if (current.workspaceId !== req.workspace.id) return res.status(404).json({ error: "Not found" });
   const next = { ...current, ...patch, updatedAt: Date.now() };
   rows[idx] = next;
   writePhoneNumbers(rows);
   return res.json({ phoneNumber: next });
 });
 
-app.delete("/api/phone-numbers/:id", async (req, res) => {
+app.delete("/api/phone-numbers/:id", requireAuth, async (req, res) => {
   const id = String(req.params.id);
   if (USE_DB) {
+    const existing = await store.getPhoneNumber(id);
+    if (!existing || existing.workspaceId !== req.workspace.id) return res.status(404).json({ error: "Not found" });
     await store.deletePhoneNumber(id);
     return res.json({ ok: true });
   }
@@ -603,15 +713,12 @@ app.post("/api/twilio/inbound", async (req, res) => {
   }
 
   // Find phone number config
-  const ws = await ensureDefaultWorkspace();
-  const workspaceId = ws.id;
   let phoneRow = null;
 
   if (USE_DB) {
-    const rows = await store.listPhoneNumbers(workspaceId);
-    phoneRow = rows.find((p) => p.e164 === to) ?? null;
+    phoneRow = await store.getPhoneNumberByE164(to);
   } else {
-    phoneRow = readPhoneNumbers().find((p) => p.workspaceId === workspaceId && p.e164 === to) ?? null;
+    phoneRow = readPhoneNumbers().find((p) => p.e164 === to) ?? null;
   }
 
   if (!phoneRow) {
@@ -627,7 +734,9 @@ app.post("/api/twilio/inbound", async (req, res) => {
     return;
   }
 
-  const agent = USE_DB ? await store.getAgent(agentId) : readAgents().find((a) => a.id === agentId);
+  const agent = USE_DB
+    ? await store.getAgent(phoneRow.workspaceId, agentId)
+    : readAgents().find((a) => a.id === agentId);
   if (!agent) {
     vr.say("Inbound agent was not found.");
     res.type("text/xml").send(vr.toString());
@@ -659,6 +768,7 @@ app.post("/api/twilio/inbound", async (req, res) => {
   const now = Date.now();
   const callRecord = {
     id: callId,
+    workspaceId: phoneRow.workspaceId ?? null,
     agentId: agent.id,
     agentName: agent.name,
     // In call history, show caller as "to" so it's visible.
@@ -752,7 +862,7 @@ app.post("/api/twilio/inbound", async (req, res) => {
 });
 
 // --- Start a voice session for an agent profile ---
-app.post("/api/agents/:id/start", async (req, res) => {
+app.post("/api/agents/:id/start", requireAuth, async (req, res) => {
   const { id } = req.params;
   const startSchema = z
     .object({
@@ -764,7 +874,7 @@ app.post("/api/agents/:id/start", async (req, res) => {
     return res.status(400).json({ error: "Validation failed", details: startParsed.error.flatten() });
   }
 
-  const agent = USE_DB ? await store.getAgent(id) : readAgents().find((a) => a.id === id);
+  const agent = USE_DB ? await store.getAgent(req.workspace.id, id) : readAgents().find((a) => a.id === id);
   if (!agent) return res.status(404).json({ error: "Agent not found" });
   const promptDraft = agent.promptDraft ?? agent.prompt ?? "";
   const promptPublished = agent.promptPublished ?? "";
@@ -788,6 +898,7 @@ app.post("/api/agents/:id/start", async (req, res) => {
   const now = Date.now();
   const callRecord = {
     id: callId,
+    workspaceId: req.workspace.id,
     agentId: agent.id,
     agentName: agent.name,
     to: "webtest",
@@ -871,9 +982,9 @@ app.post("/api/agents/:id/start", async (req, res) => {
 });
 
 // --- Call History (stored locally in ./data/calls.json) ---
-app.get("/api/calls", async (_req, res) => {
+app.get("/api/calls", requireAuth, async (req, res) => {
   if (USE_DB) {
-    const calls = await store.listCalls();
+    const calls = await store.listCalls(req.workspace.id);
     return res.json({ calls });
   }
   const calls = readCalls();
@@ -896,9 +1007,9 @@ app.get("/api/calls", async (_req, res) => {
   });
 });
 
-app.get("/api/calls/:id", async (req, res) => {
+app.get("/api/calls/:id", requireAuth, async (req, res) => {
   const { id } = req.params;
-  const call = USE_DB ? await store.getCall(id) : readCalls().find((c) => c.id === id);
+  const call = USE_DB ? await store.getCall(req.workspace.id, id) : readCalls().find((c) => c.id === id);
   if (!call) return res.status(404).json({ error: "Call not found" });
   res.json({ call });
 });
@@ -930,7 +1041,7 @@ app.post("/api/calls/:id/metrics", async (req, res) => {
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "Validation failed", details: parsed.error.flatten() });
 
-  const current = USE_DB ? await store.getCall(id) : readCalls().find((c) => c.id === id);
+  const current = USE_DB ? await store.getCallById(id) : readCalls().find((c) => c.id === id);
   if (!current) return res.status(404).json({ error: "Call not found" });
   const usage = parsed.data.usage ?? current.metrics?.usage ?? null;
   const latency = parsed.data.latency ?? current.metrics?.latency ?? null;
@@ -972,10 +1083,11 @@ app.post("/api/calls/:id/metrics", async (req, res) => {
 });
 
 // --- Analytics ---
-app.get("/api/analytics", async (_req, res) => {
+app.get("/api/analytics", requireAuth, async (req, res) => {
   if (USE_DB) {
     const p = getPool();
-    const { rows } = await p.query(`
+    const { rows } = await p.query(
+      `
       SELECT
         COUNT(*)::BIGINT AS call_count,
         COUNT(*) FILTER (WHERE ended_at IS NOT NULL)::BIGINT AS completed_call_count,
@@ -986,7 +1098,10 @@ app.get("/api/analytics", async (_req, res) => {
         SUM((metrics->>'tokensTotal')::BIGINT)
           FILTER (WHERE ended_at IS NOT NULL AND metrics IS NOT NULL AND (metrics->>'tokensTotal') IS NOT NULL) AS total_tokens
       FROM calls
-    `);
+      WHERE workspace_id=$1
+    `,
+      [req.workspace.id]
+    );
 
     const r = rows[0] || {};
     const avgDurationSec = r.avg_duration_sec == null ? null : Math.round(Number(r.avg_duration_sec));
@@ -1040,10 +1155,12 @@ app.get("/api/analytics", async (_req, res) => {
   });
 });
 
-app.get("/api/agents/:id/analytics", async (req, res) => {
+app.get("/api/agents/:id/analytics", requireAuth, async (req, res) => {
   const { id } = req.params;
 
   if (USE_DB) {
+    const agent = await store.getAgent(req.workspace.id, id);
+    if (!agent) return res.status(404).json({ error: "Agent not found" });
     const p = getPool();
     const { rows } = await p.query(
       `
@@ -1057,9 +1174,9 @@ app.get("/api/agents/:id/analytics", async (req, res) => {
         SUM((metrics->>'tokensTotal')::BIGINT)
           FILTER (WHERE ended_at IS NOT NULL AND metrics IS NOT NULL AND (metrics->>'tokensTotal') IS NOT NULL) AS total_tokens
       FROM calls
-      WHERE agent_id=$1
+      WHERE workspace_id=$1 AND agent_id=$2
     `,
-      [id]
+      [req.workspace.id, id]
     );
 
     const { rows: latestRows } = await p.query(
@@ -1072,11 +1189,11 @@ app.get("/api/agents/:id/analytics", async (req, res) => {
         (metrics->>'tokensTotal')::BIGINT AS tokens_total,
         (metrics->'latency'->>'agent_turn_latency_ms_avg')::DOUBLE PRECISION AS latency_ms
       FROM calls
-      WHERE agent_id=$1 AND ended_at IS NOT NULL
+      WHERE workspace_id=$1 AND agent_id=$2 AND ended_at IS NOT NULL
       ORDER BY ended_at DESC
       LIMIT 1
     `,
-      [id]
+      [req.workspace.id, id]
     );
 
     const r = rows[0] || {};
@@ -1158,9 +1275,9 @@ app.get("/api/agents/:id/analytics", async (req, res) => {
 });
 
 // Stream the call recording (supports Range requests for <audio> playback).
-app.get("/api/calls/:id/recording", async (req, res) => {
+app.get("/api/calls/:id/recording", requireAuth, async (req, res) => {
   const { id } = req.params;
-  const call = USE_DB ? await store.getCall(id) : readCalls().find((c) => c.id === id);
+  const call = USE_DB ? await store.getCall(req.workspace.id, id) : readCalls().find((c) => c.id === id);
   if (!call) return res.status(404).send("Call not found");
   if (!call.recording || call.recording.kind !== "egress_s3") return res.status(404).send("No recording");
 
@@ -1191,7 +1308,7 @@ app.get("/api/calls/:id/recording", async (req, res) => {
   }
 });
 
-app.post("/api/calls/:id/end", async (req, res) => {
+app.post("/api/calls/:id/end", requireAuth, async (req, res) => {
   const { id } = req.params;
   const schema = z.object({
     outcome: z.string().min(1).max(80).optional(),
@@ -1211,7 +1328,7 @@ app.post("/api/calls/:id/end", async (req, res) => {
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "Validation failed", details: parsed.error.flatten() });
 
-  const current = USE_DB ? await store.getCall(id) : readCalls().find((c) => c.id === id);
+  const current = USE_DB ? await store.getCall(req.workspace.id, id) : readCalls().find((c) => c.id === id);
   if (!current) return res.status(404).json({ error: "Call not found" });
   const now = Date.now();
   const endedAt = current.endedAt ?? now;
@@ -1250,7 +1367,7 @@ app.post("/api/calls/:id/end", async (req, res) => {
           if (status === 3) {
             // EGRESS_COMPLETE
             if (USE_DB) {
-              const c = await store.getCall(id);
+              const c = await store.getCallById(id);
               if (c?.recording?.kind === "egress_s3") await store.updateCall(id, { recording: { ...c.recording, status: "ready" } });
             } else {
               const calls3 = readCalls();
@@ -1269,7 +1386,7 @@ app.post("/api/calls/:id/end", async (req, res) => {
           if (status === 4 || status === 5) {
             // EGRESS_FAILED / EGRESS_ABORTED
             if (USE_DB) {
-              const c = await store.getCall(id);
+              const c = await store.getCallById(id);
               if (c?.recording?.kind === "egress_s3") await store.updateCall(id, { recording: { ...c.recording, status: "failed" } });
             } else {
               const calls3 = readCalls();
@@ -1318,7 +1435,7 @@ const upload = multer({
   limits: { fileSize: 50 * 1024 * 1024 },
 });
 
-app.post("/api/calls/:id/recording", upload.single("file"), async (req, res) => {
+app.post("/api/calls/:id/recording", requireAuth, upload.single("file"), async (req, res) => {
   const { id } = req.params;
   const calls = readCalls();
   const idx = calls.findIndex((c) => c.id === id);
@@ -1340,6 +1457,8 @@ app.post("/api/calls/:id/recording", upload.single("file"), async (req, res) => 
   };
 
   if (USE_DB) {
+    const existing = await store.getCall(req.workspace.id, id);
+    if (!existing) return res.status(404).json({ error: "Call not found" });
     const updated = await store.updateCall(id, { recording });
     if (!updated) return res.status(404).json({ error: "Call not found" });
     return res.json({ ok: true, recordingUrl: url, call: updated });

@@ -1,9 +1,20 @@
 const { nanoid } = require("nanoid");
 const { getPool } = require("./db");
 
+function rowToUser(r) {
+  return {
+    id: r.id,
+    email: r.email,
+    name: r.name ?? "",
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+  };
+}
+
 function rowToAgent(r) {
   return {
     id: r.id,
+    workspaceId: r.workspace_id ?? null,
     name: r.name,
     promptDraft: r.prompt_draft ?? "",
     promptPublished: r.prompt_published ?? "",
@@ -17,6 +28,7 @@ function rowToAgent(r) {
 function rowToCall(r) {
   return {
     id: r.id,
+    workspaceId: r.workspace_id ?? null,
     agentId: r.agent_id,
     agentName: r.agent_name,
     to: r.to,
@@ -38,6 +50,7 @@ function rowToWorkspace(r) {
   return {
     id: r.id,
     name: r.name,
+    userId: r.user_id ?? null,
     twilioSubaccountSid: r.twilio_subaccount_sid ?? null,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
@@ -76,17 +89,17 @@ async function getWorkspace(id) {
   return rows[0] ? rowToWorkspace(rows[0]) : null;
 }
 
-async function createWorkspace({ id, name }) {
+async function createWorkspace({ id, name, userId = null }) {
   const p = getPool();
   const now = Date.now();
   const wsId = id || nanoid(10);
   const { rows } = await p.query(
     `
-    INSERT INTO workspaces (id, name, twilio_subaccount_sid, created_at, updated_at)
-    VALUES ($1,$2,NULL,$3,$4)
+    INSERT INTO workspaces (id, name, user_id, twilio_subaccount_sid, created_at, updated_at)
+    VALUES ($1,$2,$3,NULL,$4,$5)
     RETURNING *
   `,
-    [wsId, name, now, now]
+    [wsId, name, userId, now, now]
   );
   return rowToWorkspace(rows[0]);
 }
@@ -100,12 +113,13 @@ async function updateWorkspace(id, patch) {
     `
     UPDATE workspaces
     SET name=COALESCE($2,name),
-        twilio_subaccount_sid=$3,
-        updated_at=$4
+        user_id=COALESCE($3,user_id),
+        twilio_subaccount_sid=$4,
+        updated_at=$5
     WHERE id=$1
     RETURNING *
   `,
-    [id, next.name ?? null, next.twilioSubaccountSid ?? null, next.updatedAt]
+    [id, next.name ?? null, next.userId ?? null, next.twilioSubaccountSid ?? null, next.updatedAt]
   );
   return rows[0] ? rowToWorkspace(rows[0]) : null;
 }
@@ -115,6 +129,104 @@ async function ensureDefaultWorkspace() {
   const { rows } = await p.query(`SELECT * FROM workspaces ORDER BY created_at ASC LIMIT 1`);
   if (rows[0]) return rowToWorkspace(rows[0]);
   return await createWorkspace({ id: "rapidcallai", name: "rapidcallai" });
+}
+
+async function createUser({ email, name = "", passwordHash }) {
+  const p = getPool();
+  const now = Date.now();
+  const id = nanoid(12);
+  const { rows } = await p.query(
+    `
+    INSERT INTO users (id, email, name, password_hash, created_at, updated_at)
+    VALUES ($1,$2,$3,$4,$5,$6)
+    RETURNING *
+  `,
+    [id, String(email).toLowerCase(), name ?? "", passwordHash, now, now]
+  );
+  return rowToUser(rows[0]);
+}
+
+async function getUserByEmail(email) {
+  const p = getPool();
+  const { rows } = await p.query(`SELECT * FROM users WHERE email=$1`, [String(email).toLowerCase()]);
+  return rows[0] ? { ...rowToUser(rows[0]), passwordHash: rows[0].password_hash } : null;
+}
+
+async function getUserById(id) {
+  const p = getPool();
+  const { rows } = await p.query(`SELECT * FROM users WHERE id=$1`, [id]);
+  return rows[0] ? rowToUser(rows[0]) : null;
+}
+
+async function countUsers() {
+  const p = getPool();
+  const { rows } = await p.query(`SELECT COUNT(*)::int AS n FROM users`);
+  return Number(rows[0]?.n || 0);
+}
+
+async function createSession({ userId, ttlDays = 30, token }) {
+  const p = getPool();
+  const now = Date.now();
+  const expiresAt = now + ttlDays * 24 * 60 * 60 * 1000;
+  await p.query(
+    `INSERT INTO sessions (token, user_id, expires_at, created_at) VALUES ($1,$2,$3,$4)`,
+    [token, userId, expiresAt, now]
+  );
+  return { token, userId, expiresAt, createdAt: now };
+}
+
+async function getSession(token) {
+  const p = getPool();
+  const { rows } = await p.query(`SELECT * FROM sessions WHERE token=$1`, [token]);
+  if (!rows[0]) return null;
+  return {
+    token: rows[0].token,
+    userId: rows[0].user_id,
+    expiresAt: rows[0].expires_at,
+    createdAt: rows[0].created_at,
+  };
+}
+
+async function deleteSession(token) {
+  const p = getPool();
+  await p.query(`DELETE FROM sessions WHERE token=$1`, [token]);
+}
+
+async function getWorkspaceForUser(userId) {
+  const p = getPool();
+  const { rows } = await p.query(`SELECT * FROM workspaces WHERE user_id=$1 ORDER BY created_at ASC LIMIT 1`, [userId]);
+  return rows[0] ? rowToWorkspace(rows[0]) : null;
+}
+
+async function ensureWorkspaceForUser({ user, nameHint }) {
+  const p = getPool();
+  const existing = await getWorkspaceForUser(user.id);
+  if (existing) return existing;
+
+  // One-time migration: if this is the first user ever created, claim the legacy workspace + attach legacy rows.
+  const nUsers = await countUsers();
+  if (nUsers <= 1) {
+    const { rows } = await p.query(`SELECT * FROM workspaces WHERE user_id IS NULL ORDER BY created_at ASC LIMIT 1`);
+    if (rows[0]) {
+      const legacy = rowToWorkspace(rows[0]);
+      const now = Date.now();
+      const { rows: claimedRows } = await p.query(
+        `UPDATE workspaces SET user_id=$2, name=COALESCE($4,name), updated_at=$3 WHERE id=$1 RETURNING *`,
+        [legacy.id, user.id, now, (nameHint || user.name || user.email || "Workspace").trim()]
+      );
+
+      const claimed = claimedRows[0] ? rowToWorkspace(claimedRows[0]) : legacy;
+
+      // Attach any old rows that didn't have workspace_id (pre-multitenant schema)
+      await p.query(`UPDATE agents SET workspace_id=$1 WHERE workspace_id IS NULL`, [claimed.id]);
+      await p.query(`UPDATE calls SET workspace_id=$1 WHERE workspace_id IS NULL`, [claimed.id]);
+
+      return claimed;
+    }
+  }
+
+  const wsName = (nameHint || user.name || user.email || "Workspace").trim();
+  return await createWorkspace({ name: wsName, userId: user.id });
 }
 
 async function listPhoneNumbers(workspaceId) {
@@ -129,6 +241,12 @@ async function listPhoneNumbers(workspaceId) {
 async function getPhoneNumber(id) {
   const p = getPool();
   const { rows } = await p.query(`SELECT * FROM phone_numbers WHERE id=$1`, [id]);
+  return rows[0] ? rowToPhoneNumber(rows[0]) : null;
+}
+
+async function getPhoneNumberByE164(e164) {
+  const p = getPool();
+  const { rows } = await p.query(`SELECT * FROM phone_numbers WHERE e164=$1 ORDER BY created_at DESC LIMIT 1`, [e164]);
   return rows[0] ? rowToPhoneNumber(rows[0]) : null;
 }
 
@@ -220,13 +338,16 @@ async function deletePhoneNumber(id) {
   await p.query(`DELETE FROM phone_numbers WHERE id=$1`, [id]);
 }
 
-async function listAgents() {
+async function listAgents(workspaceId) {
   const p = getPool();
-  const { rows } = await p.query(`SELECT * FROM agents ORDER BY created_at DESC`);
+  const { rows } = await p.query(
+    `SELECT * FROM agents WHERE workspace_id=$1 ORDER BY created_at DESC`,
+    [workspaceId]
+  );
   return rows.map(rowToAgent);
 }
 
-async function createAgent({ name, promptDraft = "", promptPublished = "", welcome = null }) {
+async function createAgent({ workspaceId, name, promptDraft = "", promptPublished = "", welcome = null }) {
   const p = getPool();
   const now = Date.now();
   const id = nanoid(10);
@@ -242,24 +363,24 @@ async function createAgent({ name, promptDraft = "", promptPublished = "", welco
 
   const { rows } = await p.query(
     `
-    INSERT INTO agents (id, name, prompt_draft, prompt_published, published_at, welcome, created_at, updated_at)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+    INSERT INTO agents (id, workspace_id, name, prompt_draft, prompt_published, published_at, welcome, created_at, updated_at)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
     RETURNING *
   `,
-    [id, name, promptDraft ?? "", promptPublished ?? "", pubAt, JSON.stringify(welcomeNorm), now, now]
+    [id, workspaceId, name, promptDraft ?? "", promptPublished ?? "", pubAt, JSON.stringify(welcomeNorm), now, now]
   );
   return rowToAgent(rows[0]);
 }
 
-async function getAgent(id) {
+async function getAgent(workspaceId, id) {
   const p = getPool();
-  const { rows } = await p.query(`SELECT * FROM agents WHERE id=$1`, [id]);
+  const { rows } = await p.query(`SELECT * FROM agents WHERE workspace_id=$1 AND id=$2`, [workspaceId, id]);
   return rows[0] ? rowToAgent(rows[0]) : null;
 }
 
-async function updateAgent(id, { name, promptDraft, publish, welcome }) {
+async function updateAgent(workspaceId, id, { name, promptDraft, publish, welcome }) {
   const p = getPool();
-  const current = await getAgent(id);
+  const current = await getAgent(workspaceId, id);
   if (!current) return null;
 
   const nextDraft = promptDraft ?? current.promptDraft ?? "";
@@ -285,17 +406,17 @@ async function updateAgent(id, { name, promptDraft, publish, welcome }) {
         published_at=$5,
         welcome=$6,
         updated_at=$7
-    WHERE id=$1
+    WHERE workspace_id=$8 AND id=$1
     RETURNING *
   `,
-    [id, name ?? null, nextDraft, nextPublished, publishedAt, JSON.stringify(welcomeNorm), updatedAt]
+    [id, name ?? null, nextDraft, nextPublished, publishedAt, JSON.stringify(welcomeNorm), updatedAt, workspaceId]
   );
   return rows[0] ? rowToAgent(rows[0]) : null;
 }
 
-async function deleteAgent(id) {
+async function deleteAgent(workspaceId, id) {
   const p = getPool();
-  await p.query(`DELETE FROM agents WHERE id=$1`, [id]);
+  await p.query(`DELETE FROM agents WHERE workspace_id=$1 AND id=$2`, [workspaceId, id]);
 }
 
 async function createCall(call) {
@@ -309,12 +430,13 @@ async function createCall(call) {
   await p.query(
     `
     INSERT INTO calls
-      (id, agent_id, agent_name, "to", room_name, started_at, ended_at, duration_sec, outcome, cost_usd, transcript, recording, metrics, created_at, updated_at)
+      (id, workspace_id, agent_id, agent_name, "to", room_name, started_at, ended_at, duration_sec, outcome, cost_usd, transcript, recording, metrics, created_at, updated_at)
     VALUES
-      ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+      ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
   `,
     [
       c.id,
+      c.workspaceId ?? null,
       c.agentId,
       c.agentName,
       c.to,
@@ -333,10 +455,16 @@ async function createCall(call) {
   );
 }
 
+async function getCallById(id) {
+  const p = getPool();
+  const { rows } = await p.query(`SELECT * FROM calls WHERE id=$1`, [id]);
+  return rows[0] ? rowToCall(rows[0]) : null;
+}
+
 async function updateCall(callId, patch) {
   const p = getPool();
   // Fetch existing to merge JSON fields safely.
-  const existing = await getCall(callId);
+  const existing = await getCallById(callId);
   if (!existing) return null;
 
   const next = { ...existing, ...patch, updatedAt: Date.now() };
@@ -377,22 +505,25 @@ async function updateCall(callId, patch) {
     ]
   );
 
-  return await getCall(callId);
+  return await getCallById(callId);
 }
 
-async function listCalls() {
+async function listCalls(workspaceId) {
   const p = getPool();
   const { rows } = await p.query(
     `
     SELECT id, agent_id, agent_name, "to", room_name, started_at, ended_at, duration_sec, outcome, cost_usd,
            (recording->>'url') AS recording_url,
-           created_at, updated_at
+           created_at, updated_at, workspace_id
     FROM calls
+    WHERE workspace_id=$1
     ORDER BY started_at DESC
-  `
+  `,
+    [workspaceId]
   );
   return rows.map((r) => ({
     id: r.id,
+    workspaceId: r.workspace_id ?? null,
     agentId: r.agent_id,
     agentName: r.agent_name,
     to: r.to,
@@ -408,9 +539,9 @@ async function listCalls() {
   }));
 }
 
-async function getCall(id) {
+async function getCall(workspaceId, id) {
   const p = getPool();
-  const { rows } = await p.query(`SELECT * FROM calls WHERE id=$1`, [id]);
+  const { rows } = await p.query(`SELECT * FROM calls WHERE workspace_id=$1 AND id=$2`, [workspaceId, id]);
   return rows[0] ? rowToCall(rows[0]) : null;
 }
 
@@ -487,6 +618,16 @@ async function upsertCallForMigration(call) {
 }
 
 module.exports = {
+  // Auth
+  createUser,
+  getUserByEmail,
+  getUserById,
+  createSession,
+  getSession,
+  deleteSession,
+  getWorkspaceForUser,
+  ensureWorkspaceForUser,
+
   // Workspaces + phone numbers
   listWorkspaces,
   getWorkspace,
@@ -495,6 +636,7 @@ module.exports = {
   ensureDefaultWorkspace,
   listPhoneNumbers,
   getPhoneNumber,
+  getPhoneNumberByE164,
   createPhoneNumber,
   updatePhoneNumber,
   deletePhoneNumber,
@@ -508,6 +650,7 @@ module.exports = {
   updateCall,
   listCalls,
   getCall,
+  getCallById,
   upsertAgentForMigration,
   upsertCallForMigration,
 };

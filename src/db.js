@@ -31,18 +31,43 @@ async function initSchema() {
   if (!p) return false;
 
   await p.query(`
-    CREATE TABLE IF NOT EXISTS workspaces (
+    CREATE TABLE IF NOT EXISTS users (
       id TEXT PRIMARY KEY,
-      name TEXT NOT NULL,
-      twilio_subaccount_sid TEXT NULL,
+      email TEXT NOT NULL UNIQUE,
+      name TEXT NOT NULL DEFAULT '',
+      password_hash TEXT NOT NULL,
       created_at BIGINT NOT NULL,
       updated_at BIGINT NOT NULL
     );
   `);
 
   await p.query(`
+    CREATE TABLE IF NOT EXISTS sessions (
+      token TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      expires_at BIGINT NOT NULL,
+      created_at BIGINT NOT NULL
+    );
+  `);
+
+  await p.query(`
+    CREATE TABLE IF NOT EXISTS workspaces (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      user_id TEXT NULL,
+      twilio_subaccount_sid TEXT NULL,
+      created_at BIGINT NOT NULL,
+      updated_at BIGINT NOT NULL
+    );
+  `);
+
+  // Backward-compatible schema upgrades (when table already exists)
+  await p.query(`ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS user_id TEXT NULL;`);
+
+  await p.query(`
     CREATE TABLE IF NOT EXISTS agents (
       id TEXT PRIMARY KEY,
+      workspace_id TEXT NULL,
       name TEXT NOT NULL,
       prompt_draft TEXT NOT NULL DEFAULT '',
       prompt_published TEXT NOT NULL DEFAULT '',
@@ -53,9 +78,13 @@ async function initSchema() {
     );
   `);
 
+  await p.query(`ALTER TABLE agents ADD COLUMN IF NOT EXISTS workspace_id TEXT NULL;`);
+  await p.query(`CREATE INDEX IF NOT EXISTS agents_workspace_idx ON agents(workspace_id, created_at DESC);`);
+
   await p.query(`
     CREATE TABLE IF NOT EXISTS calls (
       id TEXT PRIMARY KEY,
+      workspace_id TEXT NULL,
       agent_id TEXT NULL,
       agent_name TEXT NOT NULL,
       "to" TEXT NOT NULL,
@@ -73,7 +102,10 @@ async function initSchema() {
     );
   `);
 
+  await p.query(`ALTER TABLE calls ADD COLUMN IF NOT EXISTS workspace_id TEXT NULL;`);
+
   await p.query(`CREATE INDEX IF NOT EXISTS calls_agent_started_idx ON calls(agent_id, started_at DESC);`);
+  await p.query(`CREATE INDEX IF NOT EXISTS calls_workspace_started_idx ON calls(workspace_id, started_at DESC);`);
 
   await p.query(`
     CREATE TABLE IF NOT EXISTS phone_numbers (
