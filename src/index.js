@@ -636,6 +636,8 @@ app.put("/api/phone-numbers/:id", requireAuth, async (req, res) => {
     outboundAgentId: z.string().min(1).nullable().optional(),
     livekitInboundTrunkId: z.string().min(1).nullable().optional(),
     livekitOutboundTrunkId: z.string().min(1).nullable().optional(),
+    livekitSipUsername: z.string().min(1).nullable().optional(),
+    livekitSipPassword: z.string().min(1).nullable().optional(),
     allowedInboundCountries: z.union([z.array(z.string()), z.string()]).optional(),
     allowedOutboundCountries: z.union([z.array(z.string()), z.string()]).optional(),
   });
@@ -652,6 +654,8 @@ app.put("/api/phone-numbers/:id", requireAuth, async (req, res) => {
     outboundAgentId: parsed.data.outboundAgentId,
     livekitInboundTrunkId: parsed.data.livekitInboundTrunkId,
     livekitOutboundTrunkId: parsed.data.livekitOutboundTrunkId,
+    livekitSipUsername: parsed.data.livekitSipUsername,
+    livekitSipPassword: parsed.data.livekitSipPassword,
     allowedInboundCountries:
       parsed.data.allowedInboundCountries === undefined ? undefined : normalizeCountries(parsed.data.allowedInboundCountries),
     allowedOutboundCountries:
@@ -727,137 +731,37 @@ app.post("/api/twilio/inbound", async (req, res) => {
     return;
   }
 
-  const agentId = phoneRow.inboundAgentId;
-  if (!agentId) {
-    vr.say("Inbound agent is not configured yet.");
+  // LiveKit docs for Twilio Programmable Voice require SIP trunk auth (username/password) and dialing:
+  //   sip:<your_twilio_number>@<your LiveKit SIP endpoint>
+  // Ref: https://docs.livekit.io/telephony/accepting-calls/inbound-twilio/
+  const sipEndpoint = String(process.env.LIVEKIT_SIP_ENDPOINT || "").trim();
+  const sipUser = String(phoneRow.livekitSipUsername || "").trim();
+  const sipPass = String(phoneRow.livekitSipPassword || "").trim();
+
+  if (!sipEndpoint) {
+    console.log("[twilio-inbound] LIVEKIT_SIP_ENDPOINT not set", { twilioCallSid, to, from });
+    vr.say("LiveKit SIP endpoint is not configured.");
+    res.type("text/xml").send(vr.toString());
+    return;
+  }
+  if (!sipUser || !sipPass) {
+    console.log("[twilio-inbound] missing LiveKit SIP auth on phone number", { twilioCallSid, to });
+    vr.say("This number is missing LiveKit SIP credentials.");
     res.type("text/xml").send(vr.toString());
     return;
   }
 
-  const agent = USE_DB
-    ? await store.getAgent(phoneRow.workspaceId, agentId)
-    : readAgents().find((a) => a.id === agentId);
-  if (!agent) {
-    vr.say("Inbound agent was not found.");
-    res.type("text/xml").send(vr.toString());
-    return;
-  }
-
-  const promptDraft = agent.promptDraft ?? agent.prompt ?? "";
-  const promptPublished = agent.promptPublished ?? "";
-  const promptUsed = (promptDraft && String(promptDraft).trim()) ? promptDraft : promptPublished;
-  if (!promptUsed || String(promptUsed).trim().length === 0) {
-    vr.say("Agent prompt is empty.");
-    res.type("text/xml").send(vr.toString());
-    return;
-  }
-
-  const sipTemplate = String(process.env.LIVEKIT_SIP_URI_TEMPLATE || "").trim();
-  if (!sipTemplate || !sipTemplate.includes("{room}")) {
-    console.log("[twilio-inbound] LIVEKIT_SIP_URI_TEMPLATE not set", { twilioCallSid, to, from });
-    vr.say("LiveKit SIP is not configured.");
-    res.type("text/xml").send(vr.toString());
-    return;
-  }
-
-  // Use the same naming scheme as web tests so your existing LiveKit Agent deployment joins.
-  const roomName = `agent-${agentId}-${nanoid(6)}`;
-  const callId = `call_${nanoid(12)}`;
-
-  // Persist call immediately
-  const now = Date.now();
-  const callRecord = {
-    id: callId,
-    workspaceId: phoneRow.workspaceId ?? null,
-    agentId: agent.id,
-    agentName: agent.name,
-    // In call history, show caller as "to" so it's visible.
-    to: from || "unknown",
-    roomName,
-    startedAt: now,
-    endedAt: null,
-    durationSec: null,
-    outcome: "in_progress",
-    costUsd: null,
-    transcript: [],
-    recording: null,
-    metrics: null,
-    createdAt: now,
-    updatedAt: now,
-  };
-
-  if (USE_DB) {
-    await store.createCall(callRecord);
-  } else {
-    const calls = readCalls();
-    calls.unshift(callRecord);
-    writeCalls(calls);
-  }
-
-  // Create room with metadata so the LiveKit Agent can read prompt/callId
-  const rs = roomService();
-  const welcome = {
-    mode: agent.welcome?.mode ?? "user",
-    aiMessageMode: agent.welcome?.aiMessageMode ?? "dynamic",
-    aiMessageText: agent.welcome?.aiMessageText ?? "",
-    aiDelaySeconds: agent.welcome?.aiDelaySeconds ?? 0,
-  };
-
-  const roomMeta = JSON.stringify({
-    agentId: agent.id,
-    agentName: agent.name,
-    prompt: promptUsed,
-    callId,
-    welcome,
-    direction: "inbound",
-    twilio: { to, from },
-  });
-
-  try {
-    await rs.createRoom({ name: roomName, emptyTimeout: 10, metadata: roomMeta });
-  } catch (e) {
-    // Room might already exist; ignore if so.
-  }
-
-  // Start recording if Egress is enabled (same as web test)
-  try {
-    const e = await startCallEgress({ roomName, callId });
-    if (e) {
-      const recording = {
-        kind: "egress_s3",
-        egressId: e.egressId,
-        bucket: e.bucket,
-        key: e.key,
-        status: "recording",
-        url: `/api/calls/${encodeURIComponent(callId)}/recording`,
-      };
-      if (USE_DB) await store.updateCall(callId, { recording });
-      else {
-        const calls = readCalls();
-        const idx = calls.findIndex((c) => c.id === callId);
-        if (idx >= 0) {
-          calls[idx] = { ...calls[idx], recording, updatedAt: Date.now() };
-          writeCalls(calls);
-        }
-      }
-    }
-  } catch {
-    // ignore recording errors for call setup
-  }
-
-  let sipUri = sipTemplate.replaceAll("{room}", roomName);
-  if (!sipUri.startsWith("sip:")) sipUri = `sip:${sipUri}`;
+  let dest = `${to}@${sipEndpoint}`;
+  if (!dest.startsWith("sip:")) dest = `sip:${dest}`;
 
   console.log("[twilio-inbound] dial", {
     twilioCallSid,
     to,
     from,
-    roomName,
-    callId,
-    sipUri,
+    dest,
   });
 
-  vr.dial({ answerOnBridge: true }).sip(sipUri);
+  vr.dial({ answerOnBridge: true }).sip({ username: sipUser, password: sipPass }, dest);
   res.type("text/xml").send(vr.toString());
 });
 

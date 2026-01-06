@@ -68,6 +68,8 @@ function rowToPhoneNumber(r) {
     twilioNumberSid: r.twilio_number_sid ?? null,
     livekitInboundTrunkId: r.livekit_inbound_trunk_id ?? null,
     livekitOutboundTrunkId: r.livekit_outbound_trunk_id ?? null,
+    livekitSipUsername: r.livekit_sip_username ?? null,
+    livekitSipPassword: r.livekit_sip_password ?? null,
     inboundAgentId: r.inbound_agent_id ?? null,
     outboundAgentId: r.outbound_agent_id ?? null,
     allowedInboundCountries: r.allowed_inbound_countries ?? ["all"],
@@ -262,10 +264,11 @@ async function createPhoneNumber(input) {
     `
     INSERT INTO phone_numbers
       (id, workspace_id, e164, label, provider, status, twilio_number_sid, livekit_inbound_trunk_id, livekit_outbound_trunk_id,
+       livekit_sip_username, livekit_sip_password,
        inbound_agent_id, outbound_agent_id,
        allowed_inbound_countries, allowed_outbound_countries, created_at, updated_at)
     VALUES
-      ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+      ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
     RETURNING *
   `,
     [
@@ -278,6 +281,8 @@ async function createPhoneNumber(input) {
       input.twilioNumberSid ?? null,
       input.livekitInboundTrunkId ?? null,
       input.livekitOutboundTrunkId ?? null,
+      input.livekitSipUsername ?? null,
+      input.livekitSipPassword ?? null,
       input.inboundAgentId ?? null,
       input.outboundAgentId ?? null,
       JSON.stringify(allowedIn),
@@ -308,11 +313,13 @@ async function updatePhoneNumber(id, patch) {
         twilio_number_sid=$4,
         livekit_inbound_trunk_id=$5,
         livekit_outbound_trunk_id=$6,
-        inbound_agent_id=$7,
-        outbound_agent_id=$8,
-        allowed_inbound_countries=$9,
-        allowed_outbound_countries=$10,
-        updated_at=$11
+        livekit_sip_username=$7,
+        livekit_sip_password=$8,
+        inbound_agent_id=$9,
+        outbound_agent_id=$10,
+        allowed_inbound_countries=$11,
+        allowed_outbound_countries=$12,
+        updated_at=$13
     WHERE id=$1
     RETURNING *
   `,
@@ -323,6 +330,8 @@ async function updatePhoneNumber(id, patch) {
       next.twilioNumberSid ?? null,
       next.livekitInboundTrunkId ?? null,
       next.livekitOutboundTrunkId ?? null,
+      next.livekitSipUsername ?? null,
+      next.livekitSipPassword ?? null,
       next.inboundAgentId ?? null,
       next.outboundAgentId ?? null,
       JSON.stringify(allowedIn),
