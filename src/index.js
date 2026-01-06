@@ -104,6 +104,11 @@ app.use(
       return cb(new Error(`CORS blocked for origin: ${origin}`));
     },
     credentials: true,
+    // Explicitly allow auth header; without this, browsers can block the GET after a successful preflight.
+    allowedHeaders: ["authorization", "content-type", "x-agent-secret"],
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    exposedHeaders: ["content-range", "accept-ranges", "content-length"],
+    optionsSuccessStatus: 204,
   })
 );
 
