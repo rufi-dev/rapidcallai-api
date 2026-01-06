@@ -175,6 +175,18 @@ async function requireAuth(req, res, next) {
   return next();
 }
 
+function requireAgentSecret(req, res, next) {
+  const expected = String(process.env.AGENT_SHARED_SECRET || "").trim();
+  if (!expected) {
+    return res.status(500).json({ error: "AGENT_SHARED_SECRET is not set on the server" });
+  }
+  const got = String(req.headers["x-agent-secret"] || "").trim();
+  if (!got || got !== expected) {
+    return res.status(401).json({ error: "Invalid agent secret" });
+  }
+  return next();
+}
+
 // --- Auth (real auth when using Postgres) ---
 app.post("/api/auth/register", async (req, res) => {
   const schema = z.object({
@@ -240,6 +252,122 @@ app.post("/api/auth/logout", requireAuth, async (req, res) => {
 
 app.get("/api/me", requireAuth, async (req, res) => {
   return res.json({ user: req.user, workspace: req.workspace });
+});
+
+// --- Internal (used by the LiveKit agent to create/update call records) ---
+app.post("/api/internal/telephony/inbound/start", requireAgentSecret, async (req, res) => {
+  const schema = z.object({
+    roomName: z.string().min(1).max(200),
+    to: z.string().min(3).max(32), // trunk phone number (E.164)
+    from: z.string().min(0).max(32).optional(), // caller phone number (E.164)
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "Validation failed", details: parsed.error.flatten() });
+  if (!USE_DB) return res.status(400).json({ error: "Internal endpoints require Postgres mode" });
+
+  const to = parsed.data.to.trim();
+  const from = String(parsed.data.from || "").trim();
+
+  const phoneRow = await store.getPhoneNumberByE164(to);
+  if (!phoneRow) return res.status(404).json({ error: "Phone number not found" });
+
+  const agentId = phoneRow.inboundAgentId;
+  if (!agentId) return res.status(400).json({ error: "Inbound agent not configured for this number" });
+
+  const agent = await store.getAgent(phoneRow.workspaceId, agentId);
+  if (!agent) return res.status(404).json({ error: "Inbound agent not found" });
+
+  const promptDraft = agent.promptDraft ?? "";
+  const promptPublished = agent.promptPublished ?? "";
+  const promptUsed = (promptDraft && String(promptDraft).trim()) ? promptDraft : promptPublished;
+  if (!promptUsed || String(promptUsed).trim().length === 0) {
+    return res.status(400).json({ error: "Agent prompt is empty" });
+  }
+
+  const callId = `call_${nanoid(12)}`;
+  const now = Date.now();
+  const callRecord = {
+    id: callId,
+    workspaceId: phoneRow.workspaceId,
+    agentId: agent.id,
+    agentName: agent.name,
+    to: from || "unknown",
+    roomName: parsed.data.roomName,
+    startedAt: now,
+    endedAt: null,
+    durationSec: null,
+    outcome: "in_progress",
+    costUsd: null,
+    transcript: [],
+    recording: null,
+    metrics: null,
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  await store.createCall(callRecord);
+
+  // Start recording (egress) if configured.
+  try {
+    const e = await startCallEgress({ roomName: callRecord.roomName, callId });
+    if (e) {
+      const recording = {
+        kind: "egress_s3",
+        egressId: e.egressId,
+        bucket: e.bucket,
+        key: e.key,
+        status: "recording",
+        url: `/api/calls/${encodeURIComponent(callId)}/recording`,
+      };
+      await store.updateCall(callId, { recording });
+    }
+  } catch {
+    // ignore
+  }
+
+  return res.status(201).json({
+    callId,
+    agent: { id: agent.id, name: agent.name },
+    prompt: promptUsed,
+    welcome: agent.welcome ?? {},
+    phoneNumber: { id: phoneRow.id, e164: phoneRow.e164 },
+  });
+});
+
+app.post("/api/internal/calls/:id/end", requireAgentSecret, async (req, res) => {
+  const { id } = req.params;
+  const schema = z.object({
+    outcome: z.string().min(1).max(80).optional(),
+    transcript: z
+      .array(
+        z.object({
+          speaker: z.string().min(1).max(120),
+          role: z.enum(["agent", "user"]),
+          text: z.string().min(1).max(5000),
+          final: z.boolean().optional(),
+          firstReceivedTime: z.number().optional(),
+        })
+      )
+      .optional(),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "Validation failed", details: parsed.error.flatten() });
+  if (!USE_DB) return res.status(400).json({ error: "Internal endpoints require Postgres mode" });
+
+  const current = await store.getCallById(id);
+  if (!current) return res.status(404).json({ error: "Call not found" });
+
+  const now = Date.now();
+  const endedAt = current.endedAt ?? now;
+  const durationSec = Math.max(0, Math.round((endedAt - current.startedAt) / 1000));
+
+  const updated = await store.updateCall(id, {
+    endedAt,
+    durationSec,
+    outcome: parsed.data.outcome ?? (current.outcome === "in_progress" ? "completed" : current.outcome),
+    transcript: parsed.data.transcript ? parsed.data.transcript : current.transcript,
+  });
+  return res.json({ call: updated });
 });
 
 function normalizeCountries(v) {
@@ -918,7 +1046,7 @@ app.get("/api/calls/:id", requireAuth, async (req, res) => {
 });
 
 // Called by the Python agent to attach per-call metrics (tokens/latency/cost) to the call record.
-app.post("/api/calls/:id/metrics", async (req, res) => {
+app.post("/api/calls/:id/metrics", requireAgentSecret, async (req, res) => {
   const { id } = req.params;
   const schema = z.object({
     usage: z
