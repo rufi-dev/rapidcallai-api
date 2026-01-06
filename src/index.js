@@ -1201,7 +1201,7 @@ app.get("/api/analytics", requireAuth, async (req, res) => {
   const calls = readCalls();
   const inRange = calls.filter((c) => (c.startedAt || 0) >= qFrom && (c.startedAt || 0) <= qTo);
   const completed = inRange.filter((c) => c.endedAt);
-  const count = calls.length;
+  const count = inRange.length;
   const completedCount = completed.length;
 
   const avgDurationSec =
