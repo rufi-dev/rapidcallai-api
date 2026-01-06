@@ -980,6 +980,9 @@ app.post("/api/agents/:id/start", requireAuth, async (req, res) => {
   }
 
   const rs = roomService();
+  // When using named LiveKit Agents (agent_name), web rooms must explicitly request an agent dispatch.
+  // Telephony dispatch rules only apply to inbound SIP calls; they won't start an agent for a normal web room.
+  const webAgentName = String(process.env.LIVEKIT_WEB_AGENT_NAME || process.env.LIVEKIT_AGENT_NAME || "VoiceAgent").trim();
   // Create the room and embed the agent prompt in room metadata so the Python agent can read it.
   await rs.createRoom({
     name: roomName,
@@ -988,6 +991,14 @@ app.post("/api/agents/:id/start", requireAuth, async (req, res) => {
       agent: { id: agent.id, name: agent.name, prompt: promptUsed },
       welcome,
     }),
+    agents: webAgentName
+      ? [
+          {
+            agentName: webAgentName,
+            metadata: JSON.stringify({ source: "webtest", callId, agentId: agent.id }),
+          },
+        ]
+      : undefined,
     emptyTimeout: 10,
     maxParticipants: 2,
   });
