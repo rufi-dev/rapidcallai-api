@@ -943,7 +943,11 @@ app.post("/api/agents/:id/start", requireAuth, async (req, res) => {
     aiDelaySeconds: startParsed?.data?.welcome?.aiDelaySeconds ?? agent.welcome?.aiDelaySeconds ?? 0,
   };
 
-  const roomName = `agent-${id}-${nanoid(6)}`;
+  // IMPORTANT:
+  // Web test rooms must match an existing LiveKit dispatch rule (telephony typically uses roomPrefix "call-").
+  // If dispatch doesn't trigger, the agent won't join and the web test appears "stuck".
+  const webRoomPrefix = String(process.env.LIVEKIT_WEB_ROOM_PREFIX || "call-").trim() || "call-";
+  const roomName = `${webRoomPrefix}${id}-${nanoid(6)}`;
   const identity = `user-${nanoid(8)}`;
   const callId = `call_${nanoid(12)}`;
 
