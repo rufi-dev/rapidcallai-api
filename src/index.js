@@ -268,19 +268,36 @@ app.post("/api/internal/telephony/inbound/start", requireAgentSecret, async (req
   const to = parsed.data.to.trim();
   const from = String(parsed.data.from || "").trim();
 
+  // eslint-disable-next-line no-console
+  console.log("[internal.telephony.inbound.start]", { roomName: parsed.data.roomName, to, from });
+
   const phoneRow = await store.getPhoneNumberByE164(to);
-  if (!phoneRow) return res.status(404).json({ error: "Phone number not found" });
+  if (!phoneRow) {
+    // eslint-disable-next-line no-console
+    console.log("[internal.telephony.inbound.start] phone number not found", { to });
+    return res.status(404).json({ error: "Phone number not found" });
+  }
 
   const agentId = phoneRow.inboundAgentId;
-  if (!agentId) return res.status(400).json({ error: "Inbound agent not configured for this number" });
+  if (!agentId) {
+    // eslint-disable-next-line no-console
+    console.log("[internal.telephony.inbound.start] inbound agent not configured", { to, phoneNumberId: phoneRow.id });
+    return res.status(400).json({ error: "Inbound agent not configured for this number" });
+  }
 
   const agent = await store.getAgent(phoneRow.workspaceId, agentId);
-  if (!agent) return res.status(404).json({ error: "Inbound agent not found" });
+  if (!agent) {
+    // eslint-disable-next-line no-console
+    console.log("[internal.telephony.inbound.start] inbound agent not found", { agentId, workspaceId: phoneRow.workspaceId });
+    return res.status(404).json({ error: "Inbound agent not found" });
+  }
 
   const promptDraft = agent.promptDraft ?? "";
   const promptPublished = agent.promptPublished ?? "";
   const promptUsed = (promptDraft && String(promptDraft).trim()) ? promptDraft : promptPublished;
   if (!promptUsed || String(promptUsed).trim().length === 0) {
+    // eslint-disable-next-line no-console
+    console.log("[internal.telephony.inbound.start] agent prompt empty", { agentId: agent.id });
     return res.status(400).json({ error: "Agent prompt is empty" });
   }
 
