@@ -1191,7 +1191,7 @@ app.get("/api/analytics", requireAuth, async (req, res) => {
       SELECT
         to_char(date_trunc('day', to_timestamp(started_at / 1000.0) AT TIME ZONE 'UTC'), 'YYYY-MM-DD') AS day,
         COUNT(*)::BIGINT AS calls,
-        SUM(duration_sec)::BIGINT FILTER (WHERE ended_at IS NOT NULL AND duration_sec IS NOT NULL) AS seconds
+        (SUM(duration_sec) FILTER (WHERE ended_at IS NOT NULL AND duration_sec IS NOT NULL))::BIGINT AS seconds
       FROM calls
       WHERE workspace_id=$1 AND started_at >= $2 AND started_at <= $3
       GROUP BY 1
