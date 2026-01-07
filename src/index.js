@@ -1808,10 +1808,12 @@ app.get("/api/billing/summary", requireAuth, async (req, res) => {
       .map((c) => ({ cost_usd: c.costUsd ?? null, metrics: c.metrics ?? null }));
   }
 
+  // Usage (raw usage-based costs) and totals (what the customer pays per call).
   let llmUsd = 0;
   let sttUsd = 0;
   let ttsUsd = 0;
   let totalUsd = 0;
+  let platformUsageUsd = 0;
 
   let llmPromptTokens = 0;
   let llmCompletionTokens = 0;
@@ -1836,7 +1838,7 @@ app.get("/api/billing/summary", requireAuth, async (req, res) => {
     phoneNumbersCount = 0;
   }
   const phoneNumbersUsd = Math.max(0, phoneNumberMonthlyFee) * Math.max(0, phoneNumbersCount);
-  const platformUsd = Math.max(0, platformMonthlyFee);
+  const platformBaseUsd = Math.max(0, platformMonthlyFee);
 
   for (const r of rows) {
     const metrics = r.metrics || null;
@@ -1848,55 +1850,30 @@ app.get("/api/billing/summary", requireAuth, async (req, res) => {
       ttsCharacters += Number(usage.tts_characters_count || 0);
     }
 
-    // IMPORTANT: billing summary returns customer-facing retail charges (not internal COGS).
-    let b =
-      metrics?.retailBreakdown ||
-      (metrics?.cogsBreakdown ? computeRetailBreakdownFromCogs(metrics.cogsBreakdown) : null) ||
-      (metrics?.costBreakdown ? computeRetailBreakdownFromCogs(metrics.costBreakdown) : null) ||
-      computeRetailBreakdownFromCogs(computeCostBreakdownFromUsage(usage, metrics?.models?.llm));
+    // Usage costs (raw usage-based): prefer stored COGS breakdown, otherwise compute from usage.
+    const cogs =
+      metrics?.cogsBreakdown || metrics?.costBreakdown || computeCostBreakdownFromUsage(usage, metrics?.models?.llm) || null;
 
-    // If the stored call total exists but breakdown was recomputed with a different markup,
-    // scale the breakdown to match the stored total so numbers add up for users.
+    if (cogs?.llm?.costUsd != null) {
+      llmUsd += Number(cogs.llm.costUsd);
+      anyCost = true;
+    }
+    if (cogs?.stt?.costUsd != null) {
+      sttUsd += Number(cogs.stt.costUsd);
+      anyCost = true;
+    }
+    if (cogs?.tts?.costUsd != null) {
+      ttsUsd += Number(cogs.tts.costUsd);
+      anyCost = true;
+    }
+
+    // Per-call charged total: prefer stored retail total; otherwise compute from usage with current markup.
     const stored = typeof r.cost_usd === "number" && Number.isFinite(r.cost_usd) ? Number(r.cost_usd) : null;
-    const bTotal =
-      b?.totalUsd != null
-        ? Number(b.totalUsd)
-        : [b?.llm?.costUsd, b?.stt?.costUsd, b?.tts?.costUsd]
-            .filter((v) => typeof v === "number" && Number.isFinite(v))
-            .reduce((a, v) => a + v, 0);
-
-    if (stored != null && bTotal != null && Number.isFinite(bTotal) && bTotal > 0) {
-      const ratio = stored / bTotal;
-      if (Number.isFinite(ratio) && ratio > 0 && Math.abs(ratio - 1) > 0.01) {
-        b = {
-          ...b,
-          llm: b.llm ? { ...b.llm, costUsd: typeof b.llm.costUsd === "number" ? b.llm.costUsd * ratio : b.llm.costUsd } : b.llm,
-          stt: b.stt ? { ...b.stt, costUsd: typeof b.stt.costUsd === "number" ? b.stt.costUsd * ratio : b.stt.costUsd } : b.stt,
-          tts: b.tts ? { ...b.tts, costUsd: typeof b.tts.costUsd === "number" ? b.tts.costUsd * ratio : b.tts.costUsd } : b.tts,
-          totalUsd: stored,
-        };
-      }
-    }
-
-    if (b?.llm?.costUsd != null) {
-      llmUsd += Number(b.llm.costUsd);
-      anyCost = true;
-    }
-    if (b?.stt?.costUsd != null) {
-      sttUsd += Number(b.stt.costUsd);
-      anyCost = true;
-    }
-    if (b?.tts?.costUsd != null) {
-      ttsUsd += Number(b.tts.costUsd);
-      anyCost = true;
-    }
-
-    const c = typeof r.cost_usd === "number" ? r.cost_usd : null;
-    if (c != null && Number.isFinite(c)) {
-      totalUsd += Number(c);
-      anyCost = true;
-    } else if (b?.totalUsd != null) {
-      totalUsd += Number(b.totalUsd);
+    const computedRetail =
+      cogs?.totalUsd != null && Number.isFinite(Number(cogs.totalUsd)) ? applyRetail(Number(cogs.totalUsd)) : null;
+    const callTotal = stored ?? computedRetail;
+    if (callTotal != null && Number.isFinite(callTotal)) {
+      totalUsd += Number(callTotal);
       anyCost = true;
     }
   }
@@ -1905,37 +1882,35 @@ app.get("/api/billing/summary", requireAuth, async (req, res) => {
     return Math.round(n * 10000) / 10000;
   }
 
-  // Final reconciliation: ensure breakdown sums to total, otherwise customers see confusing math.
-  // We never want "LLM+STT+TTS > total" or vice versa without an explicit "Other" line.
-  const sumParts = llmUsd + sttUsd + ttsUsd;
-  if (anyCost && Number.isFinite(totalUsd) && totalUsd > 0 && Number.isFinite(sumParts) && sumParts > 0) {
-    const diff = totalUsd - sumParts;
-    if (Math.abs(diff) > 0.01) {
-      // scale components to match total (keeps proportions stable) and set Other to 0
-      const factor = totalUsd / sumParts;
-      if (Number.isFinite(factor) && factor > 0) {
-        llmUsd *= factor;
-        sttUsd *= factor;
-        ttsUsd *= factor;
-      }
-    }
-  }
+  // Platform usage fee scales with usage: it's the residual between what you charge for calls
+  // and the raw LLM/STT/TTS usage costs.
+  const usageSum = llmUsd + sttUsd + ttsUsd;
+  platformUsageUsd = anyCost ? Math.max(0, totalUsd - usageSum) : 0;
 
   return res.json({
     currency: "USD",
     periodStartMs: qFrom,
     periodEndMs: qTo,
-    upcomingInvoiceUsd: anyCost ? round4(totalUsd + phoneNumbersUsd + platformUsd) : null,
+    upcomingInvoiceUsd: anyCost ? round4(totalUsd + phoneNumbersUsd + platformBaseUsd) : null,
     breakdown: anyCost
       ? {
           llmUsd: round4(llmUsd),
           sttUsd: round4(sttUsd),
           ttsUsd: round4(ttsUsd),
+          platformUsageUsd: round4(platformUsageUsd),
           phoneNumbersUsd: round4(phoneNumbersUsd),
-          platformUsd: round4(platformUsd),
+          platformBaseUsd: round4(platformBaseUsd),
         }
       : null,
-    otherUsd: anyCost ? round4(Math.max(0, (totalUsd + phoneNumbersUsd + platformUsd) - (llmUsd + sttUsd + ttsUsd + phoneNumbersUsd + platformUsd))) : null,
+    otherUsd: anyCost
+      ? round4(
+          Math.max(
+            0,
+            (totalUsd + phoneNumbersUsd + platformBaseUsd) -
+              (llmUsd + sttUsd + ttsUsd + platformUsageUsd + phoneNumbersUsd + platformBaseUsd)
+          )
+        )
+      : null,
     usageTotals: {
       llmPromptTokens,
       llmPromptCachedTokens: rows.reduce((a, r) => a + Number((r?.metrics?.usage?.llm_prompt_cached_tokens || 0)), 0),
