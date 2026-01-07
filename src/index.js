@@ -39,6 +39,44 @@ function numEnv(name) {
   return Number.isFinite(n) ? n : null;
 }
 
+function computeCostBreakdownFromUsage(usage) {
+  if (!usage) return null;
+  const llmInPer1k = numEnv("LLM_INPUT_USD_PER_1K");
+  const llmOutPer1k = numEnv("LLM_OUTPUT_USD_PER_1K");
+  const sttPerMin = numEnv("STT_USD_PER_MIN");
+  const ttsPer1kChars = numEnv("TTS_USD_PER_1K_CHARS");
+
+  const llmPromptTokens = Number(usage.llm_prompt_tokens || 0);
+  const llmCompletionTokens = Number(usage.llm_completion_tokens || 0);
+  const sttAudioSeconds = Number(usage.stt_audio_duration || 0);
+  const ttsCharacters = Number(usage.tts_characters_count || 0);
+
+  const breakdown = {
+    llm: {
+      promptTokens: llmPromptTokens,
+      completionTokens: llmCompletionTokens,
+      costUsd:
+        llmInPer1k != null && llmOutPer1k != null
+          ? Math.round((((llmPromptTokens / 1000) * llmInPer1k + (llmCompletionTokens / 1000) * llmOutPer1k) * 10000)) / 10000
+          : null,
+    },
+    stt: {
+      audioSeconds: sttAudioSeconds,
+      costUsd: sttPerMin != null ? Math.round((((sttAudioSeconds / 60) * sttPerMin) * 10000)) / 10000 : null,
+    },
+    tts: {
+      characters: ttsCharacters,
+      costUsd: ttsPer1kChars != null ? Math.round((((ttsCharacters / 1000) * ttsPer1kChars) * 10000)) / 10000 : null,
+    },
+  };
+
+  const parts = [breakdown.llm.costUsd, breakdown.stt.costUsd, breakdown.tts.costUsd].filter(
+    (v) => typeof v === "number" && Number.isFinite(v)
+  );
+  const totalUsd = parts.length ? Math.round((parts.reduce((a, v) => a + v, 0) * 10000)) / 10000 : null;
+  return { ...breakdown, totalUsd };
+}
+
 function computeCostUsdFromUsage(usage) {
   if (!usage) return null;
   const llmInPer1k = numEnv("LLM_INPUT_USD_PER_1K");
@@ -1398,7 +1436,8 @@ app.post("/api/calls/:id/metrics", requireAgentSecret, async (req, res) => {
   const usage = parsed.data.usage ?? current.metrics?.usage ?? null;
   const latency = parsed.data.latency ?? current.metrics?.latency ?? null;
 
-  const costUsd = computeCostUsdFromUsage(usage) ?? current.costUsd ?? null;
+  const costBreakdown = computeCostBreakdownFromUsage(usage) ?? current.metrics?.costBreakdown ?? null;
+  const costUsd = (costBreakdown?.totalUsd ?? computeCostUsdFromUsage(usage)) ?? current.costUsd ?? null;
 
   const llmIn = Number(usage?.llm_prompt_tokens || 0);
   const llmOut = Number(usage?.llm_completion_tokens || 0);
@@ -1411,6 +1450,7 @@ app.post("/api/calls/:id/metrics", requireAgentSecret, async (req, res) => {
       usage,
       latency,
       tokensTotal,
+      costBreakdown,
     },
     updatedAt: Date.now(),
   };
@@ -1550,6 +1590,112 @@ app.get("/api/analytics", requireAuth, async (req, res) => {
       totalTokens,
     },
     series,
+  });
+});
+
+// --- Billing (Stripe-ready later) ---
+// Upcoming invoice is currently estimated as the sum of provider costs from call usage in the current billing period.
+app.get("/api/billing/summary", requireAuth, async (req, res) => {
+  const fromMs = req.query.from ? Number(req.query.from) : null;
+  const toMs = req.query.to ? Number(req.query.to) : null;
+  const hasFrom = typeof fromMs === "number" && Number.isFinite(fromMs);
+  const hasTo = typeof toMs === "number" && Number.isFinite(toMs);
+
+  const now = new Date();
+  const periodStart = hasFrom ? new Date(fromMs) : new Date(now.getFullYear(), now.getMonth(), 1);
+  const periodEnd = hasTo ? new Date(toMs) : new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59, 999);
+  const qFrom = periodStart.getTime();
+  const qTo = periodEnd.getTime();
+
+  let rows = [];
+  if (USE_DB) {
+    const p = getPool();
+    const q = await p.query(
+      `
+      SELECT cost_usd, metrics
+      FROM calls
+      WHERE workspace_id=$1
+        AND ended_at IS NOT NULL
+        AND started_at >= $2 AND started_at <= $3
+    `,
+      [req.workspace.id, qFrom, qTo]
+    );
+    rows = q.rows;
+  } else {
+    rows = readCalls()
+      .filter((c) => c.workspaceId === req.workspace.id)
+      .filter((c) => c.endedAt != null)
+      .filter((c) => Number(c.startedAt || 0) >= qFrom && Number(c.startedAt || 0) <= qTo)
+      .map((c) => ({ cost_usd: c.costUsd ?? null, metrics: c.metrics ?? null }));
+  }
+
+  let llmUsd = 0;
+  let sttUsd = 0;
+  let ttsUsd = 0;
+  let totalUsd = 0;
+
+  let llmPromptTokens = 0;
+  let llmCompletionTokens = 0;
+  let sttAudioSeconds = 0;
+  let ttsCharacters = 0;
+
+  let anyCost = false;
+
+  for (const r of rows) {
+    const metrics = r.metrics || null;
+    const usage = metrics?.usage || null;
+    if (usage) {
+      llmPromptTokens += Number(usage.llm_prompt_tokens || 0);
+      llmCompletionTokens += Number(usage.llm_completion_tokens || 0);
+      sttAudioSeconds += Number(usage.stt_audio_duration || 0);
+      ttsCharacters += Number(usage.tts_characters_count || 0);
+    }
+
+    const b = metrics?.costBreakdown || computeCostBreakdownFromUsage(usage);
+    if (b?.llm?.costUsd != null) {
+      llmUsd += Number(b.llm.costUsd);
+      anyCost = true;
+    }
+    if (b?.stt?.costUsd != null) {
+      sttUsd += Number(b.stt.costUsd);
+      anyCost = true;
+    }
+    if (b?.tts?.costUsd != null) {
+      ttsUsd += Number(b.tts.costUsd);
+      anyCost = true;
+    }
+
+    const c = typeof r.cost_usd === "number" ? r.cost_usd : null;
+    if (c != null && Number.isFinite(c)) {
+      totalUsd += Number(c);
+      anyCost = true;
+    } else if (b?.totalUsd != null) {
+      totalUsd += Number(b.totalUsd);
+      anyCost = true;
+    }
+  }
+
+  function round4(n) {
+    return Math.round(n * 10000) / 10000;
+  }
+
+  return res.json({
+    currency: "USD",
+    periodStartMs: qFrom,
+    periodEndMs: qTo,
+    upcomingInvoiceUsd: anyCost ? round4(totalUsd) : null,
+    breakdown: anyCost ? { llmUsd: round4(llmUsd), sttUsd: round4(sttUsd), ttsUsd: round4(ttsUsd) } : null,
+    usageTotals: {
+      llmPromptTokens,
+      llmCompletionTokens,
+      sttAudioSeconds,
+      ttsCharacters,
+    },
+    pricingConfigured: {
+      llm: numEnv("LLM_INPUT_USD_PER_1K") != null && numEnv("LLM_OUTPUT_USD_PER_1K") != null,
+      stt: numEnv("STT_USD_PER_MIN") != null,
+      tts: numEnv("TTS_USD_PER_1K_CHARS") != null,
+    },
   });
 });
 
