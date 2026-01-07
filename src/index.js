@@ -7,6 +7,7 @@ require("dotenv").config({
 const express = require("express");
 const cors = require("cors");
 const crypto = require("crypto");
+const https = require("https");
 const bcrypt = require("bcryptjs");
 const { nanoid } = require("nanoid");
 const { z } = require("zod");
@@ -495,6 +496,66 @@ function stripUndefined(obj) {
   return Object.fromEntries(Object.entries(obj).filter(([, v]) => v !== undefined));
 }
 
+function openaiGenerateAgentPrompt({ apiKey, model, input }) {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify({
+      model,
+      temperature: 0.4,
+      messages: [
+        {
+          role: "system",
+          content:
+            "You generate production-grade system prompts for voice agents. " +
+            "Output ONLY the final prompt text (no JSON, no markdown fences). " +
+            "The prompt must be detailed, structured, and optimized for short, one-question-at-a-time voice conversations. " +
+            "Include: ROLE, GOAL, STYLE, FLOW, BUSINESS CONTEXT, REQUIRED DATA, FAQs, DO NOT, ESCALATION, CALL SUMMARY, EXAMPLES. " +
+            "Never invent business facts; rely only on provided inputs; if missing, add safe placeholders.",
+        },
+        {
+          role: "user",
+          content:
+            "Create a system prompt using the following template + questionnaire answers. " +
+            "Make it long and high quality, but still practical for real calls.\n\n" +
+            JSON.stringify(input, null, 2),
+        },
+      ],
+    });
+
+    const req = https.request(
+      {
+        hostname: "api.openai.com",
+        path: "/v1/chat/completions",
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${apiKey}`,
+          "content-type": "application/json",
+          "content-length": Buffer.byteLength(body),
+        },
+      },
+      (res) => {
+        let data = "";
+        res.on("data", (c) => (data += c));
+        res.on("end", () => {
+          try {
+            if (res.statusCode < 200 || res.statusCode >= 300) {
+              return reject(new Error(`OpenAI error ${res.statusCode}: ${String(data).slice(0, 400)}`));
+            }
+            const parsed = JSON.parse(data);
+            const txt =
+              parsed?.choices?.[0]?.message?.content != null ? String(parsed.choices[0].message.content) : "";
+            resolve(txt);
+          } catch (e) {
+            reject(e);
+          }
+        });
+      }
+    );
+    req.on("error", reject);
+    req.write(body);
+    req.end();
+  });
+}
+
 // Serve uploaded call recordings (web-test recordings)
 const RECORDINGS_DIR = path.join(__dirname, "..", "recordings");
 if (!fs.existsSync(RECORDINGS_DIR)) fs.mkdirSync(RECORDINGS_DIR, { recursive: true });
@@ -558,6 +619,47 @@ app.post("/api/agents", requireAuth, async (req, res) => {
   agents.unshift(agent);
   writeAgents(agents);
   return res.status(201).json({ agent });
+});
+
+// Generate a production-grade agent prompt from template + questionnaire (AI-generated).
+app.post("/api/agents/generate-prompt", requireAuth, async (req, res) => {
+  const schema = z.object({
+    templateId: z.string().min(1).max(40),
+    agentName: z.string().max(120).optional(),
+    businessName: z.string().max(120).optional(),
+    industry: z.string().max(120).optional(),
+    location: z.string().max(120).optional(),
+    timezone: z.string().max(60).optional(),
+    languages: z.string().max(120).optional(),
+    primaryGoal: z.string().max(600).optional(),
+    targetCustomer: z.string().max(240).optional(),
+    tone: z.string().max(40).optional(),
+    greetingStyle: z.string().max(240).optional(),
+    offerings: z.string().max(1200).optional(),
+    hours: z.string().max(240).optional(),
+    bookingLink: z.string().max(300).optional(),
+    requiredFields: z.string().max(400).optional(),
+    faqs: z.string().max(2000).optional(),
+    disallowed: z.string().max(1200).optional(),
+    escalation: z.string().max(1200).optional(),
+    policies: z.string().max(2000).optional(),
+    extra: z.string().max(2500).optional(),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "Validation failed", details: parsed.error.flatten() });
+
+  const apiKey = String(process.env.OPENAI_API_KEY || "").trim();
+  if (!apiKey) return res.status(500).json({ error: "OPENAI_API_KEY is not set on the server" });
+  const model = String(process.env.OPENAI_GENERATE_MODEL || "gpt-4.1-mini").trim();
+
+  try {
+    const prompt = await openaiGenerateAgentPrompt({ apiKey, model, input: parsed.data });
+    const trimmed = String(prompt || "").trim();
+    if (!trimmed) return res.status(500).json({ error: "OpenAI returned empty prompt" });
+    return res.json({ promptDraft: trimmed });
+  } catch (e) {
+    return res.status(502).json({ error: "Prompt generation failed" });
+  }
 });
 
 app.get("/api/agents/:id", requireAuth, async (req, res) => {
