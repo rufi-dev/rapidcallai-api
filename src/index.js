@@ -2055,6 +2055,87 @@ app.get("/api/agents/:id/analytics", requireAuth, async (req, res) => {
   });
 });
 
+// Per-agent usage totals for pricing UX (e.g. compute $/min from historical token intensity).
+app.get("/api/agents/:id/usage-summary", requireAuth, async (req, res) => {
+  const { id } = req.params;
+  const fromMs = req.query.from ? Number(req.query.from) : null;
+  const toMs = req.query.to ? Number(req.query.to) : null;
+  const hasFrom = typeof fromMs === "number" && Number.isFinite(fromMs);
+  const hasTo = typeof toMs === "number" && Number.isFinite(toMs);
+
+  const now = new Date();
+  const periodStart = hasFrom ? new Date(fromMs) : new Date(now.getFullYear(), now.getMonth(), 1);
+  const periodEnd = hasTo ? new Date(toMs) : new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59, 999);
+  const qFrom = periodStart.getTime();
+  const qTo = periodEnd.getTime();
+
+  if (USE_DB) {
+    const agent = await store.getAgent(req.workspace.id, id);
+    if (!agent) return res.status(404).json({ error: "Agent not found" });
+    const p = getPool();
+    const { rows } = await p.query(
+      `
+      SELECT
+        COALESCE(SUM(duration_sec), 0)::BIGINT AS duration_sec,
+        COALESCE(SUM(COALESCE((metrics->'usage'->>'llm_prompt_tokens')::BIGINT, 0)), 0)::BIGINT AS llm_prompt_tokens,
+        COALESCE(SUM(COALESCE((metrics->'usage'->>'llm_prompt_cached_tokens')::BIGINT, 0)), 0)::BIGINT AS llm_prompt_cached_tokens,
+        COALESCE(SUM(COALESCE((metrics->'usage'->>'llm_completion_tokens')::BIGINT, 0)), 0)::BIGINT AS llm_completion_tokens,
+        COALESCE(SUM(COALESCE((metrics->'usage'->>'stt_audio_duration')::DOUBLE PRECISION, 0)), 0)::DOUBLE PRECISION AS stt_audio_seconds,
+        COALESCE(SUM(COALESCE((metrics->'usage'->>'tts_characters_count')::BIGINT, 0)), 0)::BIGINT AS tts_characters
+      FROM calls
+      WHERE workspace_id=$1
+        AND agent_id=$2
+        AND ended_at IS NOT NULL
+        AND started_at >= $3 AND started_at <= $4
+    `,
+      [req.workspace.id, id, qFrom, qTo]
+    );
+    const r = rows[0] || {};
+    const durationSec = Number(r.duration_sec || 0);
+    const minutes = durationSec > 0 ? durationSec / 60 : 0;
+    return res.json({
+      agentId: id,
+      range: { from: qFrom, to: qTo, tz: "UTC" },
+      totals: {
+        durationSec,
+        minutes,
+        llmPromptTokens: Number(r.llm_prompt_tokens || 0),
+        llmPromptCachedTokens: Number(r.llm_prompt_cached_tokens || 0),
+        llmCompletionTokens: Number(r.llm_completion_tokens || 0),
+        sttAudioSeconds: Number(r.stt_audio_seconds || 0),
+        ttsCharacters: Number(r.tts_characters || 0),
+      },
+    });
+  }
+
+  const calls = readCalls()
+    .filter((c) => c.agentId === id)
+    .filter((c) => c.endedAt != null)
+    .filter((c) => Number(c.startedAt || 0) >= qFrom && Number(c.startedAt || 0) <= qTo);
+
+  let durationSec = 0;
+  let llmPromptTokens = 0;
+  let llmPromptCachedTokens = 0;
+  let llmCompletionTokens = 0;
+  let sttAudioSeconds = 0;
+  let ttsCharacters = 0;
+  for (const c of calls) {
+    durationSec += Number(c.durationSec || 0);
+    const u = c.metrics?.usage || {};
+    llmPromptTokens += Number(u.llm_prompt_tokens || 0);
+    llmPromptCachedTokens += Number(u.llm_prompt_cached_tokens || 0);
+    llmCompletionTokens += Number(u.llm_completion_tokens || 0);
+    sttAudioSeconds += Number(u.stt_audio_duration || 0);
+    ttsCharacters += Number(u.tts_characters_count || 0);
+  }
+  const minutes = durationSec > 0 ? durationSec / 60 : 0;
+  return res.json({
+    agentId: id,
+    range: { from: qFrom, to: qTo, tz: "UTC" },
+    totals: { durationSec, minutes, llmPromptTokens, llmPromptCachedTokens, llmCompletionTokens, sttAudioSeconds, ttsCharacters },
+  });
+});
+
 // Stream the call recording (supports Range requests for <audio> playback).
 app.get("/api/calls/:id/recording", requireAuth, async (req, res) => {
   const { id } = req.params;
