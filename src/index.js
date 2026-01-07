@@ -1831,11 +1831,27 @@ app.get("/api/billing/summary", requireAuth, async (req, res) => {
     }
 
     // IMPORTANT: billing summary returns customer-facing retail charges (not internal COGS).
-    const b =
+    let b =
       metrics?.retailBreakdown ||
       (metrics?.cogsBreakdown ? computeRetailBreakdownFromCogs(metrics.cogsBreakdown) : null) ||
       (metrics?.costBreakdown ? computeRetailBreakdownFromCogs(metrics.costBreakdown) : null) ||
       computeRetailBreakdownFromCogs(computeCostBreakdownFromUsage(usage, metrics?.models?.llm));
+
+    // If the stored call total exists but breakdown was recomputed with a different markup,
+    // scale the breakdown to match the stored total so numbers add up for users.
+    const stored = typeof r.cost_usd === "number" && Number.isFinite(r.cost_usd) ? Number(r.cost_usd) : null;
+    if (stored != null && b?.totalUsd != null && b.totalUsd > 0) {
+      const ratio = stored / b.totalUsd;
+      if (Number.isFinite(ratio) && ratio > 0 && Math.abs(ratio - 1) > 0.01) {
+        b = {
+          ...b,
+          llm: b.llm ? { ...b.llm, costUsd: typeof b.llm.costUsd === "number" ? b.llm.costUsd * ratio : b.llm.costUsd } : b.llm,
+          stt: b.stt ? { ...b.stt, costUsd: typeof b.stt.costUsd === "number" ? b.stt.costUsd * ratio : b.stt.costUsd } : b.stt,
+          tts: b.tts ? { ...b.tts, costUsd: typeof b.tts.costUsd === "number" ? b.tts.costUsd * ratio : b.tts.costUsd } : b.tts,
+          totalUsd: stored,
+        };
+      }
+    }
 
     if (b?.llm?.costUsd != null) {
       llmUsd += Number(b.llm.costUsd);
@@ -1870,6 +1886,7 @@ app.get("/api/billing/summary", requireAuth, async (req, res) => {
     periodEndMs: qTo,
     upcomingInvoiceUsd: anyCost ? round4(totalUsd) : null,
     breakdown: anyCost ? { llmUsd: round4(llmUsd), sttUsd: round4(sttUsd), ttsUsd: round4(ttsUsd) } : null,
+    otherUsd: anyCost ? round4(Math.max(0, totalUsd - (llmUsd + sttUsd + ttsUsd))) : null,
     usageTotals: {
       llmPromptTokens,
       llmPromptCachedTokens: rows.reduce((a, r) => a + Number((r?.metrics?.usage?.llm_prompt_cached_tokens || 0)), 0),
