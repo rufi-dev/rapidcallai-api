@@ -418,7 +418,7 @@ app.post("/api/internal/telephony/inbound/start", requireAgentSecret, async (req
   // Start recording (egress) if configured.
   try {
     const e = await startCallEgress({ roomName: callRecord.roomName, callId });
-    if (e) {
+    if (e && e.enabled) {
       const recording = {
         kind: "egress_s3",
         egressId: e.egressId,
@@ -429,8 +429,8 @@ app.post("/api/internal/telephony/inbound/start", requireAgentSecret, async (req
       };
       await store.updateCall(callId, { recording });
     }
-  } catch {
-    // ignore
+  } catch (e) {
+    console.warn("[internal.telephony.inbound.start] failed to start egress", e?.message || e);
   }
 
   return res.status(201).json({
@@ -476,6 +476,52 @@ app.post("/api/internal/calls/:id/end", requireAgentSecret, async (req, res) => 
     outcome: parsed.data.outcome ?? (current.outcome === "in_progress" ? "completed" : current.outcome),
     transcript: parsed.data.transcript ? parsed.data.transcript : current.transcript,
   });
+
+  // Stop/finalize egress for telephony calls (same behavior as public /api/calls/:id/end).
+  try {
+    const c = await store.getCallById(id);
+    if (c?.recording?.kind === "egress_s3" && c.recording.egressId) {
+      const egressId = c.recording.egressId;
+      await store.updateCall(id, { recording: { ...c.recording, status: "stopping" } });
+
+      setTimeout(async () => {
+        try {
+          await stopEgress(egressId);
+        } catch {
+          // ignore
+        }
+        const started = Date.now();
+        const maxMs = 90_000;
+        const intervalMs = 2000;
+        while (Date.now() - started < maxMs) {
+          try {
+            const info = await getEgressInfo(egressId);
+            const status = info?.status;
+            if (status === 3) {
+              const c2 = await store.getCallById(id);
+              if (c2?.recording?.kind === "egress_s3") {
+                await store.updateCall(id, { recording: { ...c2.recording, status: "ready" } });
+              }
+              return;
+            }
+            if (status === 4 || status === 5) {
+              const c2 = await store.getCallById(id);
+              if (c2?.recording?.kind === "egress_s3") {
+                await store.updateCall(id, { recording: { ...c2.recording, status: "failed" } });
+              }
+              return;
+            }
+          } catch {
+            // ignore and keep polling
+          }
+          await new Promise((r) => setTimeout(r, intervalMs));
+        }
+      }, 0);
+    }
+  } catch {
+    // ignore; call end should not fail because of egress
+  }
+
   return res.json({ call: updated });
 });
 
