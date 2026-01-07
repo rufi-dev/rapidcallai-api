@@ -21,6 +21,7 @@ function rowToAgent(r) {
     publishedAt: r.published_at ?? null,
     welcome: r.welcome ?? {},
     voice: r.voice ?? {},
+    llmModel: r.llm_model ?? "",
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   };
@@ -357,7 +358,7 @@ async function listAgents(workspaceId) {
   return rows.map(rowToAgent);
 }
 
-async function createAgent({ workspaceId, name, promptDraft = "", promptPublished = "", welcome = null, voice = null }) {
+async function createAgent({ workspaceId, name, promptDraft = "", promptPublished = "", welcome = null, voice = null, llmModel = "" }) {
   const p = getPool();
   const now = Date.now();
   const id = nanoid(10);
@@ -380,11 +381,11 @@ async function createAgent({ workspaceId, name, promptDraft = "", promptPublishe
 
   const { rows } = await p.query(
     `
-    INSERT INTO agents (id, workspace_id, name, prompt_draft, prompt_published, published_at, welcome, voice, created_at, updated_at)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+    INSERT INTO agents (id, workspace_id, name, prompt_draft, prompt_published, published_at, welcome, voice, llm_model, created_at, updated_at)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
     RETURNING *
   `,
-    [id, workspaceId, name, promptDraft ?? "", promptPublished ?? "", pubAt, JSON.stringify(welcomeNorm), JSON.stringify(voiceNorm), now, now]
+    [id, workspaceId, name, promptDraft ?? "", promptPublished ?? "", pubAt, JSON.stringify(welcomeNorm), JSON.stringify(voiceNorm), String(llmModel || ""), now, now]
   );
   return rowToAgent(rows[0]);
 }
@@ -395,7 +396,7 @@ async function getAgent(workspaceId, id) {
   return rows[0] ? rowToAgent(rows[0]) : null;
 }
 
-async function updateAgent(workspaceId, id, { name, promptDraft, publish, welcome, voice }) {
+async function updateAgent(workspaceId, id, { name, promptDraft, publish, welcome, voice, llmModel }) {
   const p = getPool();
   const current = await getAgent(workspaceId, id);
   if (!current) return null;
@@ -420,6 +421,8 @@ async function updateAgent(workspaceId, id, { name, promptDraft, publish, welcom
     voiceId: v.voiceId ?? null,
   };
 
+  const nextLlmModel = llmModel == null ? (current.llmModel ?? "") : String(llmModel || "");
+
   const updatedAt = Date.now();
   const { rows } = await p.query(
     `
@@ -430,11 +433,12 @@ async function updateAgent(workspaceId, id, { name, promptDraft, publish, welcom
         published_at=$5,
         welcome=$6,
         voice=$7,
-        updated_at=$8
-    WHERE workspace_id=$9 AND id=$1
+        llm_model=$8,
+        updated_at=$9
+    WHERE workspace_id=$10 AND id=$1
     RETURNING *
   `,
-    [id, name ?? null, nextDraft, nextPublished, publishedAt, JSON.stringify(welcomeNorm), JSON.stringify(voiceNorm), updatedAt, workspaceId]
+    [id, name ?? null, nextDraft, nextPublished, publishedAt, JSON.stringify(welcomeNorm), JSON.stringify(voiceNorm), nextLlmModel, updatedAt, workspaceId]
   );
   return rows[0] ? rowToAgent(rows[0]) : null;
 }

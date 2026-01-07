@@ -39,11 +39,89 @@ function numEnv(name) {
   return Number.isFinite(n) ? n : null;
 }
 
-function computeCostBreakdownFromUsage(usage) {
-  if (!usage) return null;
+// Default LLM pricing catalog (USD per 1M tokens) based on OpenAI pricing table:
+// https://platform.openai.com/pricing
+// You can override this at runtime via LLM_PRICING_JSON (recommended for long-term accuracy).
+const DEFAULT_LLM_PRICING_PER_1M = {
+  "gpt-5.2": { input: 1.75, cached_input: 0.175, output: 14.0 },
+  "gpt-5.1": { input: 1.25, cached_input: 0.125, output: 10.0 },
+  "gpt-5": { input: 1.25, cached_input: 0.125, output: 10.0 },
+  "gpt-5-mini": { input: 0.25, cached_input: 0.025, output: 2.0 },
+  "gpt-5-nano": { input: 0.05, cached_input: 0.005, output: 0.4 },
+  "gpt-5.2-chat-latest": { input: 1.75, cached_input: 0.175, output: 14.0 },
+  "gpt-5.1-chat-latest": { input: 1.25, cached_input: 0.125, output: 10.0 },
+  "gpt-5-chat-latest": { input: 1.25, cached_input: 0.125, output: 10.0 },
+  "gpt-4.1": { input: 2.0, cached_input: 0.5, output: 8.0 },
+  "gpt-4.1-mini": { input: 0.4, cached_input: 0.1, output: 1.6 },
+  "gpt-4.1-nano": { input: 0.1, cached_input: 0.025, output: 0.4 },
+  "gpt-4o": { input: 2.5, cached_input: 1.25, output: 10.0 },
+  "gpt-4o-mini": { input: 0.15, cached_input: 0.075, output: 0.6 },
+  "gpt-realtime": { input: 4.0, cached_input: 0.4, output: 16.0 },
+};
+
+function parseJsonEnv(name) {
+  const raw = String(process.env[name] || "").trim();
+  if (!raw) return null;
+  try {
+    const v = JSON.parse(raw);
+    return v && typeof v === "object" ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+function getLlmPricingPer1k(model) {
+  const m = String(model || "").trim();
+
+  // Optional override: env JSON.
+  // Supported formats:
+  // 1) { "gpt-5.2": { "inputPer1M": 1.75, "cachedInputPer1M": 0.175, "outputPer1M": 14.0 } }
+  // 2) { "gpt-5.2": { "inputPer1K": 0.00175, "cachedInputPer1K": 0.000175, "outputPer1K": 0.014 } }
+  const envTable = parseJsonEnv("LLM_PRICING_JSON");
+  const rec = envTable && m && envTable[m] ? envTable[m] : null;
+  if (rec && typeof rec === "object") {
+    const inputPer1K = Number(rec.inputPer1K);
+    const cachedPer1K = Number(rec.cachedInputPer1K);
+    const outputPer1K = Number(rec.outputPer1K);
+    const inputPer1M = Number(rec.inputPer1M);
+    const cachedPer1M = Number(rec.cachedInputPer1M);
+    const outputPer1M = Number(rec.outputPer1M);
+
+    const resolved = {
+      inputPer1K: Number.isFinite(inputPer1K) ? inputPer1K : Number.isFinite(inputPer1M) ? inputPer1M / 1000 : null,
+      cachedInputPer1K: Number.isFinite(cachedPer1K)
+        ? cachedPer1K
+        : Number.isFinite(cachedPer1M)
+          ? cachedPer1M / 1000
+          : null,
+      outputPer1K: Number.isFinite(outputPer1K) ? outputPer1K : Number.isFinite(outputPer1M) ? outputPer1M / 1000 : null,
+    };
+    if (resolved.inputPer1K != null && resolved.outputPer1K != null) return resolved;
+  }
+
+  // Default catalog.
+  const d = m && DEFAULT_LLM_PRICING_PER_1M[m] ? DEFAULT_LLM_PRICING_PER_1M[m] : null;
+  if (d) {
+    return {
+      inputPer1K: d.input / 1000,
+      cachedInputPer1K: typeof d.cached_input === "number" ? d.cached_input / 1000 : null,
+      outputPer1K: d.output / 1000,
+    };
+  }
+
+  // Fallback to global env.
   const llmInPer1k = numEnv("LLM_INPUT_USD_PER_1K");
   const llmCachedInPer1k = numEnv("LLM_CACHED_INPUT_USD_PER_1K");
   const llmOutPer1k = numEnv("LLM_OUTPUT_USD_PER_1K");
+  if (llmInPer1k != null && llmOutPer1k != null) {
+    return { inputPer1K: llmInPer1k, cachedInputPer1K: llmCachedInPer1k, outputPer1K: llmOutPer1k };
+  }
+  return null;
+}
+
+function computeCostBreakdownFromUsage(usage, llmModel) {
+  if (!usage) return null;
+  const llmRates = getLlmPricingPer1k(llmModel);
   const sttPerMin = numEnv("STT_USD_PER_MIN");
   const ttsPer1kChars = numEnv("TTS_USD_PER_1K_CHARS");
 
@@ -59,12 +137,12 @@ function computeCostBreakdownFromUsage(usage) {
       promptCachedTokens: llmPromptCachedTokens,
       completionTokens: llmCompletionTokens,
       costUsd:
-        llmInPer1k != null && llmOutPer1k != null
+        llmRates?.inputPer1K != null && llmRates?.outputPer1K != null
           ? Math.round(
               ((
-                (llmPromptTokens / 1000) * llmInPer1k +
-                (llmCachedInPer1k != null ? (llmPromptCachedTokens / 1000) * llmCachedInPer1k : 0) +
-                (llmCompletionTokens / 1000) * llmOutPer1k
+                (llmPromptTokens / 1000) * llmRates.inputPer1K +
+                (llmRates.cachedInputPer1K != null ? (llmPromptCachedTokens / 1000) * llmRates.cachedInputPer1K : 0) +
+                (llmCompletionTokens / 1000) * llmRates.outputPer1K
               ) * 10000)
             ) / 10000
           : null,
@@ -86,23 +164,21 @@ function computeCostBreakdownFromUsage(usage) {
   return { ...breakdown, totalUsd };
 }
 
-function computeCostUsdFromUsage(usage) {
+function computeCostUsdFromUsage(usage, llmModel) {
   if (!usage) return null;
-  const llmInPer1k = numEnv("LLM_INPUT_USD_PER_1K");
-  const llmCachedInPer1k = numEnv("LLM_CACHED_INPUT_USD_PER_1K");
-  const llmOutPer1k = numEnv("LLM_OUTPUT_USD_PER_1K");
+  const llmRates = getLlmPricingPer1k(llmModel);
   const sttPerMin = numEnv("STT_USD_PER_MIN");
   const ttsPer1kChars = numEnv("TTS_USD_PER_1K_CHARS");
 
   let total = 0;
   let any = false;
 
-  if (llmInPer1k != null && llmOutPer1k != null) {
+  if (llmRates?.inputPer1K != null && llmRates?.outputPer1K != null) {
     const inTok = Number(usage.llm_prompt_tokens || 0);
     const cachedTok = Number(usage.llm_prompt_cached_tokens || 0);
     const outTok = Number(usage.llm_completion_tokens || 0);
-    total += (inTok / 1000) * llmInPer1k + (outTok / 1000) * llmOutPer1k;
-    if (llmCachedInPer1k != null) total += (cachedTok / 1000) * llmCachedInPer1k;
+    total += (inTok / 1000) * llmRates.inputPer1K + (outTok / 1000) * llmRates.outputPer1K;
+    if (llmRates.cachedInputPer1K != null) total += (cachedTok / 1000) * llmRates.cachedInputPer1K;
     any = true;
   }
 
@@ -157,6 +233,8 @@ const VoiceConfigSchema = z
     voiceId: z.string().min(1).max(120).optional(),
   })
   .optional();
+
+const LlmModelSchema = z.string().min(1).max(120).optional();
 
 // Allow one or many origins. Use comma-separated list in CLIENT_ORIGIN, e.g.:
 // CLIENT_ORIGIN=https://dashboard.rapidcallai.com,http://localhost:5173
@@ -498,6 +576,7 @@ app.post("/api/internal/telephony/inbound/start", requireAgentSecret, async (req
     prompt: promptUsed,
     welcome: agent.welcome ?? {},
     voice: agent.voice ?? {},
+    llmModel: String(agent.llmModel || ""),
     phoneNumber: { id: phoneRow.id, e164: phoneRow.e164 },
   });
 });
@@ -682,6 +761,7 @@ app.post("/api/agents", requireAuth, async (req, res) => {
     promptPublished: z.string().max(PROMPT_MAX).optional(),
     welcome: WelcomeConfigSchema,
     voice: VoiceConfigSchema,
+    llmModel: LlmModelSchema,
   });
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) {
@@ -705,6 +785,7 @@ app.post("/api/agents", requireAuth, async (req, res) => {
     promptDraft: parsed.data.promptDraft ?? "",
     promptPublished: parsed.data.promptPublished ?? "",
     publishedAt: parsed.data.promptPublished ? now : null,
+    llmModel: parsed.data.llmModel ?? "",
     welcome: {
       mode: parsed.data.welcome?.mode ?? "user",
       aiMessageMode: parsed.data.welcome?.aiMessageMode ?? "dynamic",
@@ -782,6 +863,7 @@ app.put("/api/agents/:id", requireAuth, async (req, res) => {
     publish: z.boolean().optional(),
     welcome: WelcomeConfigSchema,
     voice: VoiceConfigSchema,
+    llmModel: LlmModelSchema,
   });
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) {
@@ -819,6 +901,7 @@ app.put("/api/agents/:id", requireAuth, async (req, res) => {
     publishedAt: shouldPublish ? Date.now() : (current.publishedAt ?? null),
     welcome: parsed.data.welcome ? { ...(current.welcome ?? {}), ...parsed.data.welcome } : current.welcome,
     voice: parsed.data.voice ? { ...(current.voice ?? {}), ...parsed.data.voice } : current.voice,
+    llmModel: parsed.data.llmModel ?? (current.llmModel ?? ""),
     updatedAt: Date.now(),
   };
   delete next.prompt;
@@ -1246,6 +1329,7 @@ app.post("/api/agents/:id/start", requireAuth, async (req, res) => {
     aiDelaySeconds: startParsed?.data?.welcome?.aiDelaySeconds ?? agent.welcome?.aiDelaySeconds ?? 0,
   };
   const voice = agent.voice ?? {};
+  const llmModel = String(agent.llmModel || "").trim();
 
   // IMPORTANT:
   // Web test rooms must match an existing LiveKit dispatch rule (telephony typically uses roomPrefix "call-").
@@ -1292,7 +1376,7 @@ app.post("/api/agents/:id/start", requireAuth, async (req, res) => {
     name: roomName,
     metadata: JSON.stringify({
       call: { id: callId, to: "webtest" },
-      agent: { id: agent.id, name: agent.name, prompt: promptUsed, voice },
+      agent: { id: agent.id, name: agent.name, prompt: promptUsed, voice, llmModel },
       welcome,
     }),
     agents: webAgentName
@@ -1430,6 +1514,13 @@ app.post("/api/calls/:id/metrics", requireAgentSecret, async (req, res) => {
         stt_audio_duration: z.number().nonnegative().optional(),
       })
       .optional(),
+    models: z
+      .object({
+        llm: z.string().min(1).max(120).optional(),
+        stt: z.string().min(1).max(120).optional(),
+        tts: z.string().min(1).max(120).optional(),
+      })
+      .optional(),
     latency: z
       .object({
         llm_ttft_ms_avg: z.number().nonnegative().optional(),
@@ -1446,10 +1537,12 @@ app.post("/api/calls/:id/metrics", requireAgentSecret, async (req, res) => {
   const current = USE_DB ? await store.getCallById(id) : readCalls().find((c) => c.id === id);
   if (!current) return res.status(404).json({ error: "Call not found" });
   const usage = parsed.data.usage ?? current.metrics?.usage ?? null;
+  const models = parsed.data.models ?? current.metrics?.models ?? null;
+  const llmModel = models?.llm ?? null;
   const latency = parsed.data.latency ?? current.metrics?.latency ?? null;
 
-  const costBreakdown = computeCostBreakdownFromUsage(usage) ?? current.metrics?.costBreakdown ?? null;
-  const costUsd = (costBreakdown?.totalUsd ?? computeCostUsdFromUsage(usage)) ?? current.costUsd ?? null;
+  const costBreakdown = computeCostBreakdownFromUsage(usage, llmModel) ?? current.metrics?.costBreakdown ?? null;
+  const costUsd = (costBreakdown?.totalUsd ?? computeCostUsdFromUsage(usage, llmModel)) ?? current.costUsd ?? null;
 
   const llmIn = Number(usage?.llm_prompt_tokens || 0);
   const llmOut = Number(usage?.llm_completion_tokens || 0);
@@ -1460,6 +1553,7 @@ app.post("/api/calls/:id/metrics", requireAgentSecret, async (req, res) => {
     costUsd,
     metrics: {
       usage,
+      models,
       latency,
       tokensTotal,
       costBreakdown,
@@ -1663,7 +1757,7 @@ app.get("/api/billing/summary", requireAuth, async (req, res) => {
       ttsCharacters += Number(usage.tts_characters_count || 0);
     }
 
-    const b = metrics?.costBreakdown || computeCostBreakdownFromUsage(usage);
+    const b = metrics?.costBreakdown || computeCostBreakdownFromUsage(usage, metrics?.models?.llm);
     if (b?.llm?.costUsd != null) {
       llmUsd += Number(b.llm.costUsd);
       anyCost = true;
@@ -1705,10 +1799,48 @@ app.get("/api/billing/summary", requireAuth, async (req, res) => {
       ttsCharacters,
     },
     pricingConfigured: {
-      llm: numEnv("LLM_INPUT_USD_PER_1K") != null && numEnv("LLM_OUTPUT_USD_PER_1K") != null,
+      llm: Boolean(parseJsonEnv("LLM_PRICING_JSON") || (numEnv("LLM_INPUT_USD_PER_1K") != null && numEnv("LLM_OUTPUT_USD_PER_1K") != null) || DEFAULT_LLM_PRICING_PER_1M),
       stt: numEnv("STT_USD_PER_MIN") != null,
       tts: numEnv("TTS_USD_PER_1K_CHARS") != null,
     },
+  });
+});
+
+// Billing pricing catalog used by the dashboard to show per-model pricing previews.
+app.get("/api/billing/catalog", requireAuth, async (_req, res) => {
+  const envTable = parseJsonEnv("LLM_PRICING_JSON");
+  const source = envTable ? "env" : "default";
+  const table = envTable && typeof envTable === "object" ? envTable : DEFAULT_LLM_PRICING_PER_1M;
+
+  const llmModels = Object.keys(table || {})
+    .sort()
+    .map((id) => {
+      const rec = table[id] || {};
+      // Support either "per1M" style (default) or explicit per1K/per1M keys (env).
+      const inputPer1M = Number(rec.input ?? rec.inputPer1M);
+      const cachedPer1M = Number(rec.cached_input ?? rec.cachedInputPer1M);
+      const outputPer1M = Number(rec.output ?? rec.outputPer1M);
+      const inputPer1K = Number(rec.inputPer1K);
+      const cachedPer1K = Number(rec.cachedInputPer1K);
+      const outputPer1K = Number(rec.outputPer1K);
+
+      const out = {
+        id,
+        inputUsdPer1M: Number.isFinite(inputPer1M) ? inputPer1M : Number.isFinite(inputPer1K) ? inputPer1K * 1000 : null,
+        cachedInputUsdPer1M: Number.isFinite(cachedPer1M)
+          ? cachedPer1M
+          : Number.isFinite(cachedPer1K)
+            ? cachedPer1K * 1000
+            : null,
+        outputUsdPer1M: Number.isFinite(outputPer1M) ? outputPer1M : Number.isFinite(outputPer1K) ? outputPer1K * 1000 : null,
+      };
+      return out;
+    });
+
+  return res.json({
+    source,
+    llmModels,
+    docs: { openaiPricing: "https://platform.openai.com/pricing" },
   });
 });
 
