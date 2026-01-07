@@ -39,12 +39,24 @@ function numEnv(name) {
   return Number.isFinite(n) ? n : null;
 }
 
+// Platform usage fee:
+// - Recommended: PLATFORM_USAGE_FEE_RATE (platform fee = cogs * rate; total = cogs * (1 + rate))
+// - Legacy: RETAIL_MARKUP_MULTIPLIER (total = cogs * multiplier) -> converted to rate = multiplier - 1
+function platformUsageFeeRate() {
+  const rate = numEnv("PLATFORM_USAGE_FEE_RATE");
+  if (rate != null) {
+    if (!Number.isFinite(rate) || rate < 0) return 0;
+    // keep sane bounds to prevent accidental huge billing
+    return Math.min(rate, 100.0);
+  }
+  const m = numEnv("RETAIL_MARKUP_MULTIPLIER");
+  if (m == null) return 0;
+  if (!Number.isFinite(m) || m <= 1) return 0;
+  return Math.min(m - 1, 100.0);
+}
+
 function retailMultiplier() {
-  const v = numEnv("RETAIL_MARKUP_MULTIPLIER");
-  if (v == null) return 1.0;
-  if (!Number.isFinite(v) || v <= 0) return 1.0;
-  // keep sane bounds to prevent accidental huge billing
-  return Math.min(Math.max(v, 1.0), 100.0);
+  return 1.0 + platformUsageFeeRate();
 }
 
 function applyRetail(amountUsd) {
