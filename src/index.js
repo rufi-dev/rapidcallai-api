@@ -42,11 +42,13 @@ function numEnv(name) {
 function computeCostBreakdownFromUsage(usage) {
   if (!usage) return null;
   const llmInPer1k = numEnv("LLM_INPUT_USD_PER_1K");
+  const llmCachedInPer1k = numEnv("LLM_CACHED_INPUT_USD_PER_1K");
   const llmOutPer1k = numEnv("LLM_OUTPUT_USD_PER_1K");
   const sttPerMin = numEnv("STT_USD_PER_MIN");
   const ttsPer1kChars = numEnv("TTS_USD_PER_1K_CHARS");
 
   const llmPromptTokens = Number(usage.llm_prompt_tokens || 0);
+  const llmPromptCachedTokens = Number(usage.llm_prompt_cached_tokens || 0);
   const llmCompletionTokens = Number(usage.llm_completion_tokens || 0);
   const sttAudioSeconds = Number(usage.stt_audio_duration || 0);
   const ttsCharacters = Number(usage.tts_characters_count || 0);
@@ -54,10 +56,17 @@ function computeCostBreakdownFromUsage(usage) {
   const breakdown = {
     llm: {
       promptTokens: llmPromptTokens,
+      promptCachedTokens: llmPromptCachedTokens,
       completionTokens: llmCompletionTokens,
       costUsd:
         llmInPer1k != null && llmOutPer1k != null
-          ? Math.round((((llmPromptTokens / 1000) * llmInPer1k + (llmCompletionTokens / 1000) * llmOutPer1k) * 10000)) / 10000
+          ? Math.round(
+              ((
+                (llmPromptTokens / 1000) * llmInPer1k +
+                (llmCachedInPer1k != null ? (llmPromptCachedTokens / 1000) * llmCachedInPer1k : 0) +
+                (llmCompletionTokens / 1000) * llmOutPer1k
+              ) * 10000)
+            ) / 10000
           : null,
     },
     stt: {
@@ -80,6 +89,7 @@ function computeCostBreakdownFromUsage(usage) {
 function computeCostUsdFromUsage(usage) {
   if (!usage) return null;
   const llmInPer1k = numEnv("LLM_INPUT_USD_PER_1K");
+  const llmCachedInPer1k = numEnv("LLM_CACHED_INPUT_USD_PER_1K");
   const llmOutPer1k = numEnv("LLM_OUTPUT_USD_PER_1K");
   const sttPerMin = numEnv("STT_USD_PER_MIN");
   const ttsPer1kChars = numEnv("TTS_USD_PER_1K_CHARS");
@@ -89,8 +99,10 @@ function computeCostUsdFromUsage(usage) {
 
   if (llmInPer1k != null && llmOutPer1k != null) {
     const inTok = Number(usage.llm_prompt_tokens || 0);
+    const cachedTok = Number(usage.llm_prompt_cached_tokens || 0);
     const outTok = Number(usage.llm_completion_tokens || 0);
     total += (inTok / 1000) * llmInPer1k + (outTok / 1000) * llmOutPer1k;
+    if (llmCachedInPer1k != null) total += (cachedTok / 1000) * llmCachedInPer1k;
     any = true;
   }
 
@@ -1687,6 +1699,7 @@ app.get("/api/billing/summary", requireAuth, async (req, res) => {
     breakdown: anyCost ? { llmUsd: round4(llmUsd), sttUsd: round4(sttUsd), ttsUsd: round4(ttsUsd) } : null,
     usageTotals: {
       llmPromptTokens,
+      llmPromptCachedTokens: rows.reduce((a, r) => a + Number((r?.metrics?.usage?.llm_prompt_cached_tokens || 0)), 0),
       llmCompletionTokens,
       sttAudioSeconds,
       ttsCharacters,
