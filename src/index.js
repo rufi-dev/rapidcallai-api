@@ -28,7 +28,7 @@ const { getPool, initSchema } = require("./db");
 const store = require("./store_pg");
 const { roomService, createParticipantToken } = require("./livekit");
 const { startCallEgress, stopEgress, getEgressInfo } = require("./egress");
-const { getObject, presignGetObject } = require("./s3");
+const { getObject } = require("./s3");
 const tw = require("./twilio");
 
 function numEnv(name) {
@@ -72,6 +72,8 @@ function computeCostUsdFromUsage(usage) {
 }
 
 const app = express();
+// When running behind a reverse proxy (Render/Fly/Nginx), this ensures req.protocol reflects X-Forwarded-Proto.
+app.set("trust proxy", 1);
 // Allow larger prompts (still bounded to protect the server).
 app.use(express.json({ limit: "10mb" }));
 // Twilio webhooks POST as application/x-www-form-urlencoded by default.
@@ -116,6 +118,54 @@ const USE_DB = Boolean(process.env.DATABASE_URL);
 const DEFAULT_WORKSPACE_ID = "rapidcallai";
 
 app.get("/health", (_req, res) => res.json({ ok: true }));
+
+function getPublicApiBaseUrl(req) {
+  const explicit = String(process.env.PUBLIC_API_BASE_URL || "").trim();
+  if (explicit) return explicit.replace(/\/+$/, "");
+  const proto = req.headers["x-forwarded-proto"] ? String(req.headers["x-forwarded-proto"]).split(",")[0].trim() : req.protocol;
+  const host = req.headers["x-forwarded-host"] ? String(req.headers["x-forwarded-host"]).split(",")[0].trim() : req.get("host");
+  return `${proto}://${host}`.replace(/\/+$/, "");
+}
+
+function getRecordingPlaybackSecret() {
+  // Dedicated secret preferred. Fall back to AGENT_SHARED_SECRET to avoid breaking existing deployments.
+  const s =
+    String(process.env.RECORDING_PLAYBACK_SECRET || "").trim() ||
+    String(process.env.AGENT_SHARED_SECRET || "").trim();
+  return s || null;
+}
+
+function signRecordingPlaybackToken({ callId, expMs }) {
+  const secret = getRecordingPlaybackSecret();
+  if (!secret) return null;
+  const msg = `${callId}.${expMs}`;
+  const sig = crypto.createHmac("sha256", secret).update(msg).digest("base64url");
+  return `${expMs}.${sig}`;
+}
+
+function verifyRecordingPlaybackToken({ callId, token }) {
+  const secret = getRecordingPlaybackSecret();
+  if (!secret) return { ok: false, reason: "missing_secret" };
+  const parts = String(token || "").split(".");
+  if (parts.length !== 2) return { ok: false, reason: "bad_format" };
+  const [expStr, sig] = parts;
+  const expMs = Number(expStr);
+  if (!Number.isFinite(expMs) || expMs <= 0) return { ok: false, reason: "bad_exp" };
+  if (Date.now() > expMs) return { ok: false, reason: "expired" };
+
+  const msg = `${callId}.${expMs}`;
+  const expected = crypto.createHmac("sha256", secret).update(msg).digest("base64url");
+  try {
+    const a = Buffer.from(expected);
+    const b = Buffer.from(String(sig));
+    if (a.length !== b.length) return { ok: false, reason: "bad_sig" };
+    if (!crypto.timingSafeEqual(a, b)) return { ok: false, reason: "bad_sig" };
+  } catch {
+    return { ok: false, reason: "bad_sig" };
+  }
+
+  return { ok: true };
+}
 
 async function ensureDefaultWorkspace() {
   if (USE_DB) {
@@ -1422,6 +1472,46 @@ app.get("/api/calls/:id/recording", requireAuth, async (req, res) => {
   }
 });
 
+// Public (token-gated) stream endpoint for browser <audio> playback.
+// We avoid returning raw S3 presigned URLs because some deployments use private S3 endpoints (MinIO/VPC) that browsers can't reach.
+app.get("/api/calls/:id/recording-playback", async (req, res) => {
+  const { id } = req.params;
+  const token = String(req.query.token || "");
+  const v = verifyRecordingPlaybackToken({ callId: id, token });
+  if (!v.ok) return res.status(401).send("Unauthorized");
+
+  const call = USE_DB ? await store.getCallById(id) : readCalls().find((c) => c.id === id);
+  if (!call) return res.status(404).send("Call not found");
+  if (!call.recording || call.recording.kind !== "egress_s3") return res.status(404).send("No recording");
+  if (call.recording.status && call.recording.status !== "ready") return res.status(409).send("Recording not ready");
+
+  const { bucket, key } = call.recording;
+  try {
+    const range = req.headers.range;
+    const obj = await getObject({ bucket, key, range });
+
+    const contentType = obj.ContentType || "audio/mpeg";
+    const contentLength = obj.ContentLength;
+    const contentRange = obj.ContentRange;
+
+    res.setHeader("Content-Type", contentType);
+    res.setHeader("Accept-Ranges", "bytes");
+    if (contentLength != null) res.setHeader("Content-Length", String(contentLength));
+    if (contentRange) res.setHeader("Content-Range", contentRange);
+    res.setHeader("Cache-Control", "private, max-age=0, no-store");
+
+    if (range && contentRange) res.status(206);
+
+    if (!obj.Body) return res.status(500).send("Recording body missing");
+    obj.Body.pipe(res);
+    return;
+  } catch (e) {
+    // eslint-disable-next-line no-console
+    console.warn("Recording playback stream failed:", e?.name || e?.message || e);
+    return res.status(500).send("Failed to stream recording");
+  }
+});
+
 // Return a playback-friendly recording URL (audio tag can't send Authorization headers).
 app.get("/api/calls/:id/recording-url", requireAuth, async (req, res) => {
   const { id } = req.params;
@@ -1435,14 +1525,18 @@ app.get("/api/calls/:id/recording-url", requireAuth, async (req, res) => {
       return res.status(409).json({ error: "Recording not ready", status: call.recording.status });
     }
     try {
-      const url = await presignGetObject({
-        bucket: call.recording.bucket,
-        key: call.recording.key,
-        expiresInSeconds: 60 * 30,
-      });
+      const expMs = Date.now() + 30 * 60 * 1000;
+      const token = signRecordingPlaybackToken({ callId: id, expMs });
+      if (!token) {
+        return res.status(500).json({
+          error: "Recording playback is not configured (set RECORDING_PLAYBACK_SECRET or AGENT_SHARED_SECRET)",
+        });
+      }
+      const base = getPublicApiBaseUrl(req);
+      const url = `${base}/api/calls/${encodeURIComponent(id)}/recording-playback?token=${encodeURIComponent(token)}`;
       return res.json({ url, expiresInSeconds: 60 * 30 });
     } catch (e) {
-      return res.status(500).json({ error: "Failed to presign recording URL" });
+      return res.status(500).json({ error: "Failed to create recording playback URL" });
     }
   }
 
