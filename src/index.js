@@ -39,6 +39,20 @@ function numEnv(name) {
   return Number.isFinite(n) ? n : null;
 }
 
+function retailMultiplier() {
+  const v = numEnv("RETAIL_MARKUP_MULTIPLIER");
+  if (v == null) return 1.0;
+  if (!Number.isFinite(v) || v <= 0) return 1.0;
+  // keep sane bounds to prevent accidental huge billing
+  return Math.min(Math.max(v, 1.0), 100.0);
+}
+
+function applyRetail(amountUsd) {
+  if (amountUsd == null) return null;
+  const m = retailMultiplier();
+  return Math.round((Number(amountUsd) * m) * 10000) / 10000;
+}
+
 // Default LLM pricing catalog (USD per 1M tokens) based on OpenAI pricing table:
 // https://platform.openai.com/pricing
 // You can override this at runtime via LLM_PRICING_JSON (recommended for long-term accuracy).
@@ -220,6 +234,18 @@ function computeCostUsdFromUsage(usage, llmModel) {
 
   if (!any) return null;
   return Math.round(total * 10000) / 10000;
+}
+
+function computeRetailBreakdownFromCogs(cogsBreakdown) {
+  if (!cogsBreakdown) return null;
+  const out = {
+    llm: { ...cogsBreakdown.llm, costUsd: applyRetail(cogsBreakdown.llm?.costUsd) },
+    stt: { ...cogsBreakdown.stt, costUsd: applyRetail(cogsBreakdown.stt?.costUsd) },
+    tts: { ...cogsBreakdown.tts, costUsd: applyRetail(cogsBreakdown.tts?.costUsd) },
+  };
+  const parts = [out.llm.costUsd, out.stt.costUsd, out.tts.costUsd].filter((v) => typeof v === "number" && Number.isFinite(v));
+  const totalUsd = parts.length ? Math.round((parts.reduce((a, v) => a + v, 0) * 10000)) / 10000 : null;
+  return { ...out, totalUsd };
 }
 
 function computeApproxCostUsdFromDurationSec(durationSec) {
@@ -1577,8 +1603,14 @@ app.post("/api/calls/:id/metrics", requireAgentSecret, async (req, res) => {
       ? { ...usage, stt_model: sttModel ?? usage.stt_model, tts_model: ttsModel ?? usage.tts_model }
       : usage;
 
-  const costBreakdown = computeCostBreakdownFromUsage(usageWithModels, llmModel) ?? current.metrics?.costBreakdown ?? null;
-  const costUsd = (costBreakdown?.totalUsd ?? computeCostUsdFromUsage(usageWithModels, llmModel)) ?? current.costUsd ?? null;
+  // Internal provider costs (COGS)
+  const cogsBreakdown =
+    computeCostBreakdownFromUsage(usageWithModels, llmModel) ?? current.metrics?.cogsBreakdown ?? current.metrics?.costBreakdown ?? null;
+  const cogsUsd = (cogsBreakdown?.totalUsd ?? computeCostUsdFromUsage(usageWithModels, llmModel)) ?? current.metrics?.cogsUsd ?? null;
+
+  // Retail charges (what the customer pays) = COGS * markup multiplier.
+  const retailBreakdown = computeRetailBreakdownFromCogs(cogsBreakdown) ?? current.metrics?.retailBreakdown ?? null;
+  const retailUsd = (retailBreakdown?.totalUsd ?? applyRetail(cogsUsd)) ?? current.costUsd ?? null;
 
   const llmIn = Number(usage?.llm_prompt_tokens || 0);
   const llmOut = Number(usage?.llm_completion_tokens || 0);
@@ -1586,19 +1618,24 @@ app.post("/api/calls/:id/metrics", requireAgentSecret, async (req, res) => {
 
   const next = {
     ...current,
-    costUsd,
+    // costUsd is what we show customers (retail charges), not our internal costs.
+    costUsd: retailUsd,
     metrics: {
       usage: usageWithModels,
       models,
       latency,
       tokensTotal,
-      costBreakdown,
+      // Internal (not for UI): provider costs and totals
+      cogsUsd,
+      cogsBreakdown,
+      // Customer-facing: retail charges and totals
+      retailBreakdown,
     },
     updatedAt: Date.now(),
   };
 
   if (USE_DB) {
-    const updated = await store.updateCall(id, { costUsd, metrics: next.metrics });
+    const updated = await store.updateCall(id, { costUsd: next.costUsd, metrics: next.metrics });
     // eslint-disable-next-line no-console
     console.log(
       `Metrics saved for ${id}: tokens=${updated?.metrics?.tokensTotal ?? "—"} latencyMs=${updated?.metrics?.latency?.agent_turn_latency_ms_avg ?? "—"} costUsd=${updated?.costUsd ?? "—"}`
@@ -1793,7 +1830,13 @@ app.get("/api/billing/summary", requireAuth, async (req, res) => {
       ttsCharacters += Number(usage.tts_characters_count || 0);
     }
 
-    const b = metrics?.costBreakdown || computeCostBreakdownFromUsage(usage, metrics?.models?.llm);
+    // IMPORTANT: billing summary returns customer-facing retail charges (not internal COGS).
+    const b =
+      metrics?.retailBreakdown ||
+      (metrics?.cogsBreakdown ? computeRetailBreakdownFromCogs(metrics.cogsBreakdown) : null) ||
+      (metrics?.costBreakdown ? computeRetailBreakdownFromCogs(metrics.costBreakdown) : null) ||
+      computeRetailBreakdownFromCogs(computeCostBreakdownFromUsage(usage, metrics?.models?.llm));
+
     if (b?.llm?.costUsd != null) {
       llmUsd += Number(b.llm.costUsd);
       anyCost = true;
@@ -1885,6 +1928,9 @@ app.get("/api/billing/catalog", requireAuth, async (_req, res) => {
       source: parseJsonEnv("TTS_PRICING_JSON") ? "env" : "envOrFallback",
       pricingJsonConfigured: Boolean(parseJsonEnv("TTS_PRICING_JSON")),
       fallbackUsdPer1KChars: numEnv("TTS_USD_PER_1K_CHARS"),
+    },
+    retail: {
+      markupMultiplier: retailMultiplier(),
     },
     docs: { openaiPricing: "https://platform.openai.com/pricing" },
   });
