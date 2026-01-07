@@ -15,6 +15,7 @@ const path = require("path");
 const fs = require("fs");
 const multer = require("multer");
 const promClient = require("prom-client");
+const { WebhookReceiver } = require("livekit-server-sdk");
 
 const {
   readAgents,
@@ -30,8 +31,18 @@ const { getPool, initSchema } = require("./db");
 const store = require("./store_pg");
 const { roomService, createParticipantToken } = require("./livekit");
 const { startCallEgress, stopEgress, getEgressInfo } = require("./egress");
-const { getObject } = require("./s3");
+const { getObject, headObject } = require("./s3");
 const tw = require("./twilio");
+const costModel = require("./billing/costModel");
+
+// LiveKit webhooks receiver (verified with LIVEKIT_API_KEY/SECRET).
+// NOTE: WebhookReceiver needs the *raw* body string, so we use express.raw on that route.
+function livekitWebhookReceiver() {
+  const apiKey = String(process.env.LIVEKIT_API_KEY || "").trim();
+  const apiSecret = String(process.env.LIVEKIT_API_SECRET || "").trim();
+  if (!apiKey || !apiSecret) return null;
+  return new WebhookReceiver(apiKey, apiSecret);
+}
 
 // --- Metrics (Prometheus) ---
 // LiveKit Cloud has its own observability; this endpoint is for *your* infra + app-level metrics.
@@ -149,6 +160,45 @@ function parseJsonEnv(name) {
   } catch {
     return null;
   }
+}
+
+function round4(n) {
+  return Math.round(Number(n || 0) * 10000) / 10000;
+}
+
+async function computeOverheadUsdPerMinForWorkspace(workspaceId) {
+  const budgets = {
+    computeUsdPerMonth: numEnv("OVERHEAD_COMPUTE_USD_PER_MONTH") ?? 0,
+    dbUsdPerMonth: numEnv("OVERHEAD_DB_USD_PER_MONTH") ?? 0,
+    logsUsdPerMonth: numEnv("OVERHEAD_LOGS_USD_PER_MONTH") ?? 0,
+  };
+
+  // Prefer actual last-30-days minutes for THIS workspace if Postgres is enabled.
+  let allocatedMinutes = numEnv("OVERHEAD_ALLOCATED_MINUTES_PER_MONTH") ?? 100000;
+  try {
+    if (USE_DB) {
+      const p = getPool();
+      const since = Date.now() - 30 * 24 * 60 * 60 * 1000;
+      const { rows } = await p.query(
+        `
+        SELECT (SUM(duration_sec) FILTER (WHERE ended_at IS NOT NULL AND duration_sec IS NOT NULL))::BIGINT AS seconds
+        FROM calls
+        WHERE workspace_id=$1 AND started_at >= $2
+      `,
+        [workspaceId, since]
+      );
+      const sec = Number(rows?.[0]?.seconds || 0);
+      const minutes = sec > 0 ? sec / 60 : 0;
+      if (Number.isFinite(minutes) && minutes > 1) allocatedMinutes = minutes;
+    }
+  } catch {
+    // fall back to env
+  }
+
+  return costModel.computeOverheadUsdPerMinFromInputs({
+    allocatedMinutesPerMonth: allocatedMinutes,
+    budgetsUsdPerMonth: budgets,
+  });
 }
 
 function getLlmPricingPer1k(model) {
@@ -327,6 +377,108 @@ function computeApproxCostUsdFromDurationSec(durationSec) {
 const app = express();
 // When running behind a reverse proxy (Render/Fly/Nginx), this ensures req.protocol reflects X-Forwarded-Proto.
 app.set("trust proxy", 1);
+
+// --- LiveKit Webhooks (for billed participant-minutes) ---
+// Must be registered BEFORE express.json middleware so we can access raw body bytes.
+app.post("/api/livekit/webhook", express.raw({ type: "application/webhook+json" }), async (req, res) => {
+  const receiver = livekitWebhookReceiver();
+  if (!receiver) return res.status(503).send("LiveKit not configured");
+
+  try {
+    const bodyStr = Buffer.isBuffer(req.body) ? req.body.toString("utf8") : String(req.body || "");
+    const auth = req.get("Authorization") || req.get("Authorize") || "";
+    const ev = await receiver.receive(bodyStr, auth);
+
+    const roomName = String(ev?.room?.name || "").trim();
+    if (!roomName) return res.status(200).json({ ok: true });
+
+    // Map LiveKit room -> call record by room_name.
+    const call = await findCallByRoomName(roomName);
+    if (!call) return res.status(200).json({ ok: true });
+
+    const nowMs = Date.now();
+    const tsMs = Number(ev?.createdAt) > 0 ? Number(ev.createdAt) : nowMs;
+    const identity = String(ev?.participant?.identity || "").trim();
+
+    const prev = (call.metrics && typeof call.metrics === "object" ? call.metrics : {}) || {};
+    const lk = prev.livekit && typeof prev.livekit === "object" ? prev.livekit : {};
+    const participants = lk.participants && typeof lk.participants === "object" ? lk.participants : {};
+
+    function roundUpToMinuteSeconds(sec) {
+      const s = Number(sec || 0);
+      if (!Number.isFinite(s) || s <= 0) return 0;
+      return Math.max(60, Math.ceil(s / 60) * 60);
+    }
+
+    // Totals we maintain in metrics (seconds, not minutes)
+    let billedSecondsTotal = Number(lk.participantBilledSecondsTotal || 0);
+    let rawSecondsTotal = Number(lk.participantRawSecondsTotal || 0);
+
+    const eventName = String(ev?.event || "").trim();
+
+    if ((eventName === "participant_joined" || eventName === "room_started") && identity) {
+      const p = participants[identity] && typeof participants[identity] === "object" ? participants[identity] : {};
+      if (!p.joinedAtMs) {
+        participants[identity] = { ...p, joinedAtMs: tsMs, lastSeenAtMs: tsMs };
+      } else {
+        participants[identity] = { ...p, lastSeenAtMs: tsMs };
+      }
+    }
+
+    if ((eventName === "participant_left" || eventName === "participant_connection_aborted") && identity) {
+      const p = participants[identity] && typeof participants[identity] === "object" ? participants[identity] : {};
+      const joinedAtMs = Number(p.joinedAtMs || 0);
+      if (joinedAtMs > 0) {
+        const rawSec = Math.max(0, Math.round((tsMs - joinedAtMs) / 1000));
+        const billedSec = roundUpToMinuteSeconds(rawSec);
+        rawSecondsTotal += rawSec;
+        billedSecondsTotal += billedSec;
+      }
+      participants[identity] = { ...(participants[identity] || {}), joinedAtMs: null, lastSeenAtMs: tsMs };
+    }
+
+    if (eventName === "room_finished") {
+      // Close any still-joined participants at room end.
+      for (const pid of Object.keys(participants)) {
+        const p = participants[pid] && typeof participants[pid] === "object" ? participants[pid] : {};
+        const joinedAtMs = Number(p.joinedAtMs || 0);
+        if (joinedAtMs > 0) {
+          const rawSec = Math.max(0, Math.round((tsMs - joinedAtMs) / 1000));
+          const billedSec = roundUpToMinuteSeconds(rawSec);
+          rawSecondsTotal += rawSec;
+          billedSecondsTotal += billedSec;
+          participants[pid] = { ...p, joinedAtMs: null, lastSeenAtMs: tsMs };
+        }
+      }
+    }
+
+    const participantMinutesBilled = round4(billedSecondsTotal / 60);
+    const livekitPatch = {
+      livekit: {
+        ...(lk || {}),
+        roomName,
+        lastEventAtMs: tsMs,
+        participants,
+        participantRawSecondsTotal: round4(rawSecondsTotal),
+        participantBilledSecondsTotal: round4(billedSecondsTotal),
+        participantMinutesBilled,
+      },
+      normalized: {
+        ...(prev.normalized && typeof prev.normalized === "object" ? prev.normalized : {}),
+        participantMinutes: participantMinutesBilled,
+      },
+    };
+
+    // Best-effort: persist without blocking webhooks too long.
+    await updateCallMetricsById(call.id, livekitPatch);
+    return res.status(200).json({ ok: true });
+  } catch (e) {
+    // eslint-disable-next-line no-console
+    console.warn("[livekit.webhook] failed:", e?.message || e);
+    return res.status(400).send("Invalid webhook");
+  }
+});
+
 // Allow larger prompts (still bounded to protect the server).
 app.use(express.json({ limit: "10mb" }));
 // Twilio webhooks POST as application/x-www-form-urlencoded by default.
@@ -401,6 +553,46 @@ const USE_DB = Boolean(process.env.DATABASE_URL);
 const DEFAULT_WORKSPACE_ID = "rapidcallai";
 
 app.get("/health", (_req, res) => res.json({ ok: true }));
+
+async function findCallByRoomName(roomName) {
+  const rn = String(roomName || "").trim();
+  if (!rn) return null;
+  if (USE_DB) {
+    const p = getPool();
+    if (!p) return null;
+    const { rows } = await p.query(
+      `
+      SELECT *
+      FROM calls
+      WHERE room_name=$1
+      ORDER BY started_at DESC
+      LIMIT 1
+    `,
+      [rn]
+    );
+    return rows?.[0] ? await store.getCallById(rows[0].id) : null;
+  }
+  const calls = readCalls();
+  return calls.find((c) => c.roomName === rn) ?? null;
+}
+
+async function updateCallMetricsById(callId, patchMetrics) {
+  if (!callId) return null;
+  if (USE_DB) {
+    const cur = await store.getCallById(callId);
+    if (!cur) return null;
+    const nextMetrics = { ...(cur.metrics && typeof cur.metrics === "object" ? cur.metrics : {}), ...(patchMetrics || {}) };
+    return await store.updateCall(callId, { metrics: nextMetrics });
+  }
+  const calls = readCalls();
+  const idx = calls.findIndex((c) => c.id === callId);
+  if (idx === -1) return null;
+  const cur = calls[idx];
+  const nextMetrics = { ...(cur.metrics && typeof cur.metrics === "object" ? cur.metrics : {}), ...(patchMetrics || {}) };
+  calls[idx] = { ...cur, metrics: nextMetrics, updatedAt: Date.now() };
+  writeCalls(calls);
+  return calls[idx];
+}
 
 function getPublicApiBaseUrl(req) {
   const explicit = String(process.env.PUBLIC_API_BASE_URL || "").trim();
@@ -625,6 +817,7 @@ app.post("/api/internal/telephony/inbound/start", requireAgentSecret, async (req
     roomName: z.string().min(1).max(200),
     to: z.string().min(3).max(32), // trunk phone number (E.164)
     from: z.string().min(0).max(32).optional(), // caller phone number (E.164)
+    twilioCallSid: z.string().min(0).max(64).optional(),
   });
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "Validation failed", details: parsed.error.flatten() });
@@ -632,6 +825,7 @@ app.post("/api/internal/telephony/inbound/start", requireAgentSecret, async (req
 
   const to = parsed.data.to.trim();
   const from = String(parsed.data.from || "").trim();
+  const twilioCallSid = String(parsed.data.twilioCallSid || "").trim();
 
   // eslint-disable-next-line no-console
   console.log("[internal.telephony.inbound.start]", { roomName: parsed.data.roomName, to, from });
@@ -684,7 +878,14 @@ app.post("/api/internal/telephony/inbound/start", requireAgentSecret, async (req
     costUsd: null,
     transcript: [],
     recording: null,
-    metrics: null,
+    metrics: {
+      normalized: { source: "telephony" },
+      telephony: {
+        trunkNumber: to,
+        callerNumber: from || "",
+        twilioCallSid: twilioCallSid || undefined,
+      },
+    },
     createdAt: now,
     updatedAt: now,
   };
@@ -787,7 +988,14 @@ app.post("/api/internal/calls/:id/end", requireAgentSecret, async (req, res) => 
             if (status === 3) {
               const c2 = await store.getCallById(id);
               if (c2?.recording?.kind === "egress_s3") {
-                await store.updateCall(id, { recording: { ...c2.recording, status: "ready" } });
+                let sizeBytes = c2.recording.sizeBytes ?? null;
+                try {
+                  const h = await headObject({ bucket: c2.recording.bucket, key: c2.recording.key });
+                  if (typeof h?.ContentLength === "number" && Number.isFinite(h.ContentLength)) sizeBytes = h.ContentLength;
+                } catch {
+                  // ignore
+                }
+                await store.updateCall(id, { recording: { ...c2.recording, status: "ready", sizeBytes } });
               }
               return;
             }
@@ -1444,8 +1652,16 @@ app.post("/api/twilio/inbound", async (req, res) => {
   const dial = vr.dial({ answerOnBridge: true });
   // SIP auth is optional: it is recommended for Twilio Programmable Voice to prevent arbitrary calls hitting your SIP endpoint,
   // but LiveKit inbound trunks can also work without auth when configured by allowed numbers/dispatch rules.
-  if (sipUser && sipPass) dial.sip({ username: sipUser, password: sipPass }, dest);
-  else dial.sip(dest);
+  const sipNode = sipUser && sipPass ? dial.sip({ username: sipUser, password: sipPass }, dest) : dial.sip(dest);
+  // Propagate Twilio CallSid to the SIP endpoint so LiveKit can surface it as participant attributes (best-effort).
+  // This helps us reconcile carrier billing later.
+  try {
+    if (sipNode && typeof sipNode.parameter === "function" && twilioCallSid) {
+      sipNode.parameter({ name: "X-Twilio-CallSid", value: twilioCallSid });
+    }
+  } catch {
+    // ignore
+  }
   res.type("text/xml").send(vr.toString());
 });
 
@@ -1506,7 +1722,7 @@ app.post("/api/agents/:id/start", requireAuth, async (req, res) => {
     costUsd: null,
     transcript: [],
     recording: null, // will be filled if egress is enabled
-    metrics: null,
+    metrics: { normalized: { source: "web" } },
     createdAt: now,
     updatedAt: now,
   };
@@ -1676,6 +1892,22 @@ app.post("/api/calls/:id/metrics", requireAgentSecret, async (req, res) => {
         tts: z.string().min(1).max(120).optional(),
       })
       .optional(),
+    // Normalized per-call fields that drive minute-based billing.
+    normalized: z
+      .object({
+        source: z.enum(["web", "telephony", "unknown"]).optional(),
+        participantsCountAvg: z.number().positive().optional(),
+        recordingEnabled: z.boolean().optional(),
+      })
+      .optional(),
+    telephony: z
+      .object({
+        trunkNumber: z.string().min(0).max(64).optional(),
+        callerNumber: z.string().min(0).max(64).optional(),
+        twilioCallSid: z.string().min(0).max(64).optional(),
+        rateKey: z.string().min(0).max(64).optional(),
+      })
+      .optional(),
     latency: z
       .object({
         llm_ttft_ms_avg: z.number().nonnegative().optional(),
@@ -1698,6 +1930,8 @@ app.post("/api/calls/:id/metrics", requireAgentSecret, async (req, res) => {
   const sttModel = models?.stt ?? usage?.stt_model ?? null;
   const ttsModel = models?.tts ?? usage?.tts_model ?? null;
   const latency = parsed.data.latency ?? current.metrics?.latency ?? null;
+  const normalizedIn = parsed.data.normalized ?? null;
+  const telephonyIn = parsed.data.telephony ?? null;
 
   // Normalize models into usage so pricing lookups can be consistent.
   const usageWithModels =
@@ -1705,14 +1939,50 @@ app.post("/api/calls/:id/metrics", requireAgentSecret, async (req, res) => {
       ? { ...usage, stt_model: sttModel ?? usage.stt_model, tts_model: ttsModel ?? usage.tts_model }
       : usage;
 
-  // Internal provider costs (COGS)
-  const cogsBreakdown =
-    computeCostBreakdownFromUsage(usageWithModels, llmModel) ?? current.metrics?.cogsBreakdown ?? current.metrics?.costBreakdown ?? null;
-  const cogsUsd = (cogsBreakdown?.totalUsd ?? computeCostUsdFromUsage(usageWithModels, llmModel)) ?? current.metrics?.cogsUsd ?? null;
+  // Compute full, minute-normalized costs using the authoritative cost model.
+  const durationSec =
+    typeof current.durationSec === "number" && Number.isFinite(current.durationSec)
+      ? current.durationSec
+      : Math.max(0, Math.round(((current.endedAt ?? Date.now()) - Number(current.startedAt || Date.now())) / 1000));
 
-  // Retail charges (what the customer pays) = COGS * markup multiplier.
-  const retailBreakdown = computeRetailBreakdownFromCogs(cogsBreakdown) ?? current.metrics?.retailBreakdown ?? null;
-  const retailUsd = (retailBreakdown?.totalUsd ?? applyRetail(cogsUsd)) ?? current.costUsd ?? null;
+  const overheadUsdPerMin = await computeOverheadUsdPerMinForWorkspace(current.workspaceId ?? DEFAULT_WORKSPACE_ID);
+
+  const prevTelephony = current.metrics?.telephony && typeof current.metrics.telephony === "object" ? current.metrics.telephony : {};
+  const mergedTelephony = { ...prevTelephony, ...(telephonyIn || {}) };
+
+  const prevNormalized = current.metrics?.normalized && typeof current.metrics.normalized === "object" ? current.metrics.normalized : {};
+  const mergedNormalized = { ...prevNormalized, ...(normalizedIn || {}) };
+  const livekit = current.metrics?.livekit && typeof current.metrics.livekit === "object" ? current.metrics.livekit : {};
+
+  const recordingInfo = current.recording && typeof current.recording === "object" ? current.recording : null;
+  const recording = {
+    enabled: Boolean(recordingInfo),
+    sizeBytes: recordingInfo && typeof recordingInfo.sizeBytes === "number" ? recordingInfo.sizeBytes : null,
+    playbackGetCount:
+      (current.metrics?.recording && typeof current.metrics.recording === "object" && typeof current.metrics.recording.playbackGetCount === "number")
+        ? current.metrics.recording.playbackGetCount
+        : recordingInfo && typeof recordingInfo.playbackGetCount === "number"
+          ? recordingInfo.playbackGetCount
+          : null,
+  };
+
+  const out = costModel.computeCallCosts({
+    durationSec,
+    usage: usageWithModels,
+    models: { llm: llmModel, stt: sttModel, tts: ttsModel },
+    normalizedInput: {
+      source: mergedNormalized.source,
+      participantsCountAvg: mergedNormalized.participantsCountAvg,
+      recordingEnabled: mergedNormalized.recordingEnabled,
+      participantMinutes: livekit?.participantMinutesBilled ?? mergedNormalized.participantMinutes ?? null,
+      telephonyTo: mergedTelephony.trunkNumber || mergedTelephony.callerNumber || "",
+      telephonyRateKey: mergedTelephony.rateKey || "",
+    },
+    recording,
+    overheadUsdPerMin,
+  });
+
+  const retailUsd = out?.retail?.totalUsd ?? null;
 
   const llmIn = Number(usage?.llm_prompt_tokens || 0);
   const llmOut = Number(usage?.llm_completion_tokens || 0);
@@ -1723,15 +1993,18 @@ app.post("/api/calls/:id/metrics", requireAgentSecret, async (req, res) => {
     // costUsd is what we show customers (retail charges), not our internal costs.
     costUsd: retailUsd,
     metrics: {
+      ...(current.metrics && typeof current.metrics === "object" ? current.metrics : {}),
       usage: usageWithModels,
-      models,
+      models: { ...(models || {}), llm: llmModel ?? undefined, stt: sttModel ?? undefined, tts: ttsModel ?? undefined },
       latency,
       tokensTotal,
-      // Internal (not for UI): provider costs and totals
-      cogsUsd,
-      cogsBreakdown,
-      // Customer-facing: retail charges and totals
-      retailBreakdown,
+      telephony: mergedTelephony,
+      normalized: { ...mergedNormalized, ...out.normalized },
+      cost: {
+        cogs: out.cogs,
+        retail: out.retail,
+        pricingConfigured: out.pricingConfigured,
+      },
     },
     updatedAt: Date.now(),
   };
@@ -1893,7 +2166,7 @@ app.get("/api/billing/summary", requireAuth, async (req, res) => {
     const p = getPool();
     const q = await p.query(
       `
-      SELECT cost_usd, metrics
+      SELECT cost_usd, metrics, duration_sec, recording
       FROM calls
       WHERE workspace_id=$1
         AND ended_at IS NOT NULL
@@ -1907,22 +2180,59 @@ app.get("/api/billing/summary", requireAuth, async (req, res) => {
       .filter((c) => c.workspaceId === req.workspace.id)
       .filter((c) => c.endedAt != null)
       .filter((c) => Number(c.startedAt || 0) >= qFrom && Number(c.startedAt || 0) <= qTo)
-      .map((c) => ({ cost_usd: c.costUsd ?? null, metrics: c.metrics ?? null }));
+      .map((c) => ({ cost_usd: c.costUsd ?? null, metrics: c.metrics ?? null, duration_sec: c.durationSec ?? null, recording: c.recording ?? null }));
   }
 
-  // Usage (raw usage-based costs) and totals (what the customer pays per call).
-  let llmUsd = 0;
-  let sttUsd = 0;
-  let ttsUsd = 0;
-  let totalUsd = 0;
-  let platformUsageUsd = 0;
+  const overheadUsdPerMin = await computeOverheadUsdPerMinForWorkspace(req.workspace.id);
 
+  function emptyBreakdown() {
+    return {
+      llm: 0,
+      stt: 0,
+      tts: 0,
+      telephony: 0,
+      livekit: 0,
+      recording: 0,
+      storage: 0,
+      egress: 0,
+      s3Put: 0,
+      s3Get: 0,
+      compute: 0,
+      db: 0,
+      logs: 0,
+      overheadBuffer: 0,
+      safetyBuffer: 0,
+      margin: 0,
+    };
+  }
+
+  function addBreakdown(into, src) {
+    if (!src || typeof src !== "object") return;
+    for (const k of Object.keys(into)) {
+      const v = src[k];
+      if (typeof v === "number" && Number.isFinite(v)) into[k] += v;
+    }
+  }
+
+  let totals = {
+    calls: 0,
+    callMinutes: 0,
+    participantMinutes: 0,
+    participantMinutesEstimated: 0,
+    livekitWebhookCalls: 0,
+    billedSeconds: 0,
+    cogsUsd: 0,
+    retailUsd: 0,
+    cogsBreakdownUsd: emptyBreakdown(),
+    retailBreakdownUsd: emptyBreakdown(),
+  };
+
+  // Raw usage totals (for transparency)
   let llmPromptTokens = 0;
+  let llmPromptCachedTokens = 0;
   let llmCompletionTokens = 0;
   let sttAudioSeconds = 0;
   let ttsCharacters = 0;
-
-  let anyCost = false;
 
   // Fixed monthly fees (explicit line items)
   const phoneNumberMonthlyFee = numEnv("PHONE_NUMBER_MONTHLY_FEE_USD") ?? 0;
@@ -1945,77 +2255,115 @@ app.get("/api/billing/summary", requireAuth, async (req, res) => {
   for (const r of rows) {
     const metrics = r.metrics || null;
     const usage = metrics?.usage || null;
+    const models = metrics?.models || null;
+    const llmModel = models?.llm ?? usage?.llm_model ?? null;
+    const sttModel = models?.stt ?? usage?.stt_model ?? null;
+    const ttsModel = models?.tts ?? usage?.tts_model ?? null;
+    const normalized = metrics?.normalized || null;
+    const telephony = metrics?.telephony || null;
+    const durationSec = typeof r.duration_sec === "number" ? r.duration_sec : Number(r.duration_sec || 0);
+  const recording = r.recording && typeof r.recording === "object" ? r.recording : null;
+    const livekit = metrics?.livekit && typeof metrics.livekit === "object" ? metrics.livekit : null;
+
     if (usage) {
       llmPromptTokens += Number(usage.llm_prompt_tokens || 0);
       llmCompletionTokens += Number(usage.llm_completion_tokens || 0);
       sttAudioSeconds += Number(usage.stt_audio_duration || 0);
       ttsCharacters += Number(usage.tts_characters_count || 0);
+      llmPromptCachedTokens += Number(usage.llm_prompt_cached_tokens || 0);
     }
 
-    // Usage costs (raw usage-based): prefer stored COGS breakdown, otherwise compute from usage.
-    const cogs =
-      metrics?.cogsBreakdown || metrics?.costBreakdown || computeCostBreakdownFromUsage(usage, metrics?.models?.llm) || null;
+    const computed = costModel.computeCallCosts({
+      durationSec,
+      usage,
+      models: { llm: llmModel, stt: sttModel, tts: ttsModel },
+      normalizedInput: {
+        source: normalized?.source,
+        participantsCountAvg: normalized?.participantsCountAvg,
+        recordingEnabled: normalized?.recordingEnabled,
+        participantMinutes: (metrics?.livekit && typeof metrics.livekit === "object" ? metrics.livekit.participantMinutesBilled : null) ?? normalized?.participantMinutes ?? null,
+        telephonyTo: telephony?.trunkNumber || telephony?.callerNumber || "",
+        telephonyRateKey: telephony?.rateKey || "",
+      },
+      recording: {
+        enabled: Boolean(recording),
+        sizeBytes: recording?.sizeBytes ?? null,
+        playbackGetCount:
+          (metrics?.recording && typeof metrics.recording === "object" && typeof metrics.recording.playbackGetCount === "number")
+            ? metrics.recording.playbackGetCount
+            : recording?.playbackGetCount ?? null,
+      },
+      overheadUsdPerMin,
+    });
 
-    if (cogs?.llm?.costUsd != null) {
-      llmUsd += Number(cogs.llm.costUsd);
-      anyCost = true;
-    }
-    if (cogs?.stt?.costUsd != null) {
-      sttUsd += Number(cogs.stt.costUsd);
-      anyCost = true;
-    }
-    if (cogs?.tts?.costUsd != null) {
-      ttsUsd += Number(cogs.tts.costUsd);
-      anyCost = true;
-    }
+    const callMinutes = Number(computed?.normalized?.callMinutes || 0);
+    const participantMinutes = Number(computed?.normalized?.participantMinutes || 0);
+    const billedSeconds = Number(computed?.normalized?.billedSeconds || 0);
+    const cogs = metrics?.cost?.cogs || computed?.cogs || null;
+    const retail = metrics?.cost?.retail || computed?.retail || null;
 
-    // Per-call charged total: prefer stored retail total; otherwise compute from usage with current markup.
-    const stored = typeof r.cost_usd === "number" && Number.isFinite(r.cost_usd) ? Number(r.cost_usd) : null;
-    const computedRetail =
-      cogs?.totalUsd != null && Number.isFinite(Number(cogs.totalUsd)) ? applyRetail(Number(cogs.totalUsd)) : null;
-    const callTotal = stored ?? computedRetail;
-    if (callTotal != null && Number.isFinite(callTotal)) {
-      totalUsd += Number(callTotal);
-      anyCost = true;
+    // Prefer stored retail cost (this is what we actually charged) when present.
+    const storedRetailUsd = typeof r.cost_usd === "number" && Number.isFinite(r.cost_usd) ? Number(r.cost_usd) : null;
+    const callRetailUsd = storedRetailUsd != null ? storedRetailUsd : Number(retail?.totalUsd || 0);
+    const callCogsUsd = Number(cogs?.totalUsd || 0);
+
+    totals.calls += 1;
+    totals.callMinutes += callMinutes;
+    totals.participantMinutes += participantMinutes;
+    totals.billedSeconds += billedSeconds;
+    totals.cogsUsd += callCogsUsd;
+    totals.retailUsd += callRetailUsd;
+    addBreakdown(totals.cogsBreakdownUsd, cogs?.breakdownUsd);
+    addBreakdown(totals.retailBreakdownUsd, retail?.breakdownUsd);
+
+    // Debug/validation: participant-minute estimate from agent sampling (or default participants avg).
+    const participantsAvg =
+      (normalized && typeof normalized.participantsCountAvg === "number" && Number.isFinite(normalized.participantsCountAvg) && normalized.participantsCountAvg > 0)
+        ? Number(normalized.participantsCountAvg)
+        : numEnv("DEFAULT_PARTICIPANTS_COUNT_AVG") ?? 2;
+    totals.participantMinutesEstimated += callMinutes * participantsAvg;
+
+    // Coverage: calls where LiveKit webhook-derived billed participant minutes exists.
+    if (livekit && typeof livekit.participantMinutesBilled === "number" && Number.isFinite(livekit.participantMinutesBilled) && livekit.participantMinutesBilled > 0) {
+      totals.livekitWebhookCalls += 1;
     }
   }
 
-  function round4(n) {
-    return Math.round(n * 10000) / 10000;
-  }
+  const callMinutesTotal = Math.max(0.0001, totals.callMinutes);
+  const cogsUsdPerMin = totals.cogsUsd / callMinutesTotal;
+  const retailUsdPerMin = totals.retailUsd / callMinutesTotal;
+  const safetyRate = numEnv("SAFETY_BUFFER_RATE") ?? 0.25;
+  const marginRate = numEnv("TARGET_GROSS_MARGIN_RATE") ?? 0.7;
+  const recommendedRetailUsdPerMin = (cogsUsdPerMin * (1 + Math.max(0, safetyRate))) / Math.max(0.0001, 1 - Math.max(0, marginRate));
 
-  // Platform usage fee scales with usage: it's the residual between what you charge for calls
-  // and the raw LLM/STT/TTS usage costs.
-  const usageSum = llmUsd + sttUsd + ttsUsd;
-  platformUsageUsd = anyCost ? Math.max(0, totalUsd - usageSum) : 0;
+  const cogsBreakdownUsdPerMin = {};
+  const retailBreakdownUsdPerMin = {};
+  for (const k of Object.keys(totals.cogsBreakdownUsd)) cogsBreakdownUsdPerMin[k] = round4(totals.cogsBreakdownUsd[k] / callMinutesTotal);
+  for (const k of Object.keys(totals.retailBreakdownUsd)) retailBreakdownUsdPerMin[k] = round4(totals.retailBreakdownUsd[k] / callMinutesTotal);
+
+  const fixedFeesUsd = round4(phoneNumbersUsd + platformBaseUsd);
+  const fixedFeesUsdPerMin = round4(fixedFeesUsd / callMinutesTotal);
 
   return res.json({
     currency: "USD",
     periodStartMs: qFrom,
     periodEndMs: qTo,
-    upcomingInvoiceUsd: anyCost ? round4(totalUsd + phoneNumbersUsd + platformBaseUsd) : null,
-    breakdown: anyCost
+    // Customer-facing: total retail charges + fixed fees
+    upcomingInvoiceUsd: rows.length ? round4(totals.retailUsd + fixedFeesUsd) : null,
+    // Backward-compatible: old breakdown fields (now represent COGS LLM/STT/TTS totals only when available)
+    breakdown: rows.length
       ? {
-          llmUsd: round4(llmUsd),
-          sttUsd: round4(sttUsd),
-          ttsUsd: round4(ttsUsd),
-          platformUsageUsd: round4(platformUsageUsd),
+          llmUsd: round4(totals.cogsBreakdownUsd.llm),
+          sttUsd: round4(totals.cogsBreakdownUsd.stt),
+          ttsUsd: round4(totals.cogsBreakdownUsd.tts),
           phoneNumbersUsd: round4(phoneNumbersUsd),
           platformBaseUsd: round4(platformBaseUsd),
         }
       : null,
-    otherUsd: anyCost
-      ? round4(
-          Math.max(
-            0,
-            (totalUsd + phoneNumbersUsd + platformBaseUsd) -
-              (llmUsd + sttUsd + ttsUsd + platformUsageUsd + phoneNumbersUsd + platformBaseUsd)
-          )
-        )
-      : null,
+    otherUsd: rows.length ? 0 : null,
     usageTotals: {
       llmPromptTokens,
-      llmPromptCachedTokens: rows.reduce((a, r) => a + Number((r?.metrics?.usage?.llm_prompt_cached_tokens || 0)), 0),
+      llmPromptCachedTokens,
       llmCompletionTokens,
       sttAudioSeconds,
       ttsCharacters,
@@ -2025,10 +2373,42 @@ app.get("/api/billing/summary", requireAuth, async (req, res) => {
       phoneNumberMonthlyFeeUsd: round4(Math.max(0, phoneNumberMonthlyFee)),
       platformMonthlyFeeUsd: round4(Math.max(0, platformMonthlyFee)),
     },
+    // New normalized totals (minute-first)
+    totals: {
+      calls: totals.calls,
+      callMinutes: round4(totals.callMinutes),
+      participantMinutes: round4(totals.participantMinutes),
+      participantMinutesEstimated: round4(totals.participantMinutesEstimated),
+      livekitWebhookCalls: totals.livekitWebhookCalls,
+      billedSeconds: round4(totals.billedSeconds),
+      cogs: {
+        totalUsd: round4(totals.cogsUsd),
+        totalUsdPerMin: round4(cogsUsdPerMin),
+        breakdownUsd: Object.fromEntries(Object.entries(totals.cogsBreakdownUsd).map(([k, v]) => [k, round4(v)])),
+        breakdownUsdPerMin: cogsBreakdownUsdPerMin,
+      },
+      retail: {
+        totalUsd: round4(totals.retailUsd),
+        totalUsdPerMin: round4(retailUsdPerMin),
+        breakdownUsd: Object.fromEntries(Object.entries(totals.retailBreakdownUsd).map(([k, v]) => [k, round4(v)])),
+        breakdownUsdPerMin: retailBreakdownUsdPerMin,
+        recommendedRetailUsdPerMin: round4(recommendedRetailUsdPerMin),
+        safetyBufferRate: round4(Math.max(0, safetyRate)),
+        targetGrossMarginRate: round4(Math.max(0, marginRate)),
+      },
+      fixedFees: {
+        totalUsd: fixedFeesUsd,
+        totalUsdPerMin: fixedFeesUsdPerMin,
+        phoneNumbersUsd: round4(phoneNumbersUsd),
+        platformBaseUsd: round4(platformBaseUsd),
+      },
+    },
     pricingConfigured: {
       llm: Boolean(parseJsonEnv("LLM_PRICING_JSON") || (numEnv("LLM_INPUT_USD_PER_1K") != null && numEnv("LLM_OUTPUT_USD_PER_1K") != null) || DEFAULT_LLM_PRICING_PER_1M),
       stt: numEnv("STT_USD_PER_MIN") != null,
       tts: numEnv("TTS_USD_PER_1K_CHARS") != null,
+      telephony: numEnv("TELEPHONY_USD_PER_MIN") != null || Boolean(parseJsonEnv("TELEPHONY_PRICING_JSON")),
+      livekit: numEnv("LIVEKIT_USD_PER_PARTICIPANT_MIN") != null,
     },
   });
 });
@@ -2077,8 +2457,39 @@ app.get("/api/billing/catalog", requireAuth, async (_req, res) => {
       pricingJsonConfigured: Boolean(parseJsonEnv("TTS_PRICING_JSON")),
       fallbackUsdPer1KChars: numEnv("TTS_USD_PER_1K_CHARS"),
     },
+    telephony: {
+      source: parseJsonEnv("TELEPHONY_PRICING_JSON") ? "env" : "envOrFallback",
+      pricingJsonConfigured: Boolean(parseJsonEnv("TELEPHONY_PRICING_JSON")),
+      fallbackUsdPerMin: numEnv("TELEPHONY_USD_PER_MIN"),
+    },
+    livekit: {
+      usdPerParticipantMin: numEnv("LIVEKIT_USD_PER_PARTICIPANT_MIN"),
+      defaultParticipantsCountAvg: numEnv("DEFAULT_PARTICIPANTS_COUNT_AVG") ?? 2,
+    },
+    recording: {
+      enabledDefault: String(process.env.RECORDING_ENABLED_DEFAULT || "").toLowerCase() === "true",
+      retentionDays: numEnv("RECORDING_RETENTION_DAYS") ?? 30,
+      expectedGetRequests: numEnv("RECORDING_EXPECTED_GET_REQUESTS") ?? 0,
+      s3StorageUsdPerGbMonth: numEnv("S3_STORAGE_USD_PER_GB_MONTH"),
+      s3PutUsdPer1K: numEnv("S3_PUT_USD_PER_1K"),
+      s3GetUsdPer1K: numEnv("S3_GET_USD_PER_1K"),
+      awsEgressUsdPerGb: numEnv("AWS_EGRESS_USD_PER_GB"),
+    },
+    overhead: {
+      computeUsdPerMonth: numEnv("OVERHEAD_COMPUTE_USD_PER_MONTH") ?? 0,
+      dbUsdPerMonth: numEnv("OVERHEAD_DB_USD_PER_MONTH") ?? 0,
+      logsUsdPerMonth: numEnv("OVERHEAD_LOGS_USD_PER_MONTH") ?? 0,
+      allocatedMinutesPerMonth: numEnv("OVERHEAD_ALLOCATED_MINUTES_PER_MONTH") ?? 100000,
+      overheadBufferRate: numEnv("OVERHEAD_BUFFER_RATE") ?? 0,
+    },
     retail: {
       markupMultiplier: retailMultiplier(),
+      retailUsdPerCallMin: numEnv("RETAIL_USD_PER_CALL_MIN"),
+      retailMode: String(process.env.RETAIL_MODE || "recommended").trim().toLowerCase(),
+      safetyBufferRate: numEnv("SAFETY_BUFFER_RATE") ?? 0.25,
+      targetGrossMarginRate: numEnv("TARGET_GROSS_MARGIN_RATE") ?? 0.7,
+      billRoundUpToSeconds: numEnv("BILLING_ROUND_UP_TO_SECONDS") ?? 1,
+      billMinimumSeconds: numEnv("BILLING_MINIMUM_BILLABLE_SECONDS") ?? 0,
     },
     docs: { openaiPricing: "https://platform.openai.com/pricing" },
   });
@@ -2137,7 +2548,7 @@ app.get("/api/billing/usage", requireAuth, async (req, res) => {
     const p = getPool();
     const q = await p.query(
       `
-      SELECT started_at, duration_sec, cost_usd, metrics
+      SELECT started_at, duration_sec, cost_usd, metrics, recording
       FROM calls
       WHERE workspace_id=$1
         AND ended_at IS NOT NULL
@@ -2151,19 +2562,59 @@ app.get("/api/billing/usage", requireAuth, async (req, res) => {
       .filter((c) => c.workspaceId === req.workspace.id)
       .filter((c) => c.endedAt != null)
       .filter((c) => Number(c.startedAt || 0) >= qFrom && Number(c.startedAt || 0) <= qTo)
-      .map((c) => ({ started_at: c.startedAt, duration_sec: c.durationSec, cost_usd: c.costUsd ?? null, metrics: c.metrics ?? null }));
+      .map((c) => ({
+        started_at: c.startedAt,
+        duration_sec: c.durationSec,
+        cost_usd: c.costUsd ?? null,
+        metrics: c.metrics ?? null,
+        recording: c.recording ?? null,
+      }));
+  }
+
+  const overheadUsdPerMin = await computeOverheadUsdPerMinForWorkspace(req.workspace.id);
+
+  function emptyBreakdown() {
+    return {
+      llm: 0,
+      stt: 0,
+      tts: 0,
+      telephony: 0,
+      livekit: 0,
+      recording: 0,
+      storage: 0,
+      egress: 0,
+      s3Put: 0,
+      s3Get: 0,
+      compute: 0,
+      db: 0,
+      logs: 0,
+      overheadBuffer: 0,
+      safetyBuffer: 0,
+      margin: 0,
+    };
+  }
+
+  function addBreakdown(into, src) {
+    if (!src || typeof src !== "object") return;
+    for (const k of Object.keys(into)) {
+      const v = src[k];
+      if (typeof v === "number" && Number.isFinite(v)) into[k] += v;
+    }
   }
 
   let totals = {
     calls: 0,
     callMinutes: 0,
-    llmUsd: 0,
-    sttUsd: 0,
-    ttsUsd: 0,
-    platformUsageUsd: 0,
+    participantMinutes: 0,
+    billedSeconds: 0,
+    cogsUsd: 0,
+    retailUsd: 0,
     phoneNumbersUsd: 0,
     platformBaseUsd: 0,
-    totalUsd: 0,
+    fixedFeesUsd: 0,
+    totalUsd: 0, // retail + fixed fees
+    cogsBreakdownUsd: emptyBreakdown(),
+    retailBreakdownUsd: emptyBreakdown(),
   };
 
   for (const r of rows) {
@@ -2178,51 +2629,79 @@ app.get("/api/billing/usage", requireAuth, async (req, res) => {
     const llmModel = models?.llm ?? usage?.llm_model ?? null;
     const sttModel = models?.stt ?? usage?.stt_model ?? null;
     const ttsModel = models?.tts ?? usage?.tts_model ?? null;
-    const usageWithModels =
-      usage && typeof usage === "object"
-        ? { ...usage, stt_model: sttModel ?? usage.stt_model, tts_model: ttsModel ?? usage.tts_model }
-        : usage;
+    const normalized = metrics?.normalized || null;
+    const telephony = metrics?.telephony || null;
+    const recording = r.recording && typeof r.recording === "object" ? r.recording : null;
 
-    const cogs = metrics?.cogsBreakdown || metrics?.costBreakdown || computeCostBreakdownFromUsage(usageWithModels, llmModel) || null;
-    const usageLlm = Number(cogs?.llm?.costUsd ?? 0);
-    const usageStt = Number(cogs?.stt?.costUsd ?? 0);
-    const usageTts = Number(cogs?.tts?.costUsd ?? 0);
-    const usageSum = usageLlm + usageStt + usageTts;
+    const computed = costModel.computeCallCosts({
+      durationSec,
+      usage,
+      models: { llm: llmModel, stt: sttModel, tts: ttsModel },
+      normalizedInput: {
+        source: normalized?.source,
+        participantsCountAvg: normalized?.participantsCountAvg,
+        recordingEnabled: normalized?.recordingEnabled,
+        participantMinutes:
+          (metrics?.livekit && typeof metrics.livekit === "object" ? metrics.livekit.participantMinutesBilled : null) ??
+          normalized?.participantMinutes ??
+          null,
+        telephonyTo: telephony?.trunkNumber || telephony?.callerNumber || "",
+        telephonyRateKey: telephony?.rateKey || "",
+      },
+      recording: {
+        enabled: Boolean(recording),
+        sizeBytes: recording?.sizeBytes ?? null,
+        playbackGetCount:
+          (metrics?.recording && typeof metrics.recording === "object" && typeof metrics.recording.playbackGetCount === "number")
+            ? metrics.recording.playbackGetCount
+            : recording?.playbackGetCount ?? null,
+      },
+      overheadUsdPerMin,
+    });
 
-    // Call total charged (retail): prefer stored cost_usd, else apply current multiplier.
-    const stored = typeof r.cost_usd === "number" && Number.isFinite(r.cost_usd) ? Number(r.cost_usd) : null;
-    const computedRetail = cogs?.totalUsd != null && Number.isFinite(Number(cogs.totalUsd)) ? applyRetail(Number(cogs.totalUsd)) : null;
-    const callTotal = stored ?? computedRetail ?? 0;
+    const callMinutes = Number(computed?.normalized?.callMinutes || minutes || 0);
+    const participantMinutes = Number(computed?.normalized?.participantMinutes || 0);
+    const billedSeconds = Number(computed?.normalized?.billedSeconds || 0);
+    const cogs = metrics?.cost?.cogs || computed?.cogs || null;
+    const retail = metrics?.cost?.retail || computed?.retail || null;
 
-    const platformUsage = Math.max(0, callTotal - usageSum);
+    const storedRetailUsd = typeof r.cost_usd === "number" && Number.isFinite(r.cost_usd) ? Number(r.cost_usd) : null;
+    const callRetailUsd = storedRetailUsd != null ? storedRetailUsd : Number(retail?.totalUsd || 0);
+    const callCogsUsd = Number(cogs?.totalUsd || 0);
 
     const cur = seriesMap.get(t) || {
       t,
       callMinutes: 0,
-      llmUsd: 0,
-      sttUsd: 0,
-      ttsUsd: 0,
-      platformUsageUsd: 0,
       phoneNumbersUsd: 0,
       platformBaseUsd: 0,
-      totalUsd: 0,
+      participantMinutes: 0,
+      billedSeconds: 0,
+      cogsUsd: 0,
+      retailUsd: 0,
+      totalUsd: 0, // retail + fixed fees
+      cogsBreakdownUsd: emptyBreakdown(),
+      retailBreakdownUsd: emptyBreakdown(),
     };
 
-    cur.callMinutes += minutes;
-    cur.llmUsd += usageLlm;
-    cur.sttUsd += usageStt;
-    cur.ttsUsd += usageTts;
-    cur.platformUsageUsd += platformUsage;
-    cur.totalUsd += callTotal;
+    cur.callMinutes += callMinutes;
+    cur.participantMinutes += participantMinutes;
+    cur.billedSeconds += billedSeconds;
+    cur.cogsUsd += callCogsUsd;
+    cur.retailUsd += callRetailUsd;
+    cur.totalUsd += callRetailUsd;
+    addBreakdown(cur.cogsBreakdownUsd, cogs?.breakdownUsd);
+    addBreakdown(cur.retailBreakdownUsd, retail?.breakdownUsd);
     seriesMap.set(t, cur);
 
     totals.calls += 1;
-    totals.callMinutes += minutes;
-    totals.llmUsd += usageLlm;
-    totals.sttUsd += usageStt;
-    totals.ttsUsd += usageTts;
-    totals.platformUsageUsd += platformUsage;
-    totals.totalUsd += callTotal;
+    totals.callMinutes += callMinutes;
+    totals.participantMinutes += participantMinutes;
+    totals.billedSeconds += billedSeconds;
+    totals.cogsUsd += callCogsUsd;
+    totals.retailUsd += callRetailUsd;
+    totals.totalUsd += callRetailUsd;
+    addBreakdown(totals.cogsBreakdownUsd, cogs?.breakdownUsd);
+    addBreakdown(totals.retailBreakdownUsd, retail?.breakdownUsd);
   }
 
   // Add pro-rated fixed fees to each day bucket.
@@ -2231,13 +2710,15 @@ app.get("/api/billing/usage", requireAuth, async (req, res) => {
     const cur = seriesMap.get(t) || {
       t,
       callMinutes: 0,
-      llmUsd: 0,
-      sttUsd: 0,
-      ttsUsd: 0,
-      platformUsageUsd: 0,
       phoneNumbersUsd: 0,
       platformBaseUsd: 0,
+      participantMinutes: 0,
+      billedSeconds: 0,
+      cogsUsd: 0,
+      retailUsd: 0,
       totalUsd: 0,
+      cogsBreakdownUsd: emptyBreakdown(),
+      retailBreakdownUsd: emptyBreakdown(),
     };
     const days = bucket === "week" ? 7 : 1;
     cur.phoneNumbersUsd += phoneNumbersUsdPerDay * days;
@@ -2248,7 +2729,8 @@ app.get("/api/billing/usage", requireAuth, async (req, res) => {
 
   totals.phoneNumbersUsd = phoneNumbersUsdMonthly;
   totals.platformBaseUsd = platformBaseUsdMonthly;
-  totals.totalUsd += phoneNumbersUsdMonthly + platformBaseUsdMonthly;
+  totals.fixedFeesUsd = phoneNumbersUsdMonthly + platformBaseUsdMonthly;
+  totals.totalUsd += totals.fixedFeesUsd;
 
   function round4(n) {
     return Math.round(Number(n || 0) * 10000) / 10000;
@@ -2260,10 +2742,9 @@ app.get("/api/billing/usage", requireAuth, async (req, res) => {
     .map((p) => ({
       t: p.t,
       callMinutes: round4(p.callMinutes),
-      llmUsd: round4(p.llmUsd),
-      sttUsd: round4(p.sttUsd),
-      ttsUsd: round4(p.ttsUsd),
-      platformUsageUsd: round4(p.platformUsageUsd),
+      participantMinutes: round4(p.participantMinutes || 0),
+      cogsUsd: round4(p.cogsUsd || 0),
+      retailUsd: round4(p.retailUsd || 0),
       phoneNumbersUsd: round4(p.phoneNumbersUsd),
       platformBaseUsd: round4(p.platformBaseUsd),
       totalUsd: round4(p.totalUsd),
@@ -2276,13 +2757,14 @@ app.get("/api/billing/usage", requireAuth, async (req, res) => {
     totals: {
       calls: totals.calls,
       callMinutes: round4(totals.callMinutes),
-      llmUsd: round4(totals.llmUsd),
-      sttUsd: round4(totals.sttUsd),
-      ttsUsd: round4(totals.ttsUsd),
-      platformUsageUsd: round4(totals.platformUsageUsd),
+      participantMinutes: round4(totals.participantMinutes),
+      cogsUsd: round4(totals.cogsUsd),
+      retailUsd: round4(totals.retailUsd),
       phoneNumbersUsd: round4(totals.phoneNumbersUsd),
       platformBaseUsd: round4(totals.platformBaseUsd),
       totalUsd: round4(totals.totalUsd),
+      cogsBreakdownUsd: Object.fromEntries(Object.entries(totals.cogsBreakdownUsd).map(([k, v]) => [k, round4(v)])),
+      retailBreakdownUsd: Object.fromEntries(Object.entries(totals.retailBreakdownUsd).map(([k, v]) => [k, round4(v)])),
     },
   });
 });
@@ -2536,6 +3018,40 @@ app.get("/api/calls/:id/recording-playback", async (req, res) => {
 
   const { bucket, key } = call.recording;
   try {
+    // Playback GET counter (used for S3 GET request cost, per call).
+    // Best-effort: do not block streaming.
+    setTimeout(async () => {
+      try {
+        const c = USE_DB ? await store.getCallById(id) : readCalls().find((x) => x.id === id);
+        if (!c) return;
+        const prevMetrics = c.metrics && typeof c.metrics === "object" ? c.metrics : {};
+        const prevRec = prevMetrics.recording && typeof prevMetrics.recording === "object" ? prevMetrics.recording : {};
+        const nextCount = Number(prevRec.playbackGetCount || 0) + 1;
+        const patch = {
+          metrics: {
+            ...prevMetrics,
+            recording: { ...prevRec, playbackGetCount: nextCount, lastPlaybackAtMs: Date.now() },
+          },
+          recording:
+            c.recording && typeof c.recording === "object"
+              ? { ...c.recording, playbackGetCount: nextCount }
+              : c.recording,
+        };
+        if (USE_DB) {
+          await store.updateCall(id, patch);
+        } else {
+          const calls = readCalls();
+          const idx = calls.findIndex((x) => x.id === id);
+          if (idx !== -1) {
+            calls[idx] = { ...calls[idx], ...patch, updatedAt: Date.now() };
+            writeCalls(calls);
+          }
+        }
+      } catch {
+        // ignore
+      }
+    }, 0);
+
     const range = req.headers.range;
     const obj = await getObject({ bucket, key, range });
 
@@ -2752,14 +3268,30 @@ app.post("/api/calls/:id/end", requireAuth, async (req, res) => {
             // EGRESS_COMPLETE
             if (USE_DB) {
               const c = await store.getCallById(id);
-              if (c?.recording?.kind === "egress_s3") await store.updateCall(id, { recording: { ...c.recording, status: "ready" } });
+              if (c?.recording?.kind === "egress_s3") {
+                let sizeBytes = c.recording.sizeBytes ?? null;
+                try {
+                  const h = await headObject({ bucket: c.recording.bucket, key: c.recording.key });
+                  if (typeof h?.ContentLength === "number" && Number.isFinite(h.ContentLength)) sizeBytes = h.ContentLength;
+                } catch {
+                  // ignore
+                }
+                await store.updateCall(id, { recording: { ...c.recording, status: "ready", sizeBytes } });
+              }
             } else {
               const calls3 = readCalls();
               const idx3 = calls3.findIndex((c) => c.id === id);
               if (idx3 !== -1 && calls3[idx3].recording?.kind === "egress_s3") {
+                let sizeBytes = calls3[idx3].recording.sizeBytes ?? null;
+                try {
+                  const h = await headObject({ bucket: calls3[idx3].recording.bucket, key: calls3[idx3].recording.key });
+                  if (typeof h?.ContentLength === "number" && Number.isFinite(h.ContentLength)) sizeBytes = h.ContentLength;
+                } catch {
+                  // ignore
+                }
                 calls3[idx3] = {
                   ...calls3[idx3],
-                  recording: { ...calls3[idx3].recording, status: "ready" },
+                  recording: { ...calls3[idx3].recording, status: "ready", sizeBytes },
                   updatedAt: Date.now(),
                 };
                 writeCalls(calls3);

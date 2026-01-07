@@ -1,4 +1,4 @@
-const { S3Client, GetObjectCommand } = require("@aws-sdk/client-s3");
+const { S3Client, GetObjectCommand, HeadObjectCommand } = require("@aws-sdk/client-s3");
 const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 
 function getS3Client() {
@@ -36,6 +36,13 @@ async function getObject({ bucket, key, range }) {
   return await client.send(cmd);
 }
 
-module.exports = { presignGetObject, getObject };
+async function headObject({ bucket, key }) {
+  const client = getS3Client();
+  if (!client) throw new Error("Missing S3 client config (EGRESS_S3_REGION/EGRESS_S3_ACCESS_KEY/EGRESS_S3_SECRET)");
+  const cmd = new HeadObjectCommand({ Bucket: bucket, Key: key });
+  return await client.send(cmd);
+}
+
+module.exports = { presignGetObject, getObject, headObject };
 
 

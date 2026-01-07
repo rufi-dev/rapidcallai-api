@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "node src/index.js",
     "start": "node src/index.js",
+    "test": "node src/billing/costModel.test.js",
     "migrate:json": "node src/migrate_from_json.js"
   },
   "keywords": [],
