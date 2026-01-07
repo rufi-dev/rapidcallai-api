@@ -14,6 +14,7 @@ const { z } = require("zod");
 const path = require("path");
 const fs = require("fs");
 const multer = require("multer");
+const promClient = require("prom-client");
 
 const {
   readAgents,
@@ -31,6 +32,60 @@ const { roomService, createParticipantToken } = require("./livekit");
 const { startCallEgress, stopEgress, getEgressInfo } = require("./egress");
 const { getObject } = require("./s3");
 const tw = require("./twilio");
+
+// --- Metrics (Prometheus) ---
+// LiveKit Cloud has its own observability; this endpoint is for *your* infra + app-level metrics.
+// Enable by setting METRICS_BEARER_TOKEN.
+const metricsRegister = new promClient.Registry();
+promClient.collectDefaultMetrics({ register: metricsRegister });
+
+const httpRequestDurationMs = new promClient.Histogram({
+  name: "rapidcall_http_request_duration_ms",
+  help: "HTTP request duration in ms",
+  labelNames: ["method", "route", "status"],
+  buckets: [5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000],
+});
+metricsRegister.registerMetric(httpRequestDurationMs);
+
+const callsStartedTotal = new promClient.Counter({
+  name: "rapidcall_calls_started_total",
+  help: "Number of calls started",
+  labelNames: ["source"],
+});
+metricsRegister.registerMetric(callsStartedTotal);
+
+const callsEndedTotal = new promClient.Counter({
+  name: "rapidcall_calls_ended_total",
+  help: "Number of calls ended",
+  labelNames: ["source", "outcome"],
+});
+metricsRegister.registerMetric(callsEndedTotal);
+
+const callDurationSeconds = new promClient.Histogram({
+  name: "rapidcall_call_duration_seconds",
+  help: "Call duration in seconds (ended calls)",
+  labelNames: ["source", "outcome"],
+  buckets: [1, 5, 10, 20, 30, 60, 120, 300, 600, 1200, 3600],
+});
+metricsRegister.registerMetric(callDurationSeconds);
+
+const callMetricsPostedTotal = new promClient.Counter({
+  name: "rapidcall_call_metrics_posted_total",
+  help: "Number of times the agent posted /api/calls/:id/metrics",
+  labelNames: ["hasUsage"],
+});
+metricsRegister.registerMetric(callMetricsPostedTotal);
+
+// Best-effort in-process gauge (accurate per instance only).
+let inProgressCallsGaugeValue = 0;
+const inProgressCallsGauge = new promClient.Gauge({
+  name: "rapidcall_calls_in_progress",
+  help: "In-progress calls (per API instance; best-effort)",
+  collect() {
+    this.set(inProgressCallsGaugeValue);
+  },
+});
+metricsRegister.registerMetric(inProgressCallsGauge);
 
 function numEnv(name) {
   const v = process.env[name];
@@ -276,6 +331,26 @@ app.set("trust proxy", 1);
 app.use(express.json({ limit: "10mb" }));
 // Twilio webhooks POST as application/x-www-form-urlencoded by default.
 app.use(express.urlencoded({ extended: false }));
+
+// HTTP metrics middleware (use route templates when available to avoid high-cardinality metrics).
+app.use((req, res, next) => {
+  const end = httpRequestDurationMs.startTimer({ method: req.method });
+  res.on("finish", () => {
+    const route = req.route?.path ? `${req.baseUrl || ""}${req.route.path}` : req.path || "unknown";
+    end({ route, status: String(res.statusCode) });
+  });
+  next();
+});
+
+// Prometheus metrics endpoint (disabled unless METRICS_BEARER_TOKEN is set).
+app.get("/metrics", async (req, res) => {
+  const token = String(process.env.METRICS_BEARER_TOKEN || "").trim();
+  if (!token) return res.status(404).send("Not found");
+  const auth = String(req.headers.authorization || "");
+  if (auth !== `Bearer ${token}`) return res.status(401).send("Unauthorized");
+  res.set("Content-Type", metricsRegister.contentType);
+  return res.send(await metricsRegister.metrics());
+});
 const PROMPT_MAX = 200000;
 const WELCOME_TEXT_MAX = 400;
 
@@ -593,6 +668,8 @@ app.post("/api/internal/telephony/inbound/start", requireAgentSecret, async (req
 
   const callId = `call_${nanoid(12)}`;
   const now = Date.now();
+  callsStartedTotal.inc({ source: "telephony" });
+  inProgressCallsGaugeValue += 1;
   const callRecord = {
     id: callId,
     workspaceId: phoneRow.workspaceId,
@@ -670,12 +747,22 @@ app.post("/api/internal/calls/:id/end", requireAgentSecret, async (req, res) => 
   const endedAt = current.endedAt ?? now;
   const durationSec = Math.max(0, Math.round((endedAt - current.startedAt) / 1000));
 
+  const outcomeToStore = parsed.data.outcome ?? (current.outcome === "in_progress" ? "completed" : current.outcome);
   const updated = await store.updateCall(id, {
     endedAt,
     durationSec,
-    outcome: parsed.data.outcome ?? (current.outcome === "in_progress" ? "completed" : current.outcome),
+    outcome: outcomeToStore,
     transcript: parsed.data.transcript ? parsed.data.transcript : current.transcript,
   });
+
+  // Metrics: telephony end
+  try {
+    callsEndedTotal.inc({ source: "telephony", outcome: String(outcomeToStore || "completed") });
+    callDurationSeconds.observe({ source: "telephony", outcome: String(outcomeToStore || "completed") }, Number(durationSec || 0));
+    inProgressCallsGaugeValue = Math.max(0, inProgressCallsGaugeValue - 1);
+  } catch {
+    // ignore
+  }
 
   // Stop/finalize egress for telephony calls (same behavior as public /api/calls/:id/end).
   try {
@@ -1400,6 +1487,8 @@ app.post("/api/agents/:id/start", requireAuth, async (req, res) => {
   const roomName = `${webRoomPrefix}${id}-${nanoid(6)}`;
   const identity = `user-${nanoid(8)}`;
   const callId = `call_${nanoid(12)}`;
+  callsStartedTotal.inc({ source: "web" });
+  inProgressCallsGaugeValue += 1;
 
   // Persist a call record immediately (web test)
   const now = Date.now();
@@ -1599,6 +1688,7 @@ app.post("/api/calls/:id/metrics", requireAgentSecret, async (req, res) => {
 
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "Validation failed", details: parsed.error.flatten() });
+  callMetricsPostedTotal.inc({ hasUsage: parsed.data.usage ? "true" : "false" });
 
   const current = USE_DB ? await store.getCallById(id) : readCalls().find((c) => c.id === id);
   if (!current) return res.status(404).json({ error: "Call not found" });
@@ -2415,15 +2505,25 @@ app.post("/api/calls/:id/end", requireAuth, async (req, res) => {
   const endedAt = current.endedAt ?? now;
   const durationSec = Math.max(0, Math.round((endedAt - current.startedAt) / 1000));
 
+  const outcomeToStore = parsed.data.outcome ?? (current.outcome === "in_progress" ? "completed" : current.outcome);
   const next = {
     ...current,
     endedAt,
     durationSec,
-    outcome: parsed.data.outcome ?? (current.outcome === "in_progress" ? "completed" : current.outcome),
+    outcome: outcomeToStore,
     costUsd: typeof parsed.data.costUsd === "number" ? parsed.data.costUsd : current.costUsd,
     transcript: parsed.data.transcript ? parsed.data.transcript : current.transcript,
     updatedAt: now,
   };
+
+  // Metrics: web end (best-effort; this endpoint is used by webtest UI)
+  try {
+    callsEndedTotal.inc({ source: "web", outcome: String(outcomeToStore || "completed") });
+    callDurationSeconds.observe({ source: "web", outcome: String(outcomeToStore || "completed") }, Number(durationSec || 0));
+    inProgressCallsGaugeValue = Math.max(0, inProgressCallsGaugeValue - 1);
+  } catch {
+    // ignore
+  }
 
   // Stop egress recording if it is running; finalize status in the background.
   if (next.recording && next.recording.kind === "egress_s3" && next.recording.egressId) {
