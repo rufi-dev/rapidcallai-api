@@ -119,11 +119,35 @@ function getLlmPricingPer1k(model) {
   return null;
 }
 
+function getSttPricingPerMin(model) {
+  const m = String(model || "").trim();
+  const envTable = parseJsonEnv("STT_PRICING_JSON");
+  const rec = envTable && m && envTable[m] ? envTable[m] : null;
+  if (rec && typeof rec === "object") {
+    const v = Number(rec.usdPerMin ?? rec.usd_per_min);
+    if (Number.isFinite(v)) return v;
+  }
+  // fallback: global rate
+  return numEnv("STT_USD_PER_MIN");
+}
+
+function getTtsPricingPer1kChars(model) {
+  const m = String(model || "").trim();
+  const envTable = parseJsonEnv("TTS_PRICING_JSON");
+  const rec = envTable && m && envTable[m] ? envTable[m] : null;
+  if (rec && typeof rec === "object") {
+    const v = Number(rec.usdPer1KChars ?? rec.usd_per_1k_chars ?? rec.usdPer1kChars);
+    if (Number.isFinite(v)) return v;
+  }
+  // fallback: global rate
+  return numEnv("TTS_USD_PER_1K_CHARS");
+}
+
 function computeCostBreakdownFromUsage(usage, llmModel) {
   if (!usage) return null;
   const llmRates = getLlmPricingPer1k(llmModel);
-  const sttPerMin = numEnv("STT_USD_PER_MIN");
-  const ttsPer1kChars = numEnv("TTS_USD_PER_1K_CHARS");
+  const sttPerMin = getSttPricingPerMin(usage?.stt_model);
+  const ttsPer1kChars = getTtsPricingPer1kChars(usage?.tts_model);
 
   const llmPromptTokens = Number(usage.llm_prompt_tokens || 0);
   const llmPromptCachedTokens = Number(usage.llm_prompt_cached_tokens || 0);
@@ -167,8 +191,8 @@ function computeCostBreakdownFromUsage(usage, llmModel) {
 function computeCostUsdFromUsage(usage, llmModel) {
   if (!usage) return null;
   const llmRates = getLlmPricingPer1k(llmModel);
-  const sttPerMin = numEnv("STT_USD_PER_MIN");
-  const ttsPer1kChars = numEnv("TTS_USD_PER_1K_CHARS");
+  const sttPerMin = getSttPricingPerMin(usage?.stt_model);
+  const ttsPer1kChars = getTtsPricingPer1kChars(usage?.tts_model);
 
   let total = 0;
   let any = false;
@@ -1512,6 +1536,10 @@ app.post("/api/calls/:id/metrics", requireAgentSecret, async (req, res) => {
         tts_characters_count: z.number().int().nonnegative().optional(),
         tts_audio_duration: z.number().nonnegative().optional(),
         stt_audio_duration: z.number().nonnegative().optional(),
+        // optional: allow the agent to attach model identifiers directly under usage
+        llm_model: z.string().min(1).max(120).optional(),
+        stt_model: z.string().min(1).max(120).optional(),
+        tts_model: z.string().min(1).max(120).optional(),
       })
       .optional(),
     models: z
@@ -1538,11 +1566,19 @@ app.post("/api/calls/:id/metrics", requireAgentSecret, async (req, res) => {
   if (!current) return res.status(404).json({ error: "Call not found" });
   const usage = parsed.data.usage ?? current.metrics?.usage ?? null;
   const models = parsed.data.models ?? current.metrics?.models ?? null;
-  const llmModel = models?.llm ?? null;
+  const llmModel = models?.llm ?? usage?.llm_model ?? null;
+  const sttModel = models?.stt ?? usage?.stt_model ?? null;
+  const ttsModel = models?.tts ?? usage?.tts_model ?? null;
   const latency = parsed.data.latency ?? current.metrics?.latency ?? null;
 
-  const costBreakdown = computeCostBreakdownFromUsage(usage, llmModel) ?? current.metrics?.costBreakdown ?? null;
-  const costUsd = (costBreakdown?.totalUsd ?? computeCostUsdFromUsage(usage, llmModel)) ?? current.costUsd ?? null;
+  // Normalize models into usage so pricing lookups can be consistent.
+  const usageWithModels =
+    usage && typeof usage === "object"
+      ? { ...usage, stt_model: sttModel ?? usage.stt_model, tts_model: ttsModel ?? usage.tts_model }
+      : usage;
+
+  const costBreakdown = computeCostBreakdownFromUsage(usageWithModels, llmModel) ?? current.metrics?.costBreakdown ?? null;
+  const costUsd = (costBreakdown?.totalUsd ?? computeCostUsdFromUsage(usageWithModels, llmModel)) ?? current.costUsd ?? null;
 
   const llmIn = Number(usage?.llm_prompt_tokens || 0);
   const llmOut = Number(usage?.llm_completion_tokens || 0);
@@ -1552,7 +1588,7 @@ app.post("/api/calls/:id/metrics", requireAgentSecret, async (req, res) => {
     ...current,
     costUsd,
     metrics: {
-      usage,
+      usage: usageWithModels,
       models,
       latency,
       tokensTotal,
@@ -1840,6 +1876,16 @@ app.get("/api/billing/catalog", requireAuth, async (_req, res) => {
   return res.json({
     source,
     llmModels,
+    stt: {
+      source: parseJsonEnv("STT_PRICING_JSON") ? "env" : "envOrFallback",
+      pricingJsonConfigured: Boolean(parseJsonEnv("STT_PRICING_JSON")),
+      fallbackUsdPerMin: numEnv("STT_USD_PER_MIN"),
+    },
+    tts: {
+      source: parseJsonEnv("TTS_PRICING_JSON") ? "env" : "envOrFallback",
+      pricingJsonConfigured: Boolean(parseJsonEnv("TTS_PRICING_JSON")),
+      fallbackUsdPer1KChars: numEnv("TTS_USD_PER_1K_CHARS"),
+    },
     docs: { openaiPricing: "https://platform.openai.com/pricing" },
   });
 });
