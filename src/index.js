@@ -90,6 +90,14 @@ const WelcomeConfigSchema = z
   })
   .optional();
 
+const VoiceConfigSchema = z
+  .object({
+    provider: z.enum(["elevenlabs", "cartesia"]).optional(),
+    model: z.string().min(1).max(120).optional(),
+    voiceId: z.string().min(1).max(120).optional(),
+  })
+  .optional();
+
 // Allow one or many origins. Use comma-separated list in CLIENT_ORIGIN, e.g.:
 // CLIENT_ORIGIN=https://dashboard.rapidcallai.com,http://localhost:5173
 const clientOrigins = String(process.env.CLIENT_ORIGIN || "http://localhost:5173")
@@ -133,6 +141,33 @@ function getRecordingPlaybackSecret() {
     String(process.env.RECORDING_PLAYBACK_SECRET || "").trim() ||
     String(process.env.AGENT_SHARED_SECRET || "").trim();
   return s || null;
+}
+
+function wavFromPcmS16le(pcmBuf, sampleRate) {
+  const numChannels = 1;
+  const bitsPerSample = 16;
+  const byteRate = sampleRate * numChannels * (bitsPerSample / 8);
+  const blockAlign = numChannels * (bitsPerSample / 8);
+
+  const dataSize = pcmBuf.length;
+  const riffSize = 36 + dataSize;
+  const header = Buffer.alloc(44);
+
+  header.write("RIFF", 0);
+  header.writeUInt32LE(riffSize, 4);
+  header.write("WAVE", 8);
+  header.write("fmt ", 12);
+  header.writeUInt32LE(16, 16); // PCM fmt chunk size
+  header.writeUInt16LE(1, 20); // PCM format
+  header.writeUInt16LE(numChannels, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(byteRate, 28);
+  header.writeUInt16LE(blockAlign, 32);
+  header.writeUInt16LE(bitsPerSample, 34);
+  header.write("data", 36);
+  header.writeUInt32LE(dataSize, 40);
+
+  return Buffer.concat([header, pcmBuf]);
 }
 
 function signRecordingPlaybackToken({ callId, expMs }) {
@@ -402,6 +437,7 @@ app.post("/api/internal/telephony/inbound/start", requireAgentSecret, async (req
     agent: { id: agent.id, name: agent.name },
     prompt: promptUsed,
     welcome: agent.welcome ?? {},
+    voice: agent.voice ?? {},
     phoneNumber: { id: phoneRow.id, e164: phoneRow.e164 },
   });
 });
@@ -479,6 +515,7 @@ app.post("/api/agents", requireAuth, async (req, res) => {
     promptDraft: z.string().max(PROMPT_MAX).optional(),
     promptPublished: z.string().max(PROMPT_MAX).optional(),
     welcome: WelcomeConfigSchema,
+    voice: VoiceConfigSchema,
   });
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) {
@@ -508,6 +545,13 @@ app.post("/api/agents", requireAuth, async (req, res) => {
       aiMessageText: parsed.data.welcome?.aiMessageText ?? "",
       aiDelaySeconds: parsed.data.welcome?.aiDelaySeconds ?? 0,
     },
+    voice: parsed.data.voice
+      ? {
+          provider: parsed.data.voice.provider ?? null,
+          model: parsed.data.voice.model ?? null,
+          voiceId: parsed.data.voice.voiceId ?? null,
+        }
+      : {},
     createdAt: now,
     updatedAt: now,
   };
@@ -530,6 +574,7 @@ app.put("/api/agents/:id", requireAuth, async (req, res) => {
     promptDraft: z.string().max(PROMPT_MAX).optional(),
     publish: z.boolean().optional(),
     welcome: WelcomeConfigSchema,
+    voice: VoiceConfigSchema,
   });
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) {
@@ -566,6 +611,7 @@ app.put("/api/agents/:id", requireAuth, async (req, res) => {
     promptPublished: nextPublished,
     publishedAt: shouldPublish ? Date.now() : (current.publishedAt ?? null),
     welcome: parsed.data.welcome ? { ...(current.welcome ?? {}), ...parsed.data.welcome } : current.welcome,
+    voice: parsed.data.voice ? { ...(current.voice ?? {}), ...parsed.data.voice } : current.voice,
     updatedAt: Date.now(),
   };
   delete next.prompt;
@@ -992,6 +1038,7 @@ app.post("/api/agents/:id/start", requireAuth, async (req, res) => {
     aiMessageText: startParsed?.data?.welcome?.aiMessageText ?? agent.welcome?.aiMessageText ?? "",
     aiDelaySeconds: startParsed?.data?.welcome?.aiDelaySeconds ?? agent.welcome?.aiDelaySeconds ?? 0,
   };
+  const voice = agent.voice ?? {};
 
   // IMPORTANT:
   // Web test rooms must match an existing LiveKit dispatch rule (telephony typically uses roomPrefix "call-").
@@ -1038,7 +1085,7 @@ app.post("/api/agents/:id/start", requireAuth, async (req, res) => {
     name: roomName,
     metadata: JSON.stringify({
       call: { id: callId, to: "webtest" },
-      agent: { id: agent.id, name: agent.name, prompt: promptUsed },
+      agent: { id: agent.id, name: agent.name, prompt: promptUsed, voice },
       welcome,
     }),
     agents: webAgentName
@@ -1546,6 +1593,91 @@ app.get("/api/calls/:id/recording-url", requireAuth, async (req, res) => {
   }
 
   return res.status(404).json({ error: "No recording URL" });
+});
+
+// Preview TTS voice audio for the dashboard (used by Voice Configuration UI).
+// Returns audio/mpeg (ElevenLabs) or audio/wav (Cartesia bytes endpoint returns raw PCM which we wrap as WAV).
+app.post("/api/tts/preview", requireAuth, async (req, res) => {
+  const schema = z.object({
+    provider: z.enum(["elevenlabs", "cartesia"]),
+    model: z.string().min(1).max(120).optional(),
+    voiceId: z.string().min(1).max(120),
+    text: z.string().min(1).max(300),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "Validation failed", details: parsed.error.flatten() });
+
+  const provider = parsed.data.provider;
+  const text = parsed.data.text;
+
+  try {
+    if (provider === "elevenlabs") {
+      const apiKey = String(process.env.ELEVENLABS_API_KEY || "").trim();
+      if (!apiKey) return res.status(500).json({ error: "ELEVENLABS_API_KEY is not set on the server" });
+      const modelId = parsed.data.model || "eleven_multilingual_v2";
+
+      const r = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(parsed.data.voiceId)}`, {
+        method: "POST",
+        headers: {
+          "xi-api-key": apiKey,
+          "content-type": "application/json",
+          accept: "audio/mpeg",
+        },
+        body: JSON.stringify({
+          text,
+          model_id: modelId,
+          voice_settings: { stability: 0.45, similarity_boost: 0.8, style: 0.25, use_speaker_boost: true },
+        }),
+      });
+
+      if (!r.ok) {
+        const errTxt = await r.text().catch(() => "");
+        return res.status(502).json({ error: `ElevenLabs preview failed (${r.status})`, details: errTxt.slice(0, 500) });
+      }
+
+      res.setHeader("Content-Type", "audio/mpeg");
+      res.setHeader("Cache-Control", "no-store");
+      const buf = Buffer.from(await r.arrayBuffer());
+      return res.status(200).send(buf);
+    }
+
+    // Cartesia (bytes endpoint -> raw PCM s16le). Wrap as WAV for browser playback.
+    const apiKey = String(process.env.CARTESIA_API_KEY || "").trim();
+    if (!apiKey) return res.status(500).json({ error: "CARTESIA_API_KEY is not set on the server" });
+    const modelId = parsed.data.model || "sonic-2";
+    const sampleRate = 24000;
+
+    const payload = {
+      model_id: modelId,
+      voice: { mode: "id", id: parsed.data.voiceId },
+      output_format: { container: "raw", encoding: "pcm_s16le", sample_rate: sampleRate },
+      language: "en",
+      transcript: text,
+    };
+
+    const r = await fetch("https://api.cartesia.ai/tts/bytes", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "X-API-Key": apiKey,
+        "Cartesia-Version": "2025-04-16",
+      },
+      body: JSON.stringify(payload),
+    });
+
+    if (!r.ok) {
+      const errTxt = await r.text().catch(() => "");
+      return res.status(502).json({ error: `Cartesia preview failed (${r.status})`, details: errTxt.slice(0, 500) });
+    }
+
+    const pcm = Buffer.from(await r.arrayBuffer());
+    const wav = wavFromPcmS16le(pcm, sampleRate);
+    res.setHeader("Content-Type", "audio/wav");
+    res.setHeader("Cache-Control", "no-store");
+    return res.status(200).send(wav);
+  } catch (e) {
+    return res.status(500).json({ error: "Preview failed" });
+  }
 });
 
 app.post("/api/calls/:id/end", requireAuth, async (req, res) => {
