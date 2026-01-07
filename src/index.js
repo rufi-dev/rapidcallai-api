@@ -1820,6 +1820,24 @@ app.get("/api/billing/summary", requireAuth, async (req, res) => {
 
   let anyCost = false;
 
+  // Fixed monthly fees (explicit line items)
+  const phoneNumberMonthlyFee = numEnv("PHONE_NUMBER_MONTHLY_FEE_USD") ?? 0;
+  const platformMonthlyFee = numEnv("PLATFORM_MONTHLY_FEE_USD") ?? 0;
+  let phoneNumbersCount = 0;
+  try {
+    if (USE_DB) {
+      const p = getPool();
+      const q = await p.query(`SELECT COUNT(*)::BIGINT AS cnt FROM phone_numbers WHERE workspace_id=$1`, [req.workspace.id]);
+      phoneNumbersCount = Number(q.rows?.[0]?.cnt || 0);
+    } else {
+      phoneNumbersCount = readPhoneNumbers().filter((pn) => pn.workspaceId === req.workspace.id).length;
+    }
+  } catch {
+    phoneNumbersCount = 0;
+  }
+  const phoneNumbersUsd = Math.max(0, phoneNumberMonthlyFee) * Math.max(0, phoneNumbersCount);
+  const platformUsd = Math.max(0, platformMonthlyFee);
+
   for (const r of rows) {
     const metrics = r.metrics || null;
     const usage = metrics?.usage || null;
@@ -1907,15 +1925,28 @@ app.get("/api/billing/summary", requireAuth, async (req, res) => {
     currency: "USD",
     periodStartMs: qFrom,
     periodEndMs: qTo,
-    upcomingInvoiceUsd: anyCost ? round4(totalUsd) : null,
-    breakdown: anyCost ? { llmUsd: round4(llmUsd), sttUsd: round4(sttUsd), ttsUsd: round4(ttsUsd) } : null,
-    otherUsd: anyCost ? round4(Math.max(0, totalUsd - (llmUsd + sttUsd + ttsUsd))) : null,
+    upcomingInvoiceUsd: anyCost ? round4(totalUsd + phoneNumbersUsd + platformUsd) : null,
+    breakdown: anyCost
+      ? {
+          llmUsd: round4(llmUsd),
+          sttUsd: round4(sttUsd),
+          ttsUsd: round4(ttsUsd),
+          phoneNumbersUsd: round4(phoneNumbersUsd),
+          platformUsd: round4(platformUsd),
+        }
+      : null,
+    otherUsd: anyCost ? round4(Math.max(0, (totalUsd + phoneNumbersUsd + platformUsd) - (llmUsd + sttUsd + ttsUsd + phoneNumbersUsd + platformUsd))) : null,
     usageTotals: {
       llmPromptTokens,
       llmPromptCachedTokens: rows.reduce((a, r) => a + Number((r?.metrics?.usage?.llm_prompt_cached_tokens || 0)), 0),
       llmCompletionTokens,
       sttAudioSeconds,
       ttsCharacters,
+    },
+    fixedFees: {
+      phoneNumbersCount,
+      phoneNumberMonthlyFeeUsd: round4(Math.max(0, phoneNumberMonthlyFee)),
+      platformMonthlyFeeUsd: round4(Math.max(0, platformMonthlyFee)),
     },
     pricingConfigured: {
       llm: Boolean(parseJsonEnv("LLM_PRICING_JSON") || (numEnv("LLM_INPUT_USD_PER_1K") != null && numEnv("LLM_OUTPUT_USD_PER_1K") != null) || DEFAULT_LLM_PRICING_PER_1M),
