@@ -166,6 +166,56 @@ function round4(n) {
   return Math.round(Number(n || 0) * 10000) / 10000;
 }
 
+function normalizeDurationSec({ durationSecStored, startedAtMs, endedAtMs }) {
+  const started = Number(startedAtMs || 0);
+  const ended = Number(endedAtMs || 0);
+  const derived = started > 0 && ended > 0 && ended >= started ? Math.max(0, Math.round((ended - started) / 1000)) : 0;
+
+  const storedRaw = Number(durationSecStored);
+  const storedOk = Number.isFinite(storedRaw) && storedRaw >= 0;
+  const stored = storedOk ? Math.round(storedRaw) : null;
+
+  // Guard rails: if stored is wildly different from derived, trust derived.
+  // Common bug: milliseconds saved into duration_sec (e.g. 20000 instead of 20).
+  // Common bug: seconds saved as milliseconds (rare) -> stored << derived.
+  const MAX_REASONABLE_SEC = 6 * 60 * 60; // 6h
+  let use = stored != null ? stored : derived;
+  let source = stored != null ? "stored" : "derived";
+  const flags = [];
+
+  if (stored != null) {
+    if (stored > MAX_REASONABLE_SEC && derived > 0 && derived <= MAX_REASONABLE_SEC) {
+      flags.push("stored_too_large_using_derived");
+      use = derived;
+      source = "derived";
+    } else if (derived > 0) {
+      const ratio = stored / Math.max(1, derived);
+      if (ratio >= 10 || ratio <= 0.1) {
+        flags.push("stored_mismatch_using_derived");
+        use = derived;
+        source = "derived";
+      }
+    } else if (stored > MAX_REASONABLE_SEC) {
+      flags.push("stored_too_large_no_derived");
+      // keep stored, but mark
+    }
+  }
+
+  if (!Number.isFinite(use) || use < 0) {
+    use = 0;
+    source = "derived";
+    flags.push("invalid_duration_clamped");
+  }
+
+  return {
+    durationSec: use,
+    derivedSec: derived,
+    storedSec: stored,
+    source,
+    flags,
+  };
+}
+
 async function computeOverheadUsdPerMinForWorkspace(workspaceId) {
   const budgets = {
     computeUsdPerMonth: numEnv("OVERHEAD_COMPUTE_USD_PER_MONTH") ?? 0,
@@ -2166,7 +2216,7 @@ app.get("/api/billing/summary", requireAuth, async (req, res) => {
     const p = getPool();
     const q = await p.query(
       `
-      SELECT cost_usd, metrics, duration_sec, recording
+      SELECT id, cost_usd, metrics, duration_sec, recording, started_at, ended_at
       FROM calls
       WHERE workspace_id=$1
         AND ended_at IS NOT NULL
@@ -2180,7 +2230,15 @@ app.get("/api/billing/summary", requireAuth, async (req, res) => {
       .filter((c) => c.workspaceId === req.workspace.id)
       .filter((c) => c.endedAt != null)
       .filter((c) => Number(c.startedAt || 0) >= qFrom && Number(c.startedAt || 0) <= qTo)
-      .map((c) => ({ cost_usd: c.costUsd ?? null, metrics: c.metrics ?? null, duration_sec: c.durationSec ?? null, recording: c.recording ?? null }));
+      .map((c) => ({
+        id: c.id,
+        cost_usd: c.costUsd ?? null,
+        metrics: c.metrics ?? null,
+        duration_sec: c.durationSec ?? null,
+        recording: c.recording ?? null,
+        started_at: c.startedAt ?? null,
+        ended_at: c.endedAt ?? null,
+      }));
   }
 
   const overheadUsdPerMin = await computeOverheadUsdPerMinForWorkspace(req.workspace.id);
@@ -2203,6 +2261,7 @@ app.get("/api/billing/summary", requireAuth, async (req, res) => {
       overheadBuffer: 0,
       safetyBuffer: 0,
       margin: 0,
+      platformUsage: 0,
     };
   }
 
@@ -2216,7 +2275,8 @@ app.get("/api/billing/summary", requireAuth, async (req, res) => {
 
   let totals = {
     calls: 0,
-    callMinutes: 0,
+    callMinutes: 0, // RAW call minutes (sum(durationSec)/60)
+    billedCallMinutes: 0, // billed minutes (rounding + minimums)
     participantMinutes: 0,
     participantMinutesEstimated: 0,
     livekitWebhookCalls: 0,
@@ -2224,8 +2284,11 @@ app.get("/api/billing/summary", requireAuth, async (req, res) => {
     cogsUsd: 0,
     retailUsd: 0,
     cogsBreakdownUsd: emptyBreakdown(),
-    retailBreakdownUsd: emptyBreakdown(),
+    retailBreakdownUsd: emptyBreakdown(), // charged breakdown (matches retailUsd)
   };
+
+  // Debug: top longest calls in this range
+  const debugLongest = [];
 
   // Raw usage totals (for transparency)
   let llmPromptTokens = 0;
@@ -2261,8 +2324,9 @@ app.get("/api/billing/summary", requireAuth, async (req, res) => {
     const ttsModel = models?.tts ?? usage?.tts_model ?? null;
     const normalized = metrics?.normalized || null;
     const telephony = metrics?.telephony || null;
-    const durationSec = typeof r.duration_sec === "number" ? r.duration_sec : Number(r.duration_sec || 0);
-  const recording = r.recording && typeof r.recording === "object" ? r.recording : null;
+    const dur = normalizeDurationSec({ durationSecStored: r.duration_sec, startedAtMs: r.started_at, endedAtMs: r.ended_at });
+    const durationSec = dur.durationSec;
+    const recording = r.recording && typeof r.recording === "object" ? r.recording : null;
     const livekit = metrics?.livekit && typeof metrics.livekit === "object" ? metrics.livekit : null;
 
     if (usage) {
@@ -2296,42 +2360,92 @@ app.get("/api/billing/summary", requireAuth, async (req, res) => {
       overheadUsdPerMin,
     });
 
-    const callMinutes = Number(computed?.normalized?.callMinutes || 0);
+    const callMinutesRaw = durationSec / 60;
+    const billedSeconds = costModel.computeBilledSeconds(durationSec);
+    const billedMinutes = billedSeconds / 60;
     const participantMinutes = Number(computed?.normalized?.participantMinutes || 0);
-    const billedSeconds = Number(computed?.normalized?.billedSeconds || 0);
     const cogs = metrics?.cost?.cogs || computed?.cogs || null;
-    const retail = metrics?.cost?.retail || computed?.retail || null;
+    const retailModel = metrics?.cost?.retail || computed?.retail || null;
 
     // Prefer stored retail cost (this is what we actually charged) when present.
     const storedRetailUsd = typeof r.cost_usd === "number" && Number.isFinite(r.cost_usd) ? Number(r.cost_usd) : null;
-    const callRetailUsd = storedRetailUsd != null ? storedRetailUsd : Number(retail?.totalUsd || 0);
+    const callRetailUsd = storedRetailUsd != null ? storedRetailUsd : Number(retailModel?.totalUsd || 0);
     const callCogsUsd = Number(cogs?.totalUsd || 0);
 
     totals.calls += 1;
-    totals.callMinutes += callMinutes;
+    totals.callMinutes += callMinutesRaw;
+    totals.billedCallMinutes += billedMinutes;
     totals.participantMinutes += participantMinutes;
     totals.billedSeconds += billedSeconds;
     totals.cogsUsd += callCogsUsd;
     totals.retailUsd += callRetailUsd;
     addBreakdown(totals.cogsBreakdownUsd, cogs?.breakdownUsd);
-    addBreakdown(totals.retailBreakdownUsd, retail?.breakdownUsd);
+
+    // Charged retail breakdown MUST match what was charged.
+    // If the call has a stored retail breakdown and it matches stored cost, use it.
+    // Otherwise fall back to a legacy breakdown: LLM/STT/TTS + residual "platformUsage".
+    let chargedBreakdown = null;
+    if (storedRetailUsd != null && metrics?.cost?.retail?.breakdownUsd && metrics?.cost?.retail?.totalUsd != null) {
+      const t = Number(metrics.cost.retail.totalUsd || 0);
+      if (Math.abs(t - storedRetailUsd) <= 0.02) chargedBreakdown = metrics.cost.retail.breakdownUsd;
+    }
+    if (!chargedBreakdown) {
+      const usageCogs = costModel.computeCostBreakdownFromUsage({ usage, models: { llm: llmModel, stt: sttModel, tts: ttsModel } });
+      let llm = Number(usageCogs?.llmUsd || 0);
+      let stt = Number(usageCogs?.sttUsd || 0);
+      let tts = Number(usageCogs?.ttsUsd || 0);
+      const usageSum = llm + stt + tts;
+      const charged = callRetailUsd;
+      let platformUsage = 0;
+      if (charged >= usageSum) {
+        platformUsage = charged - usageSum;
+      } else if (usageSum > 0) {
+        const f = charged / usageSum;
+        llm *= f;
+        stt *= f;
+        tts *= f;
+        platformUsage = 0;
+      }
+      chargedBreakdown = { llm: round4(llm), stt: round4(stt), tts: round4(tts), platformUsage: round4(platformUsage) };
+    }
+    addBreakdown(totals.retailBreakdownUsd, chargedBreakdown);
 
     // Debug/validation: participant-minute estimate from agent sampling (or default participants avg).
     const participantsAvg =
       (normalized && typeof normalized.participantsCountAvg === "number" && Number.isFinite(normalized.participantsCountAvg) && normalized.participantsCountAvg > 0)
         ? Number(normalized.participantsCountAvg)
         : numEnv("DEFAULT_PARTICIPANTS_COUNT_AVG") ?? 2;
-    totals.participantMinutesEstimated += callMinutes * participantsAvg;
+    totals.participantMinutesEstimated += callMinutesRaw * participantsAvg;
 
     // Coverage: calls where LiveKit webhook-derived billed participant minutes exists.
     if (livekit && typeof livekit.participantMinutesBilled === "number" && Number.isFinite(livekit.participantMinutesBilled) && livekit.participantMinutesBilled > 0) {
       totals.livekitWebhookCalls += 1;
     }
+
+    // Maintain top 10 longest calls (by raw duration)
+    debugLongest.push({
+      callId: String(r.id || ""),
+      durationSec: round4(durationSec),
+      durationMin: round4(callMinutesRaw),
+      durationStoredSec: dur.storedSec,
+      durationDerivedSec: dur.derivedSec,
+      durationSource: dur.source,
+      flags: dur.flags,
+      startedAt: Number(r.started_at || 0) || null,
+      endedAt: Number(r.ended_at || 0) || null,
+      billedMinutes: round4(billedMinutes),
+      chargedUsd: round4(callRetailUsd),
+    });
   }
 
+  debugLongest.sort((a, b) => (b.durationSec || 0) - (a.durationSec || 0));
+  const debugTop10 = debugLongest.slice(0, 10);
+
   const callMinutesTotal = Math.max(0.0001, totals.callMinutes);
+  const billedMinutesTotal = Math.max(0.0001, totals.billedCallMinutes);
   const cogsUsdPerMin = totals.cogsUsd / callMinutesTotal;
-  const retailUsdPerMin = totals.retailUsd / callMinutesTotal;
+  // Customer-facing $/min should be per BILLED minute (what we charge on).
+  const retailUsdPerMin = totals.retailUsd / billedMinutesTotal;
   const safetyRate = numEnv("SAFETY_BUFFER_RATE") ?? 0.25;
   const marginRate = numEnv("TARGET_GROSS_MARGIN_RATE") ?? 0.7;
   const recommendedRetailUsdPerMin = (cogsUsdPerMin * (1 + Math.max(0, safetyRate))) / Math.max(0.0001, 1 - Math.max(0, marginRate));
@@ -2342,7 +2456,7 @@ app.get("/api/billing/summary", requireAuth, async (req, res) => {
   for (const k of Object.keys(totals.retailBreakdownUsd)) retailBreakdownUsdPerMin[k] = round4(totals.retailBreakdownUsd[k] / callMinutesTotal);
 
   const fixedFeesUsd = round4(phoneNumbersUsd + platformBaseUsd);
-  const fixedFeesUsdPerMin = round4(fixedFeesUsd / callMinutesTotal);
+  const fixedFeesUsdPerMin = round4(fixedFeesUsd / billedMinutesTotal);
 
   return res.json({
     currency: "USD",
@@ -2377,6 +2491,7 @@ app.get("/api/billing/summary", requireAuth, async (req, res) => {
     totals: {
       calls: totals.calls,
       callMinutes: round4(totals.callMinutes),
+      billedCallMinutes: round4(totals.billedCallMinutes),
       participantMinutes: round4(totals.participantMinutes),
       participantMinutesEstimated: round4(totals.participantMinutesEstimated),
       livekitWebhookCalls: totals.livekitWebhookCalls,
@@ -2409,6 +2524,10 @@ app.get("/api/billing/summary", requireAuth, async (req, res) => {
       tts: numEnv("TTS_USD_PER_1K_CHARS") != null,
       telephony: numEnv("TELEPHONY_USD_PER_MIN") != null || Boolean(parseJsonEnv("TELEPHONY_PRICING_JSON")),
       livekit: numEnv("LIVEKIT_USD_PER_PARTICIPANT_MIN") != null,
+    },
+    debug: {
+      topLongestCalls: debugTop10,
+      note: "callMinutes = sum(durationSec)/60 (raw). billedCallMinutes = sum(rounded billed seconds)/60. If a call shows stored/derived mismatch, duration_sec in DB is likely corrupted (ms saved as seconds).",
     },
   });
 });
@@ -2548,7 +2667,7 @@ app.get("/api/billing/usage", requireAuth, async (req, res) => {
     const p = getPool();
     const q = await p.query(
       `
-      SELECT started_at, duration_sec, cost_usd, metrics, recording
+      SELECT id, started_at, ended_at, duration_sec, cost_usd, metrics, recording
       FROM calls
       WHERE workspace_id=$1
         AND ended_at IS NOT NULL
@@ -2563,7 +2682,9 @@ app.get("/api/billing/usage", requireAuth, async (req, res) => {
       .filter((c) => c.endedAt != null)
       .filter((c) => Number(c.startedAt || 0) >= qFrom && Number(c.startedAt || 0) <= qTo)
       .map((c) => ({
+        id: c.id,
         started_at: c.startedAt,
+        ended_at: c.endedAt,
         duration_sec: c.durationSec,
         cost_usd: c.costUsd ?? null,
         metrics: c.metrics ?? null,
@@ -2591,6 +2712,7 @@ app.get("/api/billing/usage", requireAuth, async (req, res) => {
       overheadBuffer: 0,
       safetyBuffer: 0,
       margin: 0,
+      platformUsage: 0,
     };
   }
 
@@ -2604,7 +2726,8 @@ app.get("/api/billing/usage", requireAuth, async (req, res) => {
 
   let totals = {
     calls: 0,
-    callMinutes: 0,
+    callMinutes: 0, // RAW call minutes (sum(durationSec)/60)
+    billedCallMinutes: 0,
     participantMinutes: 0,
     billedSeconds: 0,
     cogsUsd: 0,
@@ -2614,14 +2737,19 @@ app.get("/api/billing/usage", requireAuth, async (req, res) => {
     fixedFeesUsd: 0,
     totalUsd: 0, // retail + fixed fees
     cogsBreakdownUsd: emptyBreakdown(),
-    retailBreakdownUsd: emptyBreakdown(),
+    retailBreakdownUsd: emptyBreakdown(), // charged breakdown (matches retailUsd)
   };
+
+  const debugLongest = [];
 
   for (const r of rows) {
     const startedAt = Number(r.started_at || 0);
     const t = getBucketStart(startedAt);
-    const durationSec = Number(r.duration_sec || 0);
+    const dur = normalizeDurationSec({ durationSecStored: r.duration_sec, startedAtMs: r.started_at, endedAtMs: r.ended_at });
+    const durationSec = dur.durationSec;
     const minutes = Number.isFinite(durationSec) ? durationSec / 60 : 0;
+    const billedSeconds = costModel.computeBilledSeconds(durationSec);
+    const billedMinutes = billedSeconds / 60;
 
     const metrics = r.metrics || null;
     const usage = metrics?.usage || null;
@@ -2659,14 +2787,13 @@ app.get("/api/billing/usage", requireAuth, async (req, res) => {
       overheadUsdPerMin,
     });
 
-    const callMinutes = Number(computed?.normalized?.callMinutes || minutes || 0);
+    const callMinutes = minutes;
     const participantMinutes = Number(computed?.normalized?.participantMinutes || 0);
-    const billedSeconds = Number(computed?.normalized?.billedSeconds || 0);
     const cogs = metrics?.cost?.cogs || computed?.cogs || null;
-    const retail = metrics?.cost?.retail || computed?.retail || null;
+    const retailModel = metrics?.cost?.retail || computed?.retail || null;
 
     const storedRetailUsd = typeof r.cost_usd === "number" && Number.isFinite(r.cost_usd) ? Number(r.cost_usd) : null;
-    const callRetailUsd = storedRetailUsd != null ? storedRetailUsd : Number(retail?.totalUsd || 0);
+    const callRetailUsd = storedRetailUsd != null ? storedRetailUsd : Number(retailModel?.totalUsd || 0);
     const callCogsUsd = Number(cogs?.totalUsd || 0);
 
     const cur = seriesMap.get(t) || {
@@ -2690,18 +2817,59 @@ app.get("/api/billing/usage", requireAuth, async (req, res) => {
     cur.retailUsd += callRetailUsd;
     cur.totalUsd += callRetailUsd;
     addBreakdown(cur.cogsBreakdownUsd, cogs?.breakdownUsd);
-    addBreakdown(cur.retailBreakdownUsd, retail?.breakdownUsd);
+
+    // Charged breakdown: match stored charge if present.
+    let chargedBreakdown = null;
+    if (storedRetailUsd != null && metrics?.cost?.retail?.breakdownUsd && metrics?.cost?.retail?.totalUsd != null) {
+      const t0 = Number(metrics.cost.retail.totalUsd || 0);
+      if (Math.abs(t0 - storedRetailUsd) <= 0.02) chargedBreakdown = metrics.cost.retail.breakdownUsd;
+    }
+    if (!chargedBreakdown) {
+      const usageCogs = costModel.computeCostBreakdownFromUsage({ usage, models: { llm: llmModel, stt: sttModel, tts: ttsModel } });
+      let llm = Number(usageCogs?.llmUsd || 0);
+      let stt = Number(usageCogs?.sttUsd || 0);
+      let tts = Number(usageCogs?.ttsUsd || 0);
+      const usageSum = llm + stt + tts;
+      const charged = callRetailUsd;
+      let platformUsage = 0;
+      if (charged >= usageSum) {
+        platformUsage = charged - usageSum;
+      } else if (usageSum > 0) {
+        const f = charged / usageSum;
+        llm *= f;
+        stt *= f;
+        tts *= f;
+        platformUsage = 0;
+      }
+      chargedBreakdown = { llm: round4(llm), stt: round4(stt), tts: round4(tts), platformUsage: round4(platformUsage) };
+    }
+    addBreakdown(cur.retailBreakdownUsd, chargedBreakdown);
     seriesMap.set(t, cur);
 
     totals.calls += 1;
     totals.callMinutes += callMinutes;
     totals.participantMinutes += participantMinutes;
     totals.billedSeconds += billedSeconds;
+    totals.billedCallMinutes += billedMinutes;
     totals.cogsUsd += callCogsUsd;
     totals.retailUsd += callRetailUsd;
     totals.totalUsd += callRetailUsd;
     addBreakdown(totals.cogsBreakdownUsd, cogs?.breakdownUsd);
-    addBreakdown(totals.retailBreakdownUsd, retail?.breakdownUsd);
+    addBreakdown(totals.retailBreakdownUsd, chargedBreakdown);
+
+    debugLongest.push({
+      callId: String(r.id || ""),
+      durationSec: round4(durationSec),
+      durationMin: round4(minutes),
+      durationStoredSec: dur.storedSec,
+      durationDerivedSec: dur.derivedSec,
+      durationSource: dur.source,
+      flags: dur.flags,
+      startedAt: Number(r.started_at || 0) || null,
+      endedAt: Number(r.ended_at || 0) || null,
+      billedMinutes: round4(billedMinutes),
+      chargedUsd: round4(callRetailUsd),
+    });
   }
 
   // Add pro-rated fixed fees to each day bucket.
@@ -2757,6 +2925,7 @@ app.get("/api/billing/usage", requireAuth, async (req, res) => {
     totals: {
       calls: totals.calls,
       callMinutes: round4(totals.callMinutes),
+      billedCallMinutes: round4(totals.billedCallMinutes),
       participantMinutes: round4(totals.participantMinutes),
       cogsUsd: round4(totals.cogsUsd),
       retailUsd: round4(totals.retailUsd),
@@ -2765,6 +2934,9 @@ app.get("/api/billing/usage", requireAuth, async (req, res) => {
       totalUsd: round4(totals.totalUsd),
       cogsBreakdownUsd: Object.fromEntries(Object.entries(totals.cogsBreakdownUsd).map(([k, v]) => [k, round4(v)])),
       retailBreakdownUsd: Object.fromEntries(Object.entries(totals.retailBreakdownUsd).map(([k, v]) => [k, round4(v)])),
+    },
+    debug: {
+      topLongestCalls: debugLongest.sort((a, b) => (b.durationSec || 0) - (a.durationSec || 0)).slice(0, 10),
     },
   });
 });

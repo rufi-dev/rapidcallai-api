@@ -7,6 +7,8 @@
     "dev": "node src/index.js",
     "start": "node src/index.js",
     "test": "node src/billing/costModel.test.js",
+    "fix:durations:dry": "node src/fix_call_durations.js --dry-run",
+    "fix:durations": "node src/fix_call_durations.js --apply",
     "migrate:json": "node src/migrate_from_json.js"
   },
   "keywords": [],
