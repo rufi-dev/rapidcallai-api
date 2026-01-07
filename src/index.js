@@ -1840,8 +1840,15 @@ app.get("/api/billing/summary", requireAuth, async (req, res) => {
     // If the stored call total exists but breakdown was recomputed with a different markup,
     // scale the breakdown to match the stored total so numbers add up for users.
     const stored = typeof r.cost_usd === "number" && Number.isFinite(r.cost_usd) ? Number(r.cost_usd) : null;
-    if (stored != null && b?.totalUsd != null && b.totalUsd > 0) {
-      const ratio = stored / b.totalUsd;
+    const bTotal =
+      b?.totalUsd != null
+        ? Number(b.totalUsd)
+        : [b?.llm?.costUsd, b?.stt?.costUsd, b?.tts?.costUsd]
+            .filter((v) => typeof v === "number" && Number.isFinite(v))
+            .reduce((a, v) => a + v, 0);
+
+    if (stored != null && bTotal != null && Number.isFinite(bTotal) && bTotal > 0) {
+      const ratio = stored / bTotal;
       if (Number.isFinite(ratio) && ratio > 0 && Math.abs(ratio - 1) > 0.01) {
         b = {
           ...b,
@@ -1878,6 +1885,22 @@ app.get("/api/billing/summary", requireAuth, async (req, res) => {
 
   function round4(n) {
     return Math.round(n * 10000) / 10000;
+  }
+
+  // Final reconciliation: ensure breakdown sums to total, otherwise customers see confusing math.
+  // We never want "LLM+STT+TTS > total" or vice versa without an explicit "Other" line.
+  const sumParts = llmUsd + sttUsd + ttsUsd;
+  if (anyCost && Number.isFinite(totalUsd) && totalUsd > 0 && Number.isFinite(sumParts) && sumParts > 0) {
+    const diff = totalUsd - sumParts;
+    if (Math.abs(diff) > 0.01) {
+      // scale components to match total (keeps proportions stable) and set Other to 0
+      const factor = totalUsd / sumParts;
+      if (Number.isFinite(factor) && factor > 0) {
+        llmUsd *= factor;
+        sttUsd *= factor;
+        ttsUsd *= factor;
+      }
+    }
   }
 
   return res.json({
