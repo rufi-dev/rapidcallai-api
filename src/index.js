@@ -2084,6 +2084,209 @@ app.get("/api/billing/catalog", requireAuth, async (_req, res) => {
   });
 });
 
+// Billing usage series (Retell-style visuals).
+// Returns time series for costs (LLM/STT/TTS + Platform usage + fixed fees).
+app.get("/api/billing/usage", requireAuth, async (req, res) => {
+  const fromMs = req.query.from ? Number(req.query.from) : null;
+  const toMs = req.query.to ? Number(req.query.to) : null;
+  const bucket = String(req.query.bucket || "day").trim();
+  const hasFrom = typeof fromMs === "number" && Number.isFinite(fromMs);
+  const hasTo = typeof toMs === "number" && Number.isFinite(toMs);
+
+  const now = new Date();
+  const periodStart = hasFrom ? new Date(fromMs) : new Date(now.getFullYear(), now.getMonth(), 1);
+  const periodEnd = hasTo ? new Date(toMs) : new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59, 999);
+  const qFrom = periodStart.getTime();
+  const qTo = periodEnd.getTime();
+
+  const bucketMs = bucket === "week" ? 7 * 24 * 60 * 60 * 1000 : 24 * 60 * 60 * 1000;
+  const seriesMap = new Map(); // t -> agg
+
+  function getBucketStart(t) {
+    const x = Number(t || 0);
+    if (!Number.isFinite(x)) return qFrom;
+    // align to UTC bucket boundary
+    return Math.floor(x / bucketMs) * bucketMs;
+  }
+
+  // Fixed monthly fees
+  const phoneNumberMonthlyFee = numEnv("PHONE_NUMBER_MONTHLY_FEE_USD") ?? 0;
+  const platformMonthlyFee = numEnv("PLATFORM_MONTHLY_FEE_USD") ?? 0;
+  let phoneNumbersCount = 0;
+  try {
+    if (USE_DB) {
+      const p = getPool();
+      const q = await p.query(`SELECT COUNT(*)::BIGINT AS cnt FROM phone_numbers WHERE workspace_id=$1`, [req.workspace.id]);
+      phoneNumbersCount = Number(q.rows?.[0]?.cnt || 0);
+    } else {
+      phoneNumbersCount = readPhoneNumbers().filter((pn) => pn.workspaceId === req.workspace.id).length;
+    }
+  } catch {
+    phoneNumbersCount = 0;
+  }
+  const phoneNumbersUsdMonthly = Math.max(0, phoneNumberMonthlyFee) * Math.max(0, phoneNumbersCount);
+  const platformBaseUsdMonthly = Math.max(0, platformMonthlyFee);
+
+  // Pro-rate fixed monthly fees across the requested window (simple day-based pro-rate).
+  const daysInPeriod = Math.max(1, Math.round((qTo - qFrom) / (24 * 60 * 60 * 1000)));
+  const phoneNumbersUsdPerDay = phoneNumbersUsdMonthly / daysInPeriod;
+  const platformBaseUsdPerDay = platformBaseUsdMonthly / daysInPeriod;
+
+  let rows = [];
+  if (USE_DB) {
+    const p = getPool();
+    const q = await p.query(
+      `
+      SELECT started_at, duration_sec, cost_usd, metrics
+      FROM calls
+      WHERE workspace_id=$1
+        AND ended_at IS NOT NULL
+        AND started_at >= $2 AND started_at <= $3
+    `,
+      [req.workspace.id, qFrom, qTo]
+    );
+    rows = q.rows;
+  } else {
+    rows = readCalls()
+      .filter((c) => c.workspaceId === req.workspace.id)
+      .filter((c) => c.endedAt != null)
+      .filter((c) => Number(c.startedAt || 0) >= qFrom && Number(c.startedAt || 0) <= qTo)
+      .map((c) => ({ started_at: c.startedAt, duration_sec: c.durationSec, cost_usd: c.costUsd ?? null, metrics: c.metrics ?? null }));
+  }
+
+  let totals = {
+    calls: 0,
+    callMinutes: 0,
+    llmUsd: 0,
+    sttUsd: 0,
+    ttsUsd: 0,
+    platformUsageUsd: 0,
+    phoneNumbersUsd: 0,
+    platformBaseUsd: 0,
+    totalUsd: 0,
+  };
+
+  for (const r of rows) {
+    const startedAt = Number(r.started_at || 0);
+    const t = getBucketStart(startedAt);
+    const durationSec = Number(r.duration_sec || 0);
+    const minutes = Number.isFinite(durationSec) ? durationSec / 60 : 0;
+
+    const metrics = r.metrics || null;
+    const usage = metrics?.usage || null;
+    const models = metrics?.models || null;
+    const llmModel = models?.llm ?? usage?.llm_model ?? null;
+    const sttModel = models?.stt ?? usage?.stt_model ?? null;
+    const ttsModel = models?.tts ?? usage?.tts_model ?? null;
+    const usageWithModels =
+      usage && typeof usage === "object"
+        ? { ...usage, stt_model: sttModel ?? usage.stt_model, tts_model: ttsModel ?? usage.tts_model }
+        : usage;
+
+    const cogs = metrics?.cogsBreakdown || metrics?.costBreakdown || computeCostBreakdownFromUsage(usageWithModels, llmModel) || null;
+    const usageLlm = Number(cogs?.llm?.costUsd ?? 0);
+    const usageStt = Number(cogs?.stt?.costUsd ?? 0);
+    const usageTts = Number(cogs?.tts?.costUsd ?? 0);
+    const usageSum = usageLlm + usageStt + usageTts;
+
+    // Call total charged (retail): prefer stored cost_usd, else apply current multiplier.
+    const stored = typeof r.cost_usd === "number" && Number.isFinite(r.cost_usd) ? Number(r.cost_usd) : null;
+    const computedRetail = cogs?.totalUsd != null && Number.isFinite(Number(cogs.totalUsd)) ? applyRetail(Number(cogs.totalUsd)) : null;
+    const callTotal = stored ?? computedRetail ?? 0;
+
+    const platformUsage = Math.max(0, callTotal - usageSum);
+
+    const cur = seriesMap.get(t) || {
+      t,
+      callMinutes: 0,
+      llmUsd: 0,
+      sttUsd: 0,
+      ttsUsd: 0,
+      platformUsageUsd: 0,
+      phoneNumbersUsd: 0,
+      platformBaseUsd: 0,
+      totalUsd: 0,
+    };
+
+    cur.callMinutes += minutes;
+    cur.llmUsd += usageLlm;
+    cur.sttUsd += usageStt;
+    cur.ttsUsd += usageTts;
+    cur.platformUsageUsd += platformUsage;
+    cur.totalUsd += callTotal;
+    seriesMap.set(t, cur);
+
+    totals.calls += 1;
+    totals.callMinutes += minutes;
+    totals.llmUsd += usageLlm;
+    totals.sttUsd += usageStt;
+    totals.ttsUsd += usageTts;
+    totals.platformUsageUsd += platformUsage;
+    totals.totalUsd += callTotal;
+  }
+
+  // Add pro-rated fixed fees to each day bucket.
+  // For week bucket, we pro-rate by 7x day fee.
+  for (let t = getBucketStart(qFrom); t <= getBucketStart(qTo); t += bucketMs) {
+    const cur = seriesMap.get(t) || {
+      t,
+      callMinutes: 0,
+      llmUsd: 0,
+      sttUsd: 0,
+      ttsUsd: 0,
+      platformUsageUsd: 0,
+      phoneNumbersUsd: 0,
+      platformBaseUsd: 0,
+      totalUsd: 0,
+    };
+    const days = bucket === "week" ? 7 : 1;
+    cur.phoneNumbersUsd += phoneNumbersUsdPerDay * days;
+    cur.platformBaseUsd += platformBaseUsdPerDay * days;
+    cur.totalUsd += phoneNumbersUsdPerDay * days + platformBaseUsdPerDay * days;
+    seriesMap.set(t, cur);
+  }
+
+  totals.phoneNumbersUsd = phoneNumbersUsdMonthly;
+  totals.platformBaseUsd = platformBaseUsdMonthly;
+  totals.totalUsd += phoneNumbersUsdMonthly + platformBaseUsdMonthly;
+
+  function round4(n) {
+    return Math.round(Number(n || 0) * 10000) / 10000;
+  }
+
+  const series = Array.from(seriesMap.values())
+    .filter((p) => p.t >= getBucketStart(qFrom) && p.t <= getBucketStart(qTo))
+    .sort((a, b) => a.t - b.t)
+    .map((p) => ({
+      t: p.t,
+      callMinutes: round4(p.callMinutes),
+      llmUsd: round4(p.llmUsd),
+      sttUsd: round4(p.sttUsd),
+      ttsUsd: round4(p.ttsUsd),
+      platformUsageUsd: round4(p.platformUsageUsd),
+      phoneNumbersUsd: round4(p.phoneNumbersUsd),
+      platformBaseUsd: round4(p.platformBaseUsd),
+      totalUsd: round4(p.totalUsd),
+    }));
+
+  return res.json({
+    range: { from: qFrom, to: qTo, tz: "UTC" },
+    bucket: bucket === "week" ? "week" : "day",
+    series,
+    totals: {
+      calls: totals.calls,
+      callMinutes: round4(totals.callMinutes),
+      llmUsd: round4(totals.llmUsd),
+      sttUsd: round4(totals.sttUsd),
+      ttsUsd: round4(totals.ttsUsd),
+      platformUsageUsd: round4(totals.platformUsageUsd),
+      phoneNumbersUsd: round4(totals.phoneNumbersUsd),
+      platformBaseUsd: round4(totals.platformBaseUsd),
+      totalUsd: round4(totals.totalUsd),
+    },
+  });
+});
+
 app.get("/api/agents/:id/analytics", requireAuth, async (req, res) => {
   const { id } = req.params;
 
