@@ -72,6 +72,15 @@ function computeCostUsdFromUsage(usage) {
   return Math.round(total * 10000) / 10000;
 }
 
+function computeApproxCostUsdFromDurationSec(durationSec) {
+  const sttPerMin = numEnv("STT_USD_PER_MIN");
+  if (sttPerMin == null) return null;
+  const sec = Number(durationSec || 0);
+  if (!Number.isFinite(sec) || sec <= 0) return 0;
+  // If we have STT pricing configured but no usage metrics, approximate STT time from call duration.
+  return Math.round(((sec / 60) * sttPerMin) * 10000) / 10000;
+}
+
 const app = express();
 // When running behind a reverse proxy (Render/Fly/Nginx), this ensures req.protocol reflects X-Forwarded-Proto.
 app.set("trust proxy", 1);
@@ -1298,7 +1307,32 @@ app.post("/api/agents/:id/start", requireAuth, async (req, res) => {
 app.get("/api/calls", requireAuth, async (req, res) => {
   if (USE_DB) {
     const calls = await store.listCalls(req.workspace.id);
-    return res.json({ calls });
+
+    // Best-effort cleanup: if a call is stuck "in_progress" for a long time, mark it completed.
+    // This protects against agent/network failures that prevent /end from being posted.
+    const now = Date.now();
+    const STALE_MS = 15 * 60 * 1000;
+    for (const c of calls.slice(0, 50)) {
+      if (c.outcome === "in_progress" && !c.endedAt && now - Number(c.startedAt || 0) > STALE_MS) {
+        const endedAt = now;
+        const durationSec = Math.max(0, Math.round((endedAt - Number(c.startedAt || endedAt)) / 1000));
+        // Fire-and-forget; don't block response.
+        // eslint-disable-next-line no-void
+        void store.updateCall(c.id, { endedAt, durationSec, outcome: "completed" });
+      }
+    }
+
+    return res.json({
+      calls: calls.map((c) => ({
+        ...c,
+        costUsd:
+          typeof c.costUsd === "number"
+            ? c.costUsd
+            : c.endedAt
+              ? computeApproxCostUsdFromDurationSec(c.durationSec)
+              : null,
+      })),
+    });
   }
   const calls = readCalls();
   return res.json({
@@ -1312,7 +1346,12 @@ app.get("/api/calls", requireAuth, async (req, res) => {
       endedAt: c.endedAt,
       durationSec: c.durationSec,
       outcome: c.outcome,
-      costUsd: c.costUsd,
+      costUsd:
+        typeof c.costUsd === "number"
+          ? c.costUsd
+          : c.endedAt
+            ? computeApproxCostUsdFromDurationSec(c.durationSec)
+            : null,
       recordingUrl: c.recording?.url ?? null,
       createdAt: c.createdAt,
       updatedAt: c.updatedAt,
