@@ -580,6 +580,7 @@ const VoiceConfigSchema = z
   .optional();
 
 const LlmModelSchema = z.string().min(1).max(120).optional();
+const MaxCallSecondsSchema = z.number().int().min(0).max(24 * 60 * 60).optional(); // up to 24h
 
 // Allow one or many origins. Use comma-separated list in CLIENT_ORIGIN, e.g.:
 // CLIENT_ORIGIN=https://dashboard.rapidcallai.com,http://localhost:5173
@@ -973,6 +974,7 @@ app.post("/api/internal/telephony/inbound/start", requireAgentSecret, async (req
     welcome: agent.welcome ?? {},
     voice: agent.voice ?? {},
     llmModel: String(agent.llmModel || ""),
+    maxCallSeconds: Number(agent.maxCallSeconds || 0),
     phoneNumber: { id: phoneRow.id, e164: phoneRow.e164 },
   });
 });
@@ -1175,6 +1177,7 @@ app.post("/api/agents", requireAuth, async (req, res) => {
     welcome: WelcomeConfigSchema,
     voice: VoiceConfigSchema,
     llmModel: LlmModelSchema,
+    maxCallSeconds: MaxCallSecondsSchema,
   });
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) {
@@ -1199,6 +1202,7 @@ app.post("/api/agents", requireAuth, async (req, res) => {
     promptPublished: parsed.data.promptPublished ?? "",
     publishedAt: parsed.data.promptPublished ? now : null,
     llmModel: parsed.data.llmModel ?? "",
+    maxCallSeconds: Math.max(0, Math.round(Number(parsed.data.maxCallSeconds || 0))),
     welcome: {
       mode: parsed.data.welcome?.mode ?? "user",
       aiMessageMode: parsed.data.welcome?.aiMessageMode ?? "dynamic",
@@ -1277,6 +1281,7 @@ app.put("/api/agents/:id", requireAuth, async (req, res) => {
     welcome: WelcomeConfigSchema,
     voice: VoiceConfigSchema,
     llmModel: LlmModelSchema,
+    maxCallSeconds: MaxCallSecondsSchema,
   });
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) {
@@ -1315,6 +1320,10 @@ app.put("/api/agents/:id", requireAuth, async (req, res) => {
     welcome: parsed.data.welcome ? { ...(current.welcome ?? {}), ...parsed.data.welcome } : current.welcome,
     voice: parsed.data.voice ? { ...(current.voice ?? {}), ...parsed.data.voice } : current.voice,
     llmModel: parsed.data.llmModel ?? (current.llmModel ?? ""),
+    maxCallSeconds:
+      parsed.data.maxCallSeconds == null
+        ? (current.maxCallSeconds ?? 0)
+        : Math.max(0, Math.round(Number(parsed.data.maxCallSeconds || 0))),
     updatedAt: Date.now(),
   };
   delete next.prompt;
@@ -1751,6 +1760,7 @@ app.post("/api/agents/:id/start", requireAuth, async (req, res) => {
   };
   const voice = agent.voice ?? {};
   const llmModel = String(agent.llmModel || "").trim();
+  const maxCallSeconds = Number(agent.maxCallSeconds || 0);
 
   // IMPORTANT:
   // Web test rooms must match an existing LiveKit dispatch rule (telephony typically uses roomPrefix "call-").
@@ -1799,7 +1809,7 @@ app.post("/api/agents/:id/start", requireAuth, async (req, res) => {
     name: roomName,
     metadata: JSON.stringify({
       call: { id: callId, to: "webtest" },
-      agent: { id: agent.id, name: agent.name, prompt: promptUsed, voice, llmModel },
+      agent: { id: agent.id, name: agent.name, prompt: promptUsed, voice, llmModel, maxCallSeconds },
       welcome,
     }),
     agents: webAgentName
@@ -3619,6 +3629,44 @@ async function main() {
   } else {
     // eslint-disable-next-line no-console
     console.warn("DATABASE_URL not set; falling back to local JSON storage (./data/*.json).");
+  }
+
+  // Background cleanup: ensure "in_progress" calls don't stick forever.
+  // If an agent/job never posts /end, we cap the call at STALE_MS and mark it stale_timeout.
+  if (USE_DB) {
+    const STALE_MS = 15 * 60 * 1000;
+    const intervalMs = 60 * 1000;
+    setInterval(async () => {
+      try {
+        const p = getPool();
+        if (!p) return;
+        const now = Date.now();
+        const cutoff = now - STALE_MS;
+        // Update in batches to avoid large locks.
+        const { rows } = await p.query(
+          `
+          SELECT id, started_at
+          FROM calls
+          WHERE ended_at IS NULL
+            AND outcome = 'in_progress'
+            AND started_at < $1
+          ORDER BY started_at ASC
+          LIMIT 200
+        `,
+          [cutoff]
+        );
+        if (!rows.length) return;
+        for (const r of rows) {
+          const startedAt = Number(r.started_at || now);
+          const endedAt = startedAt + STALE_MS;
+          const durationSec = Math.max(0, Math.round(STALE_MS / 1000));
+          // eslint-disable-next-line no-void
+          void store.updateCall(String(r.id), { endedAt, durationSec, outcome: "stale_timeout" });
+        }
+      } catch {
+        // ignore; best-effort cleanup
+      }
+    }, intervalMs);
   }
 
   app.listen(port, () => {

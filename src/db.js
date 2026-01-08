@@ -75,6 +75,7 @@ async function initSchema() {
       welcome JSONB NOT NULL DEFAULT '{}'::jsonb,
       voice JSONB NOT NULL DEFAULT '{}'::jsonb,
       llm_model TEXT NOT NULL DEFAULT '',
+      max_call_seconds INT NOT NULL DEFAULT 0,
       created_at BIGINT NOT NULL,
       updated_at BIGINT NOT NULL
     );
@@ -83,6 +84,7 @@ async function initSchema() {
   await p.query(`ALTER TABLE agents ADD COLUMN IF NOT EXISTS workspace_id TEXT NULL;`);
   await p.query(`ALTER TABLE agents ADD COLUMN IF NOT EXISTS voice JSONB NOT NULL DEFAULT '{}'::jsonb;`);
   await p.query(`ALTER TABLE agents ADD COLUMN IF NOT EXISTS llm_model TEXT NOT NULL DEFAULT '';`);
+  await p.query(`ALTER TABLE agents ADD COLUMN IF NOT EXISTS max_call_seconds INT NOT NULL DEFAULT 0;`);
   await p.query(`CREATE INDEX IF NOT EXISTS agents_workspace_idx ON agents(workspace_id, created_at DESC);`);
 
   await p.query(`

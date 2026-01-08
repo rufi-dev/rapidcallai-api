@@ -22,6 +22,7 @@ function rowToAgent(r) {
     welcome: r.welcome ?? {},
     voice: r.voice ?? {},
     llmModel: r.llm_model ?? "",
+    maxCallSeconds: Number(r.max_call_seconds || 0),
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   };
@@ -358,7 +359,16 @@ async function listAgents(workspaceId) {
   return rows.map(rowToAgent);
 }
 
-async function createAgent({ workspaceId, name, promptDraft = "", promptPublished = "", welcome = null, voice = null, llmModel = "" }) {
+async function createAgent({
+  workspaceId,
+  name,
+  promptDraft = "",
+  promptPublished = "",
+  welcome = null,
+  voice = null,
+  llmModel = "",
+  maxCallSeconds = 0,
+}) {
   const p = getPool();
   const now = Date.now();
   const id = nanoid(10);
@@ -381,11 +391,24 @@ async function createAgent({ workspaceId, name, promptDraft = "", promptPublishe
 
   const { rows } = await p.query(
     `
-    INSERT INTO agents (id, workspace_id, name, prompt_draft, prompt_published, published_at, welcome, voice, llm_model, created_at, updated_at)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+    INSERT INTO agents (id, workspace_id, name, prompt_draft, prompt_published, published_at, welcome, voice, llm_model, max_call_seconds, created_at, updated_at)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
     RETURNING *
   `,
-    [id, workspaceId, name, promptDraft ?? "", promptPublished ?? "", pubAt, JSON.stringify(welcomeNorm), JSON.stringify(voiceNorm), String(llmModel || ""), now, now]
+    [
+      id,
+      workspaceId,
+      name,
+      promptDraft ?? "",
+      promptPublished ?? "",
+      pubAt,
+      JSON.stringify(welcomeNorm),
+      JSON.stringify(voiceNorm),
+      String(llmModel || ""),
+      Math.max(0, Math.round(Number(maxCallSeconds || 0))),
+      now,
+      now,
+    ]
   );
   return rowToAgent(rows[0]);
 }
@@ -396,7 +419,7 @@ async function getAgent(workspaceId, id) {
   return rows[0] ? rowToAgent(rows[0]) : null;
 }
 
-async function updateAgent(workspaceId, id, { name, promptDraft, publish, welcome, voice, llmModel }) {
+async function updateAgent(workspaceId, id, { name, promptDraft, publish, welcome, voice, llmModel, maxCallSeconds }) {
   const p = getPool();
   const current = await getAgent(workspaceId, id);
   if (!current) return null;
@@ -422,6 +445,8 @@ async function updateAgent(workspaceId, id, { name, promptDraft, publish, welcom
   };
 
   const nextLlmModel = llmModel == null ? (current.llmModel ?? "") : String(llmModel || "");
+  const nextMaxCallSeconds =
+    maxCallSeconds == null ? Number(current.maxCallSeconds || 0) : Math.max(0, Math.round(Number(maxCallSeconds || 0)));
 
   const updatedAt = Date.now();
   const { rows } = await p.query(
@@ -434,11 +459,24 @@ async function updateAgent(workspaceId, id, { name, promptDraft, publish, welcom
         welcome=$6,
         voice=$7,
         llm_model=$8,
-        updated_at=$9
-    WHERE workspace_id=$10 AND id=$1
+        max_call_seconds=$9,
+        updated_at=$10
+    WHERE workspace_id=$11 AND id=$1
     RETURNING *
   `,
-    [id, name ?? null, nextDraft, nextPublished, publishedAt, JSON.stringify(welcomeNorm), JSON.stringify(voiceNorm), nextLlmModel, updatedAt, workspaceId]
+    [
+      id,
+      name ?? null,
+      nextDraft,
+      nextPublished,
+      publishedAt,
+      JSON.stringify(welcomeNorm),
+      JSON.stringify(voiceNorm),
+      nextLlmModel,
+      nextMaxCallSeconds,
+      updatedAt,
+      workspaceId,
+    ]
   );
   return rows[0] ? rowToAgent(rows[0]) : null;
 }
