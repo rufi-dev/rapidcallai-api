@@ -207,12 +207,18 @@ function normalizeDurationSec({ durationSecStored, startedAtMs, endedAtMs }) {
     flags.push("invalid_duration_clamped");
   }
 
+  // If duration is still implausibly large, mark invalid for billing.
+  // We do NOT silently clamp because cost/min math would still be distorted with a forced minimum billable time.
+  const validForBilling = use <= MAX_REASONABLE_SEC;
+  if (!validForBilling) flags.push("invalid_duration_too_large");
+
   return {
     durationSec: use,
     derivedSec: derived,
     storedSec: stored,
     source,
     flags,
+    validForBilling,
   };
 }
 
@@ -1865,11 +1871,14 @@ app.get("/api/calls", requireAuth, async (req, res) => {
     const STALE_MS = 15 * 60 * 1000;
     for (const c of calls.slice(0, 50)) {
       if (c.outcome === "in_progress" && !c.endedAt && now - Number(c.startedAt || 0) > STALE_MS) {
-        const endedAt = now;
-        const durationSec = Math.max(0, Math.round((endedAt - Number(c.startedAt || endedAt)) / 1000));
+        // IMPORTANT: do NOT set endedAt=now, otherwise stuck calls can turn into hours/days of phantom minutes.
+        // Instead, end at startedAt + STALE_MS and mark outcome so billing can exclude it.
+        const startedAt = Number(c.startedAt || now);
+        const endedAt = startedAt + STALE_MS;
+        const durationSec = Math.max(0, Math.round(STALE_MS / 1000));
         // Fire-and-forget; don't block response.
         // eslint-disable-next-line no-void
-        void store.updateCall(c.id, { endedAt, durationSec, outcome: "completed" });
+        void store.updateCall(c.id, { endedAt, durationSec, outcome: "stale_timeout" });
       }
     }
 
@@ -2220,6 +2229,7 @@ app.get("/api/billing/summary", requireAuth, async (req, res) => {
       FROM calls
       WHERE workspace_id=$1
         AND ended_at IS NOT NULL
+        AND outcome <> 'stale_timeout'
         AND started_at >= $2 AND started_at <= $3
     `,
       [req.workspace.id, qFrom, qTo]
@@ -2229,6 +2239,7 @@ app.get("/api/billing/summary", requireAuth, async (req, res) => {
     rows = readCalls()
       .filter((c) => c.workspaceId === req.workspace.id)
       .filter((c) => c.endedAt != null)
+      .filter((c) => c.outcome !== "stale_timeout")
       .filter((c) => Number(c.startedAt || 0) >= qFrom && Number(c.startedAt || 0) <= qTo)
       .map((c) => ({
         id: c.id,
@@ -2325,6 +2336,22 @@ app.get("/api/billing/summary", requireAuth, async (req, res) => {
     const normalized = metrics?.normalized || null;
     const telephony = metrics?.telephony || null;
     const dur = normalizeDurationSec({ durationSecStored: r.duration_sec, startedAtMs: r.started_at, endedAtMs: r.ended_at });
+    if (!dur.validForBilling) {
+      debugLongest.push({
+        callId: String(r.id || ""),
+        durationSec: round4(dur.durationSec),
+        durationMin: round4(dur.durationSec / 60),
+        durationStoredSec: dur.storedSec,
+        durationDerivedSec: dur.derivedSec,
+        durationSource: dur.source,
+        flags: dur.flags,
+        startedAt: Number(r.started_at || 0) || null,
+        endedAt: Number(r.ended_at || 0) || null,
+        billedMinutes: null,
+        chargedUsd: null,
+      });
+      continue;
+    }
     const durationSec = dur.durationSec;
     const recording = r.recording && typeof r.recording === "object" ? r.recording : null;
     const livekit = metrics?.livekit && typeof metrics.livekit === "object" ? metrics.livekit : null;
@@ -2671,6 +2698,7 @@ app.get("/api/billing/usage", requireAuth, async (req, res) => {
       FROM calls
       WHERE workspace_id=$1
         AND ended_at IS NOT NULL
+        AND outcome <> 'stale_timeout'
         AND started_at >= $2 AND started_at <= $3
     `,
       [req.workspace.id, qFrom, qTo]
@@ -2680,6 +2708,7 @@ app.get("/api/billing/usage", requireAuth, async (req, res) => {
     rows = readCalls()
       .filter((c) => c.workspaceId === req.workspace.id)
       .filter((c) => c.endedAt != null)
+      .filter((c) => c.outcome !== "stale_timeout")
       .filter((c) => Number(c.startedAt || 0) >= qFrom && Number(c.startedAt || 0) <= qTo)
       .map((c) => ({
         id: c.id,
@@ -2746,6 +2775,23 @@ app.get("/api/billing/usage", requireAuth, async (req, res) => {
     const startedAt = Number(r.started_at || 0);
     const t = getBucketStart(startedAt);
     const dur = normalizeDurationSec({ durationSecStored: r.duration_sec, startedAtMs: r.started_at, endedAtMs: r.ended_at });
+    if (!dur.validForBilling) {
+      // Skip invalid durations from billing sums (phantom minutes).
+      debugLongest.push({
+        callId: String(r.id || ""),
+        durationSec: round4(dur.durationSec),
+        durationMin: round4(dur.durationSec / 60),
+        durationStoredSec: dur.storedSec,
+        durationDerivedSec: dur.derivedSec,
+        durationSource: dur.source,
+        flags: dur.flags,
+        startedAt: Number(r.started_at || 0) || null,
+        endedAt: Number(r.ended_at || 0) || null,
+        billedMinutes: null,
+        chargedUsd: null,
+      });
+      continue;
+    }
     const durationSec = dur.durationSec;
     const minutes = Number.isFinite(durationSec) ? durationSec / 60 : 0;
     const billedSeconds = costModel.computeBilledSeconds(durationSec);
