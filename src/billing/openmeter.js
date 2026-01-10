@@ -526,18 +526,28 @@ async function invokeOpenMeterInvoiceAction({ apiUrl, apiKey, invoiceId, action 
     `${base}/api/v1/billing/invoices/${id}/${encodeURIComponent(act)}`,
     `${base}/api/v1/billing/invoices/${id}/actions/${encodeURIComponent(act)}`,
     `${base}/api/v1/billing/invoices/${id}:$${encodeURIComponent(act)}`,
+    `${base}/api/v1/billing/invoices/${id}:${encodeURIComponent(act)}`,
+    `${base}/api/v1/billing/invoices/${id}/actions:${encodeURIComponent(act)}`,
   ];
 
   const attemptResults = [];
   let last = null;
   for (const endpoint of attempts) {
-    const { status, text } = await requestJson(endpoint, { method: "POST", headers: auth, body: {} });
-    if (status >= 200 && status < 300) {
-      const payload = safeJsonParse(text) || {};
-      return { ok: true, endpoint, payload, attemptResults };
+    // Some deployments use POST, some PUT; some reject bodies.
+    for (const method of ["POST", "PUT", "PATCH"]) {
+      for (const body of [{}, undefined]) {
+        const { status, text } = await requestJson(endpoint, { method, headers: auth, body });
+        if (status >= 200 && status < 300) {
+          const payload = safeJsonParse(text) || {};
+          return { ok: true, endpoint, method, payload, attemptResults };
+        }
+        attemptResults.push({ endpoint, method, body: body === undefined ? "(no body)" : "{}", status, text: String(text || "").slice(0, 400) });
+        last = { status, text, endpoint, method };
+
+        // If endpoint exists but doesn't allow this method, continue trying other methods/bodies.
+        // (405 is very common here.)
+      }
     }
-    attemptResults.push({ endpoint, status, text: String(text || "").slice(0, 400) });
-    last = { status, text, endpoint };
   }
   return { ok: false, status: last?.status || 0, text: last?.text || "Failed to invoke invoice action", endpoint: last?.endpoint, attemptResults };
 }
