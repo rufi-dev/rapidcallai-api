@@ -1,0 +1,187 @@
+const { getBillingConfig } = require("./config");
+const { computeCallBillingQuantities, computeTrialDebitUsd } = require("./pricing");
+const { emitOpenMeterEvent } = require("./openmeter");
+
+function safeObj(x) {
+  return x && typeof x === "object" ? x : {};
+}
+
+function callSourceFromRecord(call) {
+  const metrics = safeObj(call?.metrics);
+  const normalized = safeObj(metrics.normalized);
+  const source = String(normalized.source || "").trim();
+  if (source) return source;
+  if (call?.to === "webtest") return "web";
+  return "unknown";
+}
+
+function callTotalTokens(call) {
+  const metrics = safeObj(call?.metrics);
+  if (typeof metrics.tokensTotal === "number" && Number.isFinite(metrics.tokensTotal)) return metrics.tokensTotal;
+  const usage = safeObj(metrics.usage);
+  return Number(usage.llm_prompt_tokens || 0) + Number(usage.llm_completion_tokens || 0);
+}
+
+function callLlmModel(call, cfg) {
+  const metrics = safeObj(call?.metrics);
+  const models = safeObj(metrics.models);
+  const usage = safeObj(metrics.usage);
+  return String(models.llm || usage.llm_model || cfg.defaultLlmModel).trim() || cfg.defaultLlmModel;
+}
+
+async function finalizeBillingForCall({ store, call }) {
+  if (!call || !call.id || !call.workspaceId) return null;
+  if (call.endedAt == null || call.durationSec == null) return null;
+
+  const cfg = getBillingConfig();
+  const ws = await store.getWorkspace(call.workspaceId);
+  if (!ws) return null;
+
+  const source = callSourceFromRecord(call);
+  const totalTokens = callTotalTokens(call);
+  const llmModel = callLlmModel(call, cfg);
+
+  const q = computeCallBillingQuantities({
+    durationSec: call.durationSec,
+    totalTokens,
+    llmModel,
+    source,
+    config: cfg,
+  });
+
+  const metrics = safeObj(call.metrics);
+  const billingPrev = safeObj(metrics.billing);
+
+  // --- Trial debit (WEB only) ---
+  if (ws.isTrial && !ws.isPaid) {
+    if ((source === "telephony" || source === "pstn") && !cfg.trialAllowPstn) return null;
+
+    if (!billingPrev.trialDebitedAt) {
+      const debitUsd = computeTrialDebitUsd({
+        durationSec: call.durationSec,
+        totalTokens,
+        llmModel,
+        source,
+        config: cfg,
+      });
+
+      await store.debitTrialCreditUsd(ws.id, debitUsd);
+      await store.updateCall(call.id, {
+        metrics: {
+          ...metrics,
+          billing: {
+            ...billingPrev,
+            billedMinutes: q.billedMinutes,
+            modelUpgradeMinutes: q.modelUpgradeMinutes,
+            tokenOverage1k: q.tokenOverage1k,
+            trialDebitedUsd: debitUsd,
+            trialDebitedAt: Date.now(),
+          },
+        },
+      });
+    }
+
+    return null;
+  }
+
+  // --- Paid: emit OpenMeter event (idempotent) ---
+  if (ws.isPaid) {
+    const nowIso = new Date().toISOString();
+    const subject = String(ws.id);
+
+    // Track per-event sending so we can retry partial failures safely.
+    const prevEvents = safeObj(billingPrev.openmeterEvents);
+    const nextEvents = { ...prevEvents };
+
+    async function sendIfNeeded({ type, data, required }) {
+      const prev = safeObj(prevEvents[type]);
+      if (prev.sentAt) {
+        nextEvents[type] = { ...prev };
+        return { ok: true, skipped: true };
+      }
+
+      const event = {
+        id: `${call.id}:${type}`,
+        type,
+        subject,
+        time: nowIso,
+        data,
+      };
+
+      const omRes = await emitOpenMeterEvent({
+        apiUrl: process.env.OPENMETER_API_URL,
+        apiKey: process.env.OPENMETER_API_KEY,
+        source: process.env.OPENMETER_SOURCE || "voice-platform",
+        event,
+      });
+
+      nextEvents[type] = {
+        id: event.id,
+        sentAt: omRes?.ok ? Date.now() : null,
+        error: omRes?.ok ? null : { status: omRes?.status ?? 0, text: String(omRes?.text || "") },
+        required: Boolean(required),
+      };
+
+      return omRes;
+    }
+
+    // 1) Base voice minutes (always required)
+    await sendIfNeeded({ type: "voice_base_minutes", required: true, data: { minutes: Number(q.billedMinutes || 0) } });
+
+    // 2) Model upgrade minutes (only when > 0)
+    if (Number(q.modelUpgradeMinutes || 0) > 0) {
+      await sendIfNeeded({
+        type: "voice_model_upgrade_minutes",
+        required: true,
+        data: { minutes: Number(q.modelUpgradeMinutes || 0) },
+      });
+    }
+
+    // 3) Telephony minutes (only for PSTN / telephony)
+    if (Number(q.telephonyMinutes || 0) > 0) {
+      await sendIfNeeded({
+        type: "telephony_minutes",
+        required: true,
+        data: { minutes: Number(q.telephonyMinutes || 0) },
+      });
+    }
+
+    // 4) Token overage (1k tokens), must be in thousands
+    if (Number(q.tokenOverage1k || 0) > 0) {
+      await sendIfNeeded({
+        type: "llm_token_overage_1k",
+        required: true,
+        data: { thousands: Number(q.tokenOverage1k || 0) },
+      });
+    }
+
+    const requiredTypes = Object.entries(nextEvents)
+      .filter(([, v]) => Boolean(v?.required))
+      .map(([k]) => k);
+    const allRequiredSent = requiredTypes.every((t) => Boolean(nextEvents[t]?.sentAt));
+
+    await store.updateCall(call.id, {
+      metrics: {
+        ...metrics,
+        billing: {
+          ...billingPrev,
+          billedMinutes: q.billedMinutes,
+          modelUpgradeMinutes: q.modelUpgradeMinutes,
+          tokenOverage1k: q.tokenOverage1k,
+          telephonyMinutes: q.telephonyMinutes,
+          openmeterEvents: nextEvents,
+          openmeterLastAttemptAt: Date.now(),
+          openmeterSentAt: allRequiredSent ? Date.now() : null,
+        },
+      },
+    });
+
+    return null;
+  }
+
+  return null;
+}
+
+module.exports = { finalizeBillingForCall };
+
+

@@ -55,6 +55,18 @@ function rowToWorkspace(r) {
     name: r.name,
     userId: r.user_id ?? null,
     twilioSubaccountSid: r.twilio_subaccount_sid ?? null,
+    isTrial: Boolean(r.is_trial),
+    trialCreditUsd: typeof r.trial_credit_usd === "number" ? r.trial_credit_usd : Number(r.trial_credit_usd || 0),
+    trialCreditGrantedAt: r.trial_credit_granted_at ?? null,
+    stripeCustomerId: r.stripe_customer_id ?? null,
+    stripeSubscriptionId: r.stripe_subscription_id ?? null,
+    stripePhoneNumbersItemId: r.stripe_phone_numbers_item_id ?? null,
+    openmeterCustomerId: r.openmeter_customer_id ?? null,
+    openmeterCreditGrantId: r.openmeter_credit_grant_id ?? null,
+    openmeterCreditGrantedAt: r.openmeter_credit_granted_at ?? null,
+    hasPaymentMethod: Boolean(r.has_payment_method),
+    isPaid: Boolean(r.is_paid),
+    telephonyEnabled: Boolean(r.telephony_enabled),
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   };
@@ -98,13 +110,34 @@ async function createWorkspace({ id, name, userId = null }) {
   const p = getPool();
   const now = Date.now();
   const wsId = id || nanoid(10);
+  const trialCreditUsdRaw = process.env.TRIAL_CREDIT_USD;
+  const trialCreditUsd = trialCreditUsdRaw != null && trialCreditUsdRaw !== "" ? Number(trialCreditUsdRaw) : 20.0;
   const { rows } = await p.query(
     `
-    INSERT INTO workspaces (id, name, user_id, twilio_subaccount_sid, created_at, updated_at)
-    VALUES ($1,$2,$3,NULL,$4,$5)
+    INSERT INTO workspaces (
+      id,
+      name,
+      user_id,
+      twilio_subaccount_sid,
+      is_trial,
+      trial_credit_usd,
+      trial_credit_granted_at,
+      stripe_customer_id,
+      stripe_subscription_id,
+      stripe_phone_numbers_item_id,
+      openmeter_customer_id,
+      openmeter_credit_grant_id,
+      openmeter_credit_granted_at,
+      has_payment_method,
+      is_paid,
+      telephony_enabled,
+      created_at,
+      updated_at
+    )
+    VALUES ($1,$2,$3,NULL,true,$4,$5,NULL,NULL,NULL,NULL,NULL,NULL,false,false,false,$6,$7)
     RETURNING *
   `,
-    [wsId, name, userId, now, now]
+    [wsId, name, userId, trialCreditUsd, now, now, now]
   );
   return rowToWorkspace(rows[0]);
 }
@@ -120,11 +153,59 @@ async function updateWorkspace(id, patch) {
     SET name=COALESCE($2,name),
         user_id=COALESCE($3,user_id),
         twilio_subaccount_sid=$4,
-        updated_at=$5
+        is_trial=COALESCE($5,is_trial),
+        trial_credit_usd=COALESCE($6,trial_credit_usd),
+        trial_credit_granted_at=COALESCE($7,trial_credit_granted_at),
+        stripe_customer_id=COALESCE($8,stripe_customer_id),
+        stripe_subscription_id=COALESCE($9,stripe_subscription_id),
+        stripe_phone_numbers_item_id=COALESCE($10,stripe_phone_numbers_item_id),
+        openmeter_customer_id=COALESCE($11,openmeter_customer_id),
+        openmeter_credit_grant_id=COALESCE($12,openmeter_credit_grant_id),
+        openmeter_credit_granted_at=COALESCE($13,openmeter_credit_granted_at),
+        has_payment_method=COALESCE($14,has_payment_method),
+        is_paid=COALESCE($15,is_paid),
+        telephony_enabled=COALESCE($16,telephony_enabled),
+        updated_at=$17
     WHERE id=$1
     RETURNING *
   `,
-    [id, next.name ?? null, next.userId ?? null, next.twilioSubaccountSid ?? null, next.updatedAt]
+    [
+      id,
+      next.name ?? null,
+      next.userId ?? null,
+      next.twilioSubaccountSid ?? null,
+      typeof next.isTrial === "boolean" ? next.isTrial : null,
+      typeof next.trialCreditUsd === "number" ? next.trialCreditUsd : null,
+      typeof next.trialCreditGrantedAt === "number" ? next.trialCreditGrantedAt : null,
+      next.stripeCustomerId ?? null,
+      next.stripeSubscriptionId ?? null,
+      next.stripePhoneNumbersItemId ?? null,
+      next.openmeterCustomerId ?? null,
+      next.openmeterCreditGrantId ?? null,
+      typeof next.openmeterCreditGrantedAt === "number" ? next.openmeterCreditGrantedAt : null,
+      typeof next.hasPaymentMethod === "boolean" ? next.hasPaymentMethod : null,
+      typeof next.isPaid === "boolean" ? next.isPaid : null,
+      typeof next.telephonyEnabled === "boolean" ? next.telephonyEnabled : null,
+      next.updatedAt,
+    ]
+  );
+  return rows[0] ? rowToWorkspace(rows[0]) : null;
+}
+
+async function debitTrialCreditUsd(workspaceId, debitUsd) {
+  const p = getPool();
+  const amt = Number(debitUsd || 0);
+  if (!Number.isFinite(amt) || amt <= 0) return await getWorkspace(workspaceId);
+  const now = Date.now();
+  const { rows } = await p.query(
+    `
+    UPDATE workspaces
+    SET trial_credit_usd=GREATEST(0, trial_credit_usd - $2),
+        updated_at=$3
+    WHERE id=$1
+    RETURNING *
+  `,
+    [workspaceId, amt, now]
   );
   return rows[0] ? rowToWorkspace(rows[0]) : null;
 }
@@ -700,6 +781,7 @@ module.exports = {
   getWorkspace,
   createWorkspace,
   updateWorkspace,
+  debitTrialCreditUsd,
   ensureDefaultWorkspace,
   listPhoneNumbers,
   getPhoneNumber,

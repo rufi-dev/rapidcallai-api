@@ -1,0 +1,95 @@
+const express = require("express");
+const { getBillingConfig } = require("./config");
+
+function createBillingRouter({ store, stripeBilling }) {
+  const r = express.Router();
+
+  r.get("/status", async (req, res) => {
+    const cfg = getBillingConfig();
+    const ws = req.workspace;
+
+    const trialCreditUsd = typeof ws?.trialCreditUsd === "number" ? ws.trialCreditUsd : Number(ws?.trialCreditUsd || 0);
+    const base = Math.max(0.000001, Number(cfg.basePriceUsdPerMin || 0.13));
+    const approxMinutesRemaining = Math.max(0, Math.floor(Math.max(0, trialCreditUsd) / base));
+
+    return res.json({
+      workspaceId: ws.id,
+      mode: ws.isPaid ? "paid" : "trial",
+      isTrial: Boolean(ws.isTrial),
+      isPaid: Boolean(ws.isPaid),
+      hasPaymentMethod: Boolean(ws.hasPaymentMethod),
+      telephonyEnabled: Boolean(ws.telephonyEnabled),
+      trial: {
+        creditUsd: Math.max(0, Math.round(trialCreditUsd * 100) / 100),
+        approxMinutesRemaining,
+        allowPstn: Boolean(cfg.trialAllowPstn),
+        allowNumberPurchase: Boolean(cfg.trialAllowNumberPurchase),
+      },
+      pricing: {
+        baseUsdPerMin: Number(cfg.basePriceUsdPerMin || 0.13),
+        defaultLlmModel: cfg.defaultLlmModel,
+        includedTokensPerMin: Number(cfg.includedTokensPerMin || 0),
+        tokenOverageUsdPer1K: Number(cfg.tokenOverageUsdPer1K || 0),
+        llmSurchargeUsdPerMinByModel: cfg.llmSurchargeUsdPerMinByModel || {},
+        telephonyUsdPerMin: Number(cfg.telephonyUsdPerMin || 0),
+        telephonyMarkupRate: Number(cfg.telephonyMarkupRate || 0),
+        phoneNumberMonthlyFeeUsd: Number(cfg.phoneNumberMonthlyFeeUsd || 0),
+      },
+    });
+  });
+
+  r.post("/upgrade", async (req, res) => {
+    if (!store) return res.status(400).json({ error: "Billing upgrade requires Postgres mode" });
+    const ws = req.workspace;
+    if (ws.isPaid && ws.hasPaymentMethod) return res.json({ ok: true, alreadyPaid: true });
+
+    try {
+      const { customerId } = await stripeBilling.ensureStripeCustomerForWorkspace(ws);
+      if (!ws.stripeCustomerId) await store.updateWorkspace(ws.id, { stripeCustomerId: customerId });
+      const session = await stripeBilling.createUpgradeCheckoutSession({ customerId, workspaceId: ws.id });
+      return res.json({ ok: true, url: session.url });
+    } catch (e) {
+      return res.status(400).json({ error: e instanceof Error ? e.message : "Upgrade failed" });
+    }
+  });
+
+  r.get("/upcoming-invoice", async (req, res) => {
+    if (!store) return res.status(400).json({ error: "Billing requires Postgres mode" });
+    const ws = req.workspace;
+    if (!ws.isPaid) return res.status(402).json({ error: "Upgrade required" });
+    if (!ws.stripeCustomerId || !ws.stripeSubscriptionId) return res.status(400).json({ error: "Stripe subscription not configured" });
+
+    try {
+      const inv = await stripeBilling.getUpcomingInvoice({ customerId: ws.stripeCustomerId, subscriptionId: ws.stripeSubscriptionId });
+      const currency = String(inv.currency || "usd").toUpperCase();
+      const totalCents = Number(inv.total || 0);
+      const lines = (inv.lines?.data || []).map((l) => ({
+        id: l.id,
+        description: l.description || l.price?.nickname || l.price?.id || "Line item",
+        amountCents: Number(l.amount || 0),
+        quantity: l.quantity == null ? null : Number(l.quantity),
+        unitAmountCents: l.price?.unit_amount == null ? null : Number(l.price.unit_amount),
+        priceId: l.price?.id ?? null,
+        periodStart: l.period?.start ? Number(l.period.start) * 1000 : null,
+        periodEnd: l.period?.end ? Number(l.period.end) * 1000 : null,
+      }));
+
+      const sumCents = lines.reduce((a, x) => a + Number(x.amountCents || 0), 0);
+      return res.json({
+        currency,
+        totalCents,
+        totalUsd: Math.round((totalCents / 100) * 100) / 100,
+        lines,
+        sums: { linesCents: sumCents, matchesTotal: sumCents === totalCents },
+      });
+    } catch (e) {
+      return res.status(400).json({ error: e instanceof Error ? e.message : "Failed to load upcoming invoice" });
+    }
+  });
+
+  return r;
+}
+
+module.exports = { createBillingRouter };
+
+

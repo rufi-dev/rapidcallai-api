@@ -56,6 +56,18 @@ async function initSchema() {
       name TEXT NOT NULL,
       user_id TEXT NULL,
       twilio_subaccount_sid TEXT NULL,
+      is_trial BOOLEAN NOT NULL DEFAULT true,
+      trial_credit_usd DOUBLE PRECISION NOT NULL DEFAULT 20.0,
+      trial_credit_granted_at BIGINT NULL,
+      stripe_customer_id TEXT NULL,
+      stripe_subscription_id TEXT NULL,
+      stripe_phone_numbers_item_id TEXT NULL,
+      openmeter_customer_id TEXT NULL,
+      openmeter_credit_grant_id TEXT NULL,
+      openmeter_credit_granted_at BIGINT NULL,
+      has_payment_method BOOLEAN NOT NULL DEFAULT false,
+      is_paid BOOLEAN NOT NULL DEFAULT false,
+      telephony_enabled BOOLEAN NOT NULL DEFAULT false,
       created_at BIGINT NOT NULL,
       updated_at BIGINT NOT NULL
     );
@@ -63,6 +75,18 @@ async function initSchema() {
 
   // Backward-compatible schema upgrades (when table already exists)
   await p.query(`ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS user_id TEXT NULL;`);
+  await p.query(`ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS is_trial BOOLEAN NOT NULL DEFAULT true;`);
+  await p.query(`ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS trial_credit_usd DOUBLE PRECISION NOT NULL DEFAULT 20.0;`);
+  await p.query(`ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS trial_credit_granted_at BIGINT NULL;`);
+  await p.query(`ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT NULL;`);
+  await p.query(`ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS stripe_subscription_id TEXT NULL;`);
+  await p.query(`ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS stripe_phone_numbers_item_id TEXT NULL;`);
+  await p.query(`ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS openmeter_customer_id TEXT NULL;`);
+  await p.query(`ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS openmeter_credit_grant_id TEXT NULL;`);
+  await p.query(`ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS openmeter_credit_granted_at BIGINT NULL;`);
+  await p.query(`ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS has_payment_method BOOLEAN NOT NULL DEFAULT false;`);
+  await p.query(`ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS is_paid BOOLEAN NOT NULL DEFAULT false;`);
+  await p.query(`ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS telephony_enabled BOOLEAN NOT NULL DEFAULT false;`);
 
   await p.query(`
     CREATE TABLE IF NOT EXISTS agents (
