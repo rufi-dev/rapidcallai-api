@@ -317,6 +317,7 @@ function createBillingRouter({ store, stripeBilling }) {
       // fall back to OpenMeter billing upcoming-invoice preview (matches OpenMeter UI "Invoicing" tab).
       const noUsageData = Object.keys(wanted).every((k) => !Number(usageByKey[k] || 0));
       let invoiceFallback = null;
+      let invoiceAttemptDebug = null;
       if (noUsageData) {
         // Try both identifiers (key vs id) like above.
         for (const cid of attemptIds) {
@@ -332,6 +333,15 @@ function createBillingRouter({ store, stripeBilling }) {
           if (inv?.skipped) {
             invoiceFallback = { ...inv, usedCustomerId: cid };
             break;
+          }
+          if (debug && inv && !inv.ok) {
+            invoiceAttemptDebug = invoiceAttemptDebug || [];
+            invoiceAttemptDebug.push({
+              customerIdOrKey: cid,
+              status: inv.status ?? null,
+              endpoint: inv.endpoint ?? null,
+              attemptResults: inv.attemptResults ?? null,
+            });
           }
         }
       }
@@ -415,6 +425,7 @@ function createBillingRouter({ store, stripeBilling }) {
                 openmeterEndpoint: ent.endpoint ?? null,
                 stripeConfigured: Boolean(s),
                 sampleByKey,
+                openmeterInvoiceAttemptDebug: invoiceAttemptDebug,
               },
             }
           : {}),

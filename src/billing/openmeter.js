@@ -328,8 +328,18 @@ async function getOpenMeterCustomerUpcomingInvoice({ apiUrl, apiKey, customerIdO
     `${base}/api/v1/billing/customers/${cid}/invoices/preview`,
     `${base}/api/v1/billing/customers/${cid}/upcoming-invoice`,
     `${base}/api/v1/billing/customers/${cid}/upcoming`,
+    // More variants seen across docs / deployments
+    `${base}/api/v1/billing/customers/${cid}/invoices`,
+    `${base}/api/v1/billing/customers/${cid}/invoices?status=upcoming`,
+    `${base}/api/v1/billing/customers/${cid}/invoices?state=upcoming`,
+    `${base}/api/v1/billing/customers/${cid}/invoices?type=upcoming`,
+    `${base}/api/v1/billing/customers/${cid}/upcoming-charges`,
+    `${base}/api/v1/billing/customers/${cid}/charges/upcoming`,
+    `${base}/api/v1/billing/upcoming?customerId=${cid}`,
+    `${base}/api/v1/billing/invoices/upcoming?customerId=${cid}`,
   ];
 
+  const attemptResults = [];
   let last = null;
   for (const endpoint of attempts) {
     const { status, text } = await requestJson(endpoint, { method: "GET", headers: auth });
@@ -337,12 +347,19 @@ async function getOpenMeterCustomerUpcomingInvoice({ apiUrl, apiKey, customerIdO
       const payload = safeJsonParse(text) || {};
       const lines = normalizeInvoiceLines(payload);
       const totalCents = extractInvoiceTotalCents(payload);
-      return { ok: true, invoice: payload, lines, totalCents, endpoint };
+      return { ok: true, invoice: payload, lines, totalCents, endpoint, attemptResults };
     }
+    attemptResults.push({ endpoint, status, text: String(text || "").slice(0, 400) });
     last = { status, text, endpoint };
   }
 
-  return { ok: false, status: last?.status || 0, text: last?.text || "Failed to load upcoming invoice", endpoint: last?.endpoint };
+  return {
+    ok: false,
+    status: last?.status || 0,
+    text: last?.text || "Failed to load upcoming invoice",
+    endpoint: last?.endpoint,
+    attemptResults,
+  };
 }
 
 module.exports = {
