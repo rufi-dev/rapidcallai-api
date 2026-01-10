@@ -1,7 +1,7 @@
 const { getBillingConfig } = require("./config");
 const { computeCallBillingQuantities, computeTrialDebitUsd } = require("./pricing");
 const { emitOpenMeterEvent } = require("./openmeter");
-const { getMeteredPriceIdsFromEnv, recordUsageForSubscription } = require("./stripe");
+const { getMeteredPriceIdsFromEnv, recordMeterEventsForWorkspace } = require("./stripe");
 
 function safeObj(x) {
   return x && typeof x === "object" ? x : {};
@@ -159,10 +159,10 @@ async function finalizeBillingForCall({ store, call }) {
       });
     }
 
-    // --- Paid: ALSO record usage to Stripe (so Stripe upcoming invoices show usage)
+    // --- Paid: ALSO record usage to Stripe via Billing Meter Events (so Stripe upcoming invoices show usage)
     // This is separate from OpenMeter and is safe as long as you do NOT also invoice via OpenMeter->Stripe sync.
     try {
-      if (ws.stripeSubscriptionId) {
+      if (ws.stripeCustomerId) {
         const priceIds = getMeteredPriceIdsFromEnv();
         const usageByPriceId = {};
 
@@ -177,12 +177,12 @@ async function finalizeBillingForCall({ store, call }) {
         if (telMin > 0 && priceIds.telephonyMinutes) usageByPriceId[priceIds.telephonyMinutes] = telMin;
         if (tok1k > 0 && priceIds.tokenOverage) usageByPriceId[priceIds.tokenOverage] = tok1k;
 
-        // Idempotency per call+price. Only mark sentAt if at least one usage record succeeded.
+        // Idempotency per call+price. Only mark sentAt if at least one event succeeded.
         const alreadySent = Boolean(nextStripe?.sentAt);
         if (!alreadySent && Object.keys(usageByPriceId).length > 0) {
           const ts = Math.floor(Number(call.endedAt || Date.now()) / 1000);
-          const r = await recordUsageForSubscription({
-            subscriptionId: ws.stripeSubscriptionId,
+          const r = await recordMeterEventsForWorkspace({
+            customerId: ws.stripeCustomerId,
             usageByPriceId,
             timestampSec: ts,
             idempotencyKeyPrefix: `call:${call.id}`,

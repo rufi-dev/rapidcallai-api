@@ -1,6 +1,6 @@
 const express = require("express");
 const { getBillingConfig } = require("./config");
-const { getMeteredPriceIdsFromEnv, recordUsageForSubscription } = require("./stripe");
+const { getMeteredPriceIdsFromEnv, recordMeterEventsForWorkspace } = require("./stripe");
 const {
   getOpenMeterCustomer,
   getOpenMeterCustomerUpcomingInvoice,
@@ -32,8 +32,8 @@ function createBillingRouter({ store, stripeBilling }) {
     if (!priceId) return res.status(400).json({ error: `Unknown priceKey or missing env for ${priceKey}` });
 
     try {
-      const r1 = await recordUsageForSubscription({
-        subscriptionId: ws.stripeSubscriptionId,
+      const r1 = await recordMeterEventsForWorkspace({
+        customerId: ws.stripeCustomerId,
         usageByPriceId: { [priceId]: qty },
         timestampSec: Math.floor(Date.now() / 1000),
         idempotencyKeyPrefix: `debug:${ws.id}:${Date.now()}`,
