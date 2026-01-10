@@ -521,8 +521,13 @@ async function invokeOpenMeterInvoiceAction({ apiUrl, apiKey, invoiceId, action 
   const act = String(action || "invoice").trim() || "invoice";
   const id = encodeURIComponent(String(invoiceId));
 
-  // OpenMeter action endpoints vary slightly between versions; try common variants.
+  // OpenMeter action endpoints vary slightly between versions.
+  // Cloud UI shows `statusDetails.availableActions.invoice`, which typically maps to an "actions" endpoint.
   const attempts = [
+    // Most likely: POST actions with body specifying action.
+    `${base}/api/v1/billing/invoices/${id}/actions`,
+
+    // Other variants we keep for completeness.
     `${base}/api/v1/billing/invoices/${id}/${encodeURIComponent(act)}`,
     `${base}/api/v1/billing/invoices/${id}/actions/${encodeURIComponent(act)}`,
     `${base}/api/v1/billing/invoices/${id}:$${encodeURIComponent(act)}`,
@@ -534,14 +539,32 @@ async function invokeOpenMeterInvoiceAction({ apiUrl, apiKey, invoiceId, action 
   let last = null;
   for (const endpoint of attempts) {
     // Some deployments use POST, some PUT; some reject bodies.
+    const bodiesToTry = endpoint.endsWith("/actions")
+      ? [
+          { action: act },
+          { type: act },
+          { name: act },
+          { operation: act },
+          { action: { type: act } },
+          {},
+          undefined,
+        ]
+      : [{}, undefined];
+
     for (const method of ["POST", "PUT", "PATCH"]) {
-      for (const body of [{}, undefined]) {
+      for (const body of bodiesToTry) {
         const { status, text } = await requestJson(endpoint, { method, headers: auth, body });
         if (status >= 200 && status < 300) {
           const payload = safeJsonParse(text) || {};
           return { ok: true, endpoint, method, payload, attemptResults };
         }
-        attemptResults.push({ endpoint, method, body: body === undefined ? "(no body)" : "{}", status, text: String(text || "").slice(0, 400) });
+        attemptResults.push({
+          endpoint,
+          method,
+          body: body === undefined ? "(no body)" : JSON.stringify(body),
+          status,
+          text: String(text || "").slice(0, 400),
+        });
         last = { status, text, endpoint, method };
 
         // If endpoint exists but doesn't allow this method, continue trying other methods/bodies.
