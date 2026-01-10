@@ -494,6 +494,54 @@ async function listOpenMeterInvoices({ apiUrl, apiKey, customerId, statuses = ["
   return { ok: true, invoices, endpoint };
 }
 
+async function getOpenMeterInvoiceById({ apiUrl, apiKey, invoiceId }) {
+  const base = normalizeBaseUrl(apiUrl);
+  if (!base) return { skipped: true, reason: "OPENMETER_API_URL not set" };
+  const auth = normalizeAuth(apiKey);
+  if (!auth) return { skipped: true, reason: "OPENMETER_API_KEY not set" };
+  if (!invoiceId) return { ok: false, reason: "invoiceId missing" };
+
+  const endpoint = `${base}/api/v1/billing/invoices/${encodeURIComponent(String(invoiceId))}?expand=lines`;
+  const { status, text } = await requestJson(endpoint, { method: "GET", headers: auth });
+  if (!(status >= 200 && status < 300)) return { ok: false, status, text, endpoint };
+
+  const invoice = safeJsonParse(text) || {};
+  const summary = parseInvoiceSummary(invoice);
+  if (!summary?.id) return { ok: false, status: 500, text: "Invalid invoice payload", endpoint };
+  return { ok: true, invoice: { ...summary, lines: parseInvoiceLines(invoice) }, endpoint };
+}
+
+async function invokeOpenMeterInvoiceAction({ apiUrl, apiKey, invoiceId, action }) {
+  const base = normalizeBaseUrl(apiUrl);
+  if (!base) return { skipped: true, reason: "OPENMETER_API_URL not set" };
+  const auth = normalizeAuth(apiKey);
+  if (!auth) return { skipped: true, reason: "OPENMETER_API_KEY not set" };
+  if (!invoiceId) return { ok: false, reason: "invoiceId missing" };
+
+  const act = String(action || "invoice").trim() || "invoice";
+  const id = encodeURIComponent(String(invoiceId));
+
+  // OpenMeter action endpoints vary slightly between versions; try common variants.
+  const attempts = [
+    `${base}/api/v1/billing/invoices/${id}/${encodeURIComponent(act)}`,
+    `${base}/api/v1/billing/invoices/${id}/actions/${encodeURIComponent(act)}`,
+    `${base}/api/v1/billing/invoices/${id}:$${encodeURIComponent(act)}`,
+  ];
+
+  const attemptResults = [];
+  let last = null;
+  for (const endpoint of attempts) {
+    const { status, text } = await requestJson(endpoint, { method: "POST", headers: auth, body: {} });
+    if (status >= 200 && status < 300) {
+      const payload = safeJsonParse(text) || {};
+      return { ok: true, endpoint, payload, attemptResults };
+    }
+    attemptResults.push({ endpoint, status, text: String(text || "").slice(0, 400) });
+    last = { status, text, endpoint };
+  }
+  return { ok: false, status: last?.status || 0, text: last?.text || "Failed to invoke invoice action", endpoint: last?.endpoint, attemptResults };
+}
+
 module.exports = {
   emitOpenMeterEvent,
   isUlid,
@@ -504,6 +552,8 @@ module.exports = {
   listOpenMeterCustomerEntitlements,
   getOpenMeterCustomerUpcomingInvoice,
   listOpenMeterInvoices,
+  getOpenMeterInvoiceById,
+  invokeOpenMeterInvoiceAction,
 };
 
 

@@ -3,8 +3,10 @@ const { getBillingConfig } = require("./config");
 const {
   getOpenMeterCustomer,
   getOpenMeterCustomerUpcomingInvoice,
+  getOpenMeterInvoiceById,
   isUlid,
   linkStripeCustomerToOpenMeterCustomer,
+  invokeOpenMeterInvoiceAction,
   listOpenMeterCustomerEntitlements,
   listOpenMeterInvoices,
 } = require("./openmeter");
@@ -597,6 +599,41 @@ function createBillingRouter({ store, stripeBilling }) {
       });
     } catch (e) {
       return res.status(400).json({ error: e instanceof Error ? e.message : "Failed to load invoices" });
+    }
+  });
+
+  // Force OpenMeter to "Invoice" (sync to Stripe) for the given OpenMeter invoice id.
+  r.post("/invoices/:invoiceId/invoice", async (req, res) => {
+    const ws = req.workspace;
+    if (!ws?.id) return res.status(401).json({ error: "Unauthorized" });
+
+    const invoiceId = String(req.params?.invoiceId || "").trim();
+    if (!invoiceId) return res.status(400).json({ error: "Missing invoiceId" });
+
+    try {
+      const act = await invokeOpenMeterInvoiceAction({
+        apiUrl: process.env.OPENMETER_API_URL,
+        apiKey: process.env.OPENMETER_API_KEY,
+        invoiceId,
+        action: "invoice",
+      });
+      if (act?.skipped) return res.json({ ok: true, skipped: true, reason: act.reason });
+      if (!act?.ok) {
+        return res.status(400).json({
+          error: "OpenMeter invoice action failed",
+          details: { status: act.status, text: act.text, endpoint: act.endpoint, attemptResults: act.attemptResults },
+        });
+      }
+
+      const fetched = await getOpenMeterInvoiceById({
+        apiUrl: process.env.OPENMETER_API_URL,
+        apiKey: process.env.OPENMETER_API_KEY,
+        invoiceId,
+      });
+      if (fetched?.ok) return res.json({ ok: true, invoice: fetched.invoice });
+      return res.json({ ok: true, action: act.payload, note: "Action succeeded but invoice re-fetch failed" });
+    } catch (e) {
+      return res.status(400).json({ error: e instanceof Error ? e.message : "Failed to invoice in OpenMeter" });
     }
   });
 
