@@ -386,13 +386,112 @@ async function getOpenMeterCustomerUpcomingInvoice({ apiUrl, apiKey, customerIdO
   };
 }
 
+function isUlid(str) {
+  const s = String(str || "").trim();
+  // Matches OpenMeter error regex: ^[0-7][0-9A-HJKMNP-TV-Za-hjkmnp-tv-z]{25}$
+  return /^[0-7][0-9A-HJKMNP-TV-Za-hjkmnp-tv-z]{25}$/.test(s);
+}
+
+function parseDecimalToCents(v) {
+  const cents = normalizeMoneyToCents(v);
+  return cents == null ? 0 : cents;
+}
+
+function parseInvoiceSummary(inv) {
+  if (!inv) return null;
+  const id = String(inv.id || "").trim() || null;
+  const number = inv.number ?? inv.invoiceNumber ?? null;
+  const status = inv.status ?? null;
+  const currency = String(inv.currency || "USD").toUpperCase();
+  const createdAtMs = parseTimeToMs(inv.createdAt) ?? null;
+  const issuedAtMs = parseTimeToMs(inv.issuedAt) ?? null;
+  const periodFromMs = parseTimeToMs(inv.period?.from ?? inv.period?.start) ?? null;
+  const periodToMs = parseTimeToMs(inv.period?.to ?? inv.period?.end) ?? null;
+  const totalCents = extractInvoiceTotalCents(inv);
+  const url = inv.url ?? inv.pdfUrl ?? inv.hostedInvoiceUrl ?? null;
+  return {
+    id,
+    number,
+    status,
+    currency,
+    createdAtMs,
+    issuedAtMs,
+    periodFromMs,
+    periodToMs,
+    totalCents: totalCents == null ? null : Number(totalCents),
+    totalUsd: totalCents == null ? null : Math.round((Number(totalCents) / 100) * 100) / 100,
+    url: url ? String(url) : null,
+  };
+}
+
+function parseInvoiceLines(inv) {
+  const lines = normalizeInvoiceLines(inv) || [];
+  return lines.map((l) => {
+    const name = String(l?.name ?? l?.description ?? l?.title ?? "Line item");
+    const quantityRaw = l?.quantity ?? l?.meteredQuantity ?? l?.metered_quantity ?? l?.units ?? null;
+    const quantity = quantityRaw == null ? null : Number(quantityRaw);
+    const amountCents = extractInvoiceTotalCents(l) ?? normalizeMoneyToCents(l?.amount) ?? normalizeMoneyToCents(l?.total) ?? null;
+    const details =
+      l?.rateCard?.featureKey
+        ? { featureKey: String(l.rateCard.featureKey) }
+        : l?.subscription?.item?.id
+          ? { subscriptionItemId: String(l.subscription.item.id) }
+          : null;
+    return {
+      id: String(l?.id || "").trim() || null,
+      name,
+      quantity: Number.isFinite(quantity) ? quantity : null,
+      amountCents: amountCents == null ? null : parseDecimalToCents(amountCents),
+      amountUsd: amountCents == null ? null : Math.round((parseDecimalToCents(amountCents) / 100) * 100) / 100,
+      details,
+    };
+  });
+}
+
+async function listOpenMeterInvoices({ apiUrl, apiKey, customerId, statuses = ["gathering", "issued"], pageSize = 50 }) {
+  const base = normalizeBaseUrl(apiUrl);
+  if (!base) return { skipped: true, reason: "OPENMETER_API_URL not set" };
+  const auth = normalizeAuth(apiKey);
+  if (!auth) return { skipped: true, reason: "OPENMETER_API_KEY not set" };
+  if (!customerId) return { ok: false, reason: "customerId missing" };
+
+  const qs = new URLSearchParams({
+    customers: String(customerId),
+    expand: "lines",
+    statuses: Array.isArray(statuses) ? statuses.join(",") : String(statuses),
+    page: "1",
+    pageSize: String(pageSize),
+    order: "DESC",
+    orderBy: "createdAt",
+  }).toString();
+
+  const endpoint = `${base}/api/v1/billing/invoices?${qs}`;
+  const { status, text } = await requestJson(endpoint, { method: "GET", headers: auth });
+  if (!(status >= 200 && status < 300)) return { ok: false, status, text, endpoint };
+
+  const payload = safeJsonParse(text) || {};
+  const items = Array.isArray(payload?.items) ? payload.items : Array.isArray(payload?.data?.items) ? payload.data.items : [];
+  const invoices = items
+    .map((inv) => {
+      const summary = parseInvoiceSummary(inv);
+      if (!summary?.id) return null;
+      return { ...summary, lines: parseInvoiceLines(inv) };
+    })
+    .filter(Boolean);
+
+  return { ok: true, invoices, endpoint };
+}
+
 module.exports = {
   emitOpenMeterEvent,
+  isUlid,
   ensureOpenMeterCustomerForWorkspace,
+  getOpenMeterCustomer,
   linkStripeCustomerToOpenMeterCustomer,
   grantOpenMeterEntitlement,
   listOpenMeterCustomerEntitlements,
   getOpenMeterCustomerUpcomingInvoice,
+  listOpenMeterInvoices,
 };
 
 

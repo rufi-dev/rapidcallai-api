@@ -1,6 +1,12 @@
 const express = require("express");
 const { getBillingConfig } = require("./config");
-const { getOpenMeterCustomerUpcomingInvoice, listOpenMeterCustomerEntitlements } = require("./openmeter");
+const {
+  getOpenMeterCustomer,
+  getOpenMeterCustomerUpcomingInvoice,
+  isUlid,
+  listOpenMeterCustomerEntitlements,
+  listOpenMeterInvoices,
+} = require("./openmeter");
 
 function createBillingRouter({ store, stripeBilling }) {
   const r = express.Router();
@@ -432,6 +438,77 @@ function createBillingRouter({ store, stripeBilling }) {
       });
     } catch (e) {
       return res.status(400).json({ error: e instanceof Error ? e.message : "Failed to load usage summary" });
+    }
+  });
+
+  // Retell-style billing history (OpenMeter is the source of truth).
+  r.get("/invoices", async (req, res) => {
+    const ws = req.workspace;
+    if (!ws?.id) return res.status(401).json({ error: "Unauthorized" });
+
+    try {
+      const debug = String(req.query?.debug || "").trim() === "1";
+      const candidates = Array.from(
+        new Set([String(ws.openmeterCustomerId || ""), String(ws.id)].filter((x) => x && x.trim().length > 0))
+      );
+
+      let customerId = null;
+      let resolvedFrom = null;
+      for (const c of candidates) {
+        if (isUlid(c)) {
+          customerId = c;
+          resolvedFrom = c;
+          break;
+        }
+      }
+      if (!customerId) {
+        // Resolve id from customer key.
+        for (const c of candidates) {
+          const r1 = await getOpenMeterCustomer({
+            apiUrl: process.env.OPENMETER_API_URL,
+            apiKey: process.env.OPENMETER_API_KEY,
+            customerIdOrKey: c,
+          });
+          if (r1?.ok && r1.customer?.id) {
+            customerId = String(r1.customer.id);
+            resolvedFrom = c;
+            break;
+          }
+        }
+      }
+
+      if (!customerId) return res.status(400).json({ error: "OpenMeter customer not found for workspace" });
+
+      const inv = await listOpenMeterInvoices({
+        apiUrl: process.env.OPENMETER_API_URL,
+        apiKey: process.env.OPENMETER_API_KEY,
+        customerId,
+        statuses: ["gathering", "issued"],
+        pageSize: 50,
+      });
+
+      if (inv?.skipped) {
+        return res.json({ ok: true, skipped: true, reason: inv.reason, upcoming: null, history: [] });
+      }
+      if (!inv?.ok) {
+        return res.status(400).json({
+          error: "Failed to load OpenMeter invoices",
+          details: { status: inv.status, text: inv.text, endpoint: inv.endpoint },
+        });
+      }
+
+      const all = inv.invoices || [];
+      const upcoming = all.find((x) => String(x.status) === "gathering") || null;
+      const history = all.filter((x) => String(x.status) !== "gathering");
+
+      return res.json({
+        ok: true,
+        upcoming,
+        history,
+        ...(debug ? { debug: { candidates, resolvedFrom, customerId, endpoint: inv.endpoint } } : {}),
+      });
+    } catch (e) {
+      return res.status(400).json({ error: e instanceof Error ? e.message : "Failed to load invoices" });
     }
   });
 
