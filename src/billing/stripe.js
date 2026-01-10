@@ -61,7 +61,16 @@ async function retrieveStripePrice(priceId) {
   return await s.prices.retrieve(String(priceId));
 }
 
-async function createStripeMeterEvent({ customerId, meterId, value, timestampSec, idempotencyKey }) {
+async function retrieveStripeMeter(meterId) {
+  const key = String(process.env.STRIPE_SECRET_KEY || "").trim();
+  const id = String(meterId || "").trim();
+  if (!id) throw new Error("meterId missing");
+  const res = await stripeRequestJson({ method: "GET", path: `/v1/billing/meters/${encodeURIComponent(id)}`, apiKey: key });
+  if (res.status >= 200 && res.status < 300) return { ok: true, meter: res.json || null };
+  return { ok: false, status: res.status, error: res.json?.error?.message || res.text };
+}
+
+async function createStripeMeterEvent({ customerId, meterId, value, timestampSec }) {
   const key = String(process.env.STRIPE_SECRET_KEY || "").trim();
   const meter = String(meterId || "").trim();
   const customer = String(customerId || "").trim();
@@ -69,11 +78,17 @@ async function createStripeMeterEvent({ customerId, meterId, value, timestampSec
   if (!customer) throw new Error("customerId missing");
 
   // Stripe Billing Meter Events API (new metering system).
-  // We use an idempotency key so retries can't double bill.
+  // This API expects event_name + payload[...] (NOT meter/customer/value at top-level).
+  const meterRes = await retrieveStripeMeter(meter);
+  if (!meterRes?.ok) return { ok: false, status: meterRes.status ?? 0, error: meterRes.error || "Failed to retrieve meter" };
+
+  const eventName = String(meterRes?.meter?.event_name || meterRes?.meter?.eventName || "").trim();
+  if (!eventName) return { ok: false, status: 400, error: "Stripe meter is missing event_name" };
+
   const body = {
-    meter,
-    customer,
-    value: String(value),
+    event_name: eventName,
+    "payload[customer]": customer,
+    "payload[value]": String(value),
     ...(timestampSec ? { timestamp: String(timestampSec) } : {}),
   };
 
@@ -83,10 +98,6 @@ async function createStripeMeterEvent({ customerId, meterId, value, timestampSec
     apiKey: key,
     body,
   });
-
-  // Apply idempotency at HTTP layer by re-sending with Idempotency-Key is ideal, but we're using the Stripe SDK elsewhere.
-  // Here we keep it simple: embed uniqueness in the event via deterministic timestamp+value per call, and rely on our call-level idempotency.
-  // If needed, we can move this to Stripe SDK rawRequest with idempotency headers.
 
   if (res.status >= 200 && res.status < 300) return { ok: true, data: res.json || null };
   return { ok: false, status: res.status, error: res.json?.error?.message || res.text };
@@ -326,13 +337,11 @@ async function recordMeterEventsForWorkspace({ customerId, usageByPriceId, times
     }
 
     // Idempotency is handled at our call level; meter events are append-only.
-    const idem = `${String(idempotencyKeyPrefix || "meter")}:${priceId}`;
     const r = await createStripeMeterEvent({
       customerId,
       meterId,
       value: quantity,
       timestampSec: ts,
-      idempotencyKey: idem,
     });
     results[priceId] = { ...r, meterId, quantity };
   }
