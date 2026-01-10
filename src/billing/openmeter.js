@@ -260,6 +260,7 @@ function normalizeInvoiceLines(payload) {
     payload?.lineItems,
     payload?.items,
     payload?.invoice?.lines,
+    payload?.invoice?.lines,
     payload?.invoice?.lineItems,
     payload?.invoice?.items,
     payload?.data?.lines,
@@ -283,6 +284,7 @@ function normalizeMoneyToCents(v) {
   }
   const s = String(v).trim();
   if (!s) return null;
+  // OpenMeter often returns decimal strings (e.g., "0.30").
   const n = Number(s);
   if (!Number.isFinite(n)) return null;
   if (Number.isInteger(n)) return n;
@@ -306,6 +308,10 @@ function extractInvoiceTotalCents(payload) {
     payload?.invoice?.total?.amount,
     payload?.invoice?.total?.amountCents,
     payload?.invoice?.totalAmount,
+    payload?.totals?.total,
+    payload?.totals?.amount,
+    payload?.totals?.chargesTotal,
+    payload?.totals?.charges_total,
   ];
   for (const v of candidates) {
     const cents = normalizeMoneyToCents(v);
@@ -322,21 +328,31 @@ async function getOpenMeterCustomerUpcomingInvoice({ apiUrl, apiKey, customerIdO
   if (!customerIdOrKey) return { ok: false, reason: "customerIdOrKey missing" };
 
   // Try a few endpoints (OpenMeter has multiple variants across versions/deployments).
-  const cid = encodeURIComponent(String(customerIdOrKey));
+  const cidRaw = String(customerIdOrKey);
+  const cid = encodeURIComponent(cidRaw);
+
+  // IMPORTANT: On OpenMeter Cloud, the "Invoicing" tab is driven by listing invoices,
+  // not a dedicated "upcoming invoice" endpoint.
+  const listInvoicesQs = new URLSearchParams({
+    customers: cidRaw,
+    expand: "lines",
+    // "gathering" is the current in-progress invoice (what the UI shows as Upcoming Charges)
+    statuses: "gathering",
+    page: "1",
+    pageSize: "1",
+    order: "DESC",
+    orderBy: "createdAt",
+  }).toString();
+
   const attempts = [
+    // Open-source & Cloud: list invoices (preferred)
+    `${base}/api/v1/billing/invoices?${listInvoicesQs}`,
+
+    // Older/other variants (kept as fallback)
     `${base}/api/v1/billing/customers/${cid}/invoices/upcoming`,
     `${base}/api/v1/billing/customers/${cid}/invoices/preview`,
     `${base}/api/v1/billing/customers/${cid}/upcoming-invoice`,
     `${base}/api/v1/billing/customers/${cid}/upcoming`,
-    // More variants seen across docs / deployments
-    `${base}/api/v1/billing/customers/${cid}/invoices`,
-    `${base}/api/v1/billing/customers/${cid}/invoices?status=upcoming`,
-    `${base}/api/v1/billing/customers/${cid}/invoices?state=upcoming`,
-    `${base}/api/v1/billing/customers/${cid}/invoices?type=upcoming`,
-    `${base}/api/v1/billing/customers/${cid}/upcoming-charges`,
-    `${base}/api/v1/billing/customers/${cid}/charges/upcoming`,
-    `${base}/api/v1/billing/upcoming?customerId=${cid}`,
-    `${base}/api/v1/billing/invoices/upcoming?customerId=${cid}`,
   ];
 
   const attemptResults = [];
@@ -345,9 +361,17 @@ async function getOpenMeterCustomerUpcomingInvoice({ apiUrl, apiKey, customerIdO
     const { status, text } = await requestJson(endpoint, { method: "GET", headers: auth });
     if (status >= 200 && status < 300) {
       const payload = safeJsonParse(text) || {};
-      const lines = normalizeInvoiceLines(payload);
-      const totalCents = extractInvoiceTotalCents(payload);
-      return { ok: true, invoice: payload, lines, totalCents, endpoint, attemptResults };
+
+      // If this is a list response, pick the first invoice item.
+      const invoice =
+        (Array.isArray(payload?.items) && payload.items[0]) ||
+        (Array.isArray(payload?.data?.items) && payload.data.items[0]) ||
+        payload?.invoice ||
+        payload;
+
+      const lines = normalizeInvoiceLines(invoice);
+      const totalCents = extractInvoiceTotalCents(invoice) ?? extractInvoiceTotalCents(payload);
+      return { ok: true, invoice, lines, totalCents, endpoint, attemptResults };
     }
     attemptResults.push({ endpoint, status, text: String(text || "").slice(0, 400) });
     last = { status, text, endpoint };
