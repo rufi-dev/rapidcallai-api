@@ -14,6 +14,74 @@ const {
 function createBillingRouter({ store, stripeBilling }) {
   const r = express.Router();
 
+  // Debug why Stripe isn't showing usage for metered items.
+  r.get("/stripe-usage-debug", async (req, res) => {
+    if (!store) return res.status(400).json({ error: "Billing requires Postgres mode" });
+    const ws = req.workspace;
+    if (!ws?.id) return res.status(401).json({ error: "Unauthorized" });
+
+    try {
+      const s = stripeBilling?.getStripe?.() || null;
+      if (!s) return res.status(400).json({ error: "Stripe not configured on server" });
+      if (!ws.stripeSubscriptionId) return res.status(400).json({ error: "Stripe subscription not configured" });
+
+      // Last call metrics (to see if we attempted to record usage and whether it failed)
+      const calls = await store.listCalls(ws.id);
+      const last = calls?.[0]?.id ? await store.getCall(ws.id, calls[0].id) : null;
+      const billing = last?.metrics?.billing || null;
+
+      const sub = await s.subscriptions.retrieve(ws.stripeSubscriptionId, { expand: ["items.data.price"] });
+      const items = (sub.items?.data || []).map((it) => ({
+        subscriptionItemId: it.id,
+        priceId: it.price?.id ?? null,
+        nickname: it.price?.nickname ?? null,
+        recurring: it.price?.recurring ?? null,
+      }));
+
+      // Price sanity: are the usage prices actually metered?
+      const env = {
+        baseMinutes: String(process.env.STRIPE_PRICE_ID_BASE_MINUTES || "").trim(),
+        modelUpgradeMinutes: String(process.env.STRIPE_PRICE_ID_MODEL_UPGRADE_MINUTES || "").trim(),
+        telephonyMinutes: String(process.env.STRIPE_PRICE_ID_TELEPHONY_MINUTES || "").trim(),
+        tokenOverage: String(process.env.STRIPE_PRICE_ID_TOKEN_OVERAGE || "").trim(),
+      };
+      const priceCheck = {};
+      for (const [k, pid] of Object.entries(env)) {
+        if (!pid) continue;
+        try {
+          const p = await s.prices.retrieve(pid);
+          priceCheck[k] = {
+            id: p.id,
+            active: p.active,
+            currency: p.currency,
+            recurring: p.recurring || null,
+          };
+        } catch (e) {
+          priceCheck[k] = { error: String(e?.message || e) };
+        }
+      }
+
+      return res.json({
+        ok: true,
+        workspace: { id: ws.id, stripeCustomerId: ws.stripeCustomerId ?? null, stripeSubscriptionId: ws.stripeSubscriptionId ?? null },
+        subscriptionItems: items,
+        envPriceIds: env,
+        priceCheck,
+        lastCall: last
+          ? {
+              id: last.id,
+              endedAt: last.endedAt ?? null,
+              durationSec: last.durationSec ?? null,
+              to: last.to ?? null,
+              billing,
+            }
+          : null,
+      });
+    } catch (e) {
+      return res.status(400).json({ error: e instanceof Error ? e.message : "Stripe debug failed" });
+    }
+  });
+
   // Fix identity mismatch: force link this workspace's OpenMeter customer to the provided Stripe customer id.
   // This is needed if duplicate Stripe customers were created and OpenMeter linked the "wrong" one.
   r.post("/link-stripe-customer", async (req, res) => {

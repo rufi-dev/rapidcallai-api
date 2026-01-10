@@ -1,6 +1,7 @@
 const { getBillingConfig } = require("./config");
 const { computeCallBillingQuantities, computeTrialDebitUsd } = require("./pricing");
 const { emitOpenMeterEvent } = require("./openmeter");
+const { getMeteredPriceIdsFromEnv, recordUsageForSubscription } = require("./stripe");
 
 function safeObj(x) {
   return x && typeof x === "object" ? x : {};
@@ -93,6 +94,9 @@ async function finalizeBillingForCall({ store, call }) {
     const prevEvents = safeObj(billingPrev.openmeterEvents);
     const nextEvents = { ...prevEvents };
 
+    const prevStripe = safeObj(billingPrev.stripeUsage);
+    const nextStripe = { ...prevStripe };
+
     async function sendIfNeeded({ type, data, required }) {
       const prev = safeObj(prevEvents[type]);
       if (prev.sentAt) {
@@ -155,6 +159,44 @@ async function finalizeBillingForCall({ store, call }) {
       });
     }
 
+    // --- Paid: ALSO record usage to Stripe (so Stripe upcoming invoices show usage)
+    // This is separate from OpenMeter and is safe as long as you do NOT also invoice via OpenMeter->Stripe sync.
+    try {
+      if (ws.stripeSubscriptionId) {
+        const priceIds = getMeteredPriceIdsFromEnv();
+        const usageByPriceId = {};
+
+        // Stripe usage records require integer quantities. We round UP to avoid underbilling.
+        const baseMin = Math.ceil(Number(q.billedMinutes || 0));
+        const upgradeMin = Math.ceil(Number(q.modelUpgradeMinutes || 0));
+        const telMin = Math.ceil(Number(q.telephonyMinutes || 0));
+        const tok1k = Math.ceil(Number(q.tokenOverage1k || 0));
+
+        if (baseMin > 0 && priceIds.baseMinutes) usageByPriceId[priceIds.baseMinutes] = baseMin;
+        if (upgradeMin > 0 && priceIds.modelUpgradeMinutes) usageByPriceId[priceIds.modelUpgradeMinutes] = upgradeMin;
+        if (telMin > 0 && priceIds.telephonyMinutes) usageByPriceId[priceIds.telephonyMinutes] = telMin;
+        if (tok1k > 0 && priceIds.tokenOverage) usageByPriceId[priceIds.tokenOverage] = tok1k;
+
+        // Idempotency per call+price. Only mark sentAt if at least one usage record succeeded.
+        const alreadySent = Boolean(nextStripe?.sentAt);
+        if (!alreadySent && Object.keys(usageByPriceId).length > 0) {
+          const ts = Math.floor(Number(call.endedAt || Date.now()) / 1000);
+          const r = await recordUsageForSubscription({
+            subscriptionId: ws.stripeSubscriptionId,
+            usageByPriceId,
+            timestampSec: ts,
+            idempotencyKeyPrefix: `call:${call.id}`,
+          });
+          nextStripe.results = r;
+          const anyOk = Object.values(r || {}).some((x) => Boolean(x?.ok));
+          nextStripe.sentAt = anyOk ? Date.now() : null;
+        }
+      }
+    } catch (e) {
+      nextStripe.error = String(e?.message || e);
+      nextStripe.sentAt = null;
+    }
+
     const requiredTypes = Object.entries(nextEvents)
       .filter(([, v]) => Boolean(v?.required))
       .map(([k]) => k);
@@ -172,6 +214,7 @@ async function finalizeBillingForCall({ store, call }) {
           openmeterEvents: nextEvents,
           openmeterLastAttemptAt: Date.now(),
           openmeterSentAt: allRequiredSent ? Date.now() : null,
+          stripeUsage: nextStripe,
         },
       },
     });

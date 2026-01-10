@@ -177,6 +177,50 @@ async function getUpcomingInvoice({ customerId, subscriptionId }) {
   return inv;
 }
 
+async function getSubscriptionItemIdByPriceId({ subscriptionId, priceId }) {
+  const s = getStripe();
+  if (!s) throw new Error("Stripe not configured (STRIPE_SECRET_KEY missing)");
+  if (!subscriptionId || !priceId) return null;
+
+  const sub = await s.subscriptions.retrieve(subscriptionId, { expand: ["items.data.price"] });
+  const item = (sub.items?.data || []).find((it) => it.price?.id === priceId) || null;
+  return item?.id ?? null;
+}
+
+async function recordUsageForSubscription({ subscriptionId, usageByPriceId, timestampSec, idempotencyKeyPrefix }) {
+  const s = getStripe();
+  if (!s) throw new Error("Stripe not configured (STRIPE_SECRET_KEY missing)");
+  if (!subscriptionId) throw new Error("subscriptionId missing");
+
+  const results = {};
+  const ts = Number.isFinite(Number(timestampSec)) ? Number(timestampSec) : Math.floor(Date.now() / 1000);
+
+  for (const [priceId, qtyRaw] of Object.entries(usageByPriceId || {})) {
+    const quantity = Math.max(0, Math.floor(Number(qtyRaw || 0)));
+    if (!priceId || quantity <= 0) continue;
+
+    const itemId = await getSubscriptionItemIdByPriceId({ subscriptionId, priceId });
+    if (!itemId) {
+      results[priceId] = { ok: false, error: "subscription item not found for price" };
+      continue;
+    }
+
+    try {
+      const idempotencyKey = `${String(idempotencyKeyPrefix || "usage")}:${subscriptionId}:${priceId}`;
+      const r = await s.subscriptionItems.createUsageRecord(
+        itemId,
+        { quantity, timestamp: ts, action: "increment" },
+        { idempotencyKey }
+      );
+      results[priceId] = { ok: true, usageRecordId: r?.id ?? null, quantity };
+    } catch (e) {
+      results[priceId] = { ok: false, error: String(e?.message || e) };
+    }
+  }
+
+  return results;
+}
+
 module.exports = {
   getStripe,
   ensureStripeCustomerForWorkspace,
@@ -184,6 +228,8 @@ module.exports = {
   createSubscriptionForWorkspace,
   updatePhoneNumbersQuantity,
   getUpcomingInvoice,
+  getMeteredPriceIdsFromEnv,
+  recordUsageForSubscription,
 };
 
 
