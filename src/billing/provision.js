@@ -53,7 +53,12 @@ async function provisionBillingForWorkspace({ store, stripeBilling, workspace, u
       userEmail: user?.email,
     });
     if (om?.ok && om.customer) {
-      const omCustomerId = String(om.customer.id || "").trim() || null;
+      // Prefer storing the customer key (we use workspace.id as key); it's the most stable identifier across APIs.
+      const omCustomerId =
+        String(om.customer.key || "").trim() ||
+        String(om.customer.id || "").trim() ||
+        String(workspace.id || "").trim() ||
+        null;
       if (omCustomerId && !workspace.openmeterCustomerId) {
         await store.updateWorkspace(workspace.id, { openmeterCustomerId: omCustomerId });
       }

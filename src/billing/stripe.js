@@ -15,6 +15,29 @@ function getFirstClientOrigin() {
   return raw.split(",")[0].trim() || "http://localhost:5173";
 }
 
+async function findExistingStripeCustomerForWorkspace({ stripe, workspaceId }) {
+  const s = stripe;
+  const wsid = String(workspaceId || "").trim();
+  if (!s || !wsid) return null;
+  try {
+    // Fast + precise: uses Stripe Search API.
+    // https://docs.stripe.com/search
+    const q = `metadata['workspace_id']:'${wsid.replace(/'/g, "\\'")}'`;
+    const r = await s.customers.search({ query: q, limit: 1 });
+    const c = (r?.data || [])[0] || null;
+    return c?.id ? c : null;
+  } catch {
+    // If search is unavailable, fall back to list+filter (slower, but safe for small accounts).
+    try {
+      const r = await s.customers.list({ limit: 100 });
+      const c = (r?.data || []).find((x) => String(x?.metadata?.workspace_id || "") === wsid) || null;
+      return c?.id ? c : null;
+    } catch {
+      return null;
+    }
+  }
+}
+
 async function ensureStripeCustomerForWorkspace(ws) {
   const s = getStripe();
   if (!s) throw new Error("Stripe not configured (STRIPE_SECRET_KEY missing)");
@@ -35,11 +58,24 @@ async function ensureStripeCustomerForWorkspace(ws) {
     return { customerId: ws.stripeCustomerId, created: false };
   }
 
+  // Avoid duplicate customers if provisioning is triggered by multiple concurrent requests.
+  const found = await findExistingStripeCustomerForWorkspace({ stripe: s, workspaceId: ws.id });
+  if (found?.id) {
+    if (email && !found.email) {
+      try {
+        await s.customers.update(found.id, { email });
+      } catch {
+        // best-effort
+      }
+    }
+    return { customerId: found.id, created: false };
+  }
+
   const customer = await s.customers.create({
     name: ws.name || ws.id,
     ...(email ? { email } : {}),
     metadata: { workspace_id: ws.id },
-  });
+  }, { idempotencyKey: `workspace:${String(ws.id)}:stripe_customer` });
   return { customerId: customer.id, created: true };
 }
 

@@ -154,12 +154,34 @@ function createBillingRouter({ store, stripeBilling }) {
     if (!ws?.id) return res.status(401).json({ error: "Unauthorized" });
 
     try {
-      const customerKey = String(ws.openmeterCustomerId || ws.id);
-      const ent = await listOpenMeterCustomerEntitlements({
-        apiUrl: process.env.OPENMETER_API_URL,
-        apiKey: process.env.OPENMETER_API_KEY,
-        customerIdOrKey: customerKey,
-      });
+      const debug = String(req.query?.debug || "").trim() === "1";
+
+      // We create OpenMeter customers with key = workspace.id and usage subject = workspace.id.
+      // Some OpenMeter endpoints accept either id or key; to avoid mismatch we try both.
+      const attemptIds = Array.from(
+        new Set([String(ws.id), String(ws.openmeterCustomerId || "")].filter((x) => x && x.trim().length > 0))
+      );
+
+      let ent = null;
+      let usedCustomerId = null;
+      for (const cid of attemptIds) {
+        const r1 = await listOpenMeterCustomerEntitlements({
+          apiUrl: process.env.OPENMETER_API_URL,
+          apiKey: process.env.OPENMETER_API_KEY,
+          customerIdOrKey: cid,
+        });
+        if (r1?.ok) {
+          ent = r1;
+          usedCustomerId = cid;
+          break;
+        }
+        // preserve "skipped" early if OpenMeter isn't configured
+        if (r1?.skipped) {
+          ent = r1;
+          usedCustomerId = cid;
+          break;
+        }
+      }
 
       if (ent?.skipped) {
         return res.json({
@@ -171,6 +193,7 @@ function createBillingRouter({ store, stripeBilling }) {
           totalCents: 0,
           totalUsd: 0,
           lines: [],
+          ...(debug ? { debug: { usedCustomerId, attempted: attemptIds } } : {}),
         });
       }
 
@@ -192,7 +215,36 @@ function createBillingRouter({ store, stripeBilling }) {
         llm_token_overage_1k: { label: "LLM token overage", unit: "1k tokens", stripePriceEnv: "STRIPE_PRICE_ID_TOKEN_OVERAGE" },
       };
 
+      function extractUsageNumber(e) {
+        // Support multiple response shapes across OpenMeter versions.
+        const candidates = [
+          e?.usage,
+          e?.currentUsage,
+          e?.current_usage,
+          e?.currentPeriod?.usage,
+          e?.current_period?.usage,
+          e?.currentPeriod?.consumed,
+          e?.current_period?.consumed,
+          e?.measurements?.usage,
+          e?.metered?.usage,
+        ];
+        for (const v of candidates) {
+          const n = Number(v);
+          if (Number.isFinite(n)) return n;
+        }
+        // Sometimes usage is nested as { value: number }
+        const nested =
+          e?.usage?.value ??
+          e?.currentUsage?.value ??
+          e?.current_usage?.value ??
+          e?.currentPeriod?.usage?.value ??
+          e?.current_period?.usage?.value;
+        const n = Number(nested);
+        return Number.isFinite(n) ? n : 0;
+      }
+
       const usageByKey = {};
+      const seenKeys = [];
       for (const e of ent.entitlements || []) {
         const key =
           String(
@@ -204,8 +256,9 @@ function createBillingRouter({ store, stripeBilling }) {
               e?.id ??
               ""
           ) || "";
+        if (key) seenKeys.push(key);
         if (!key || !wanted[key]) continue;
-        const usage = Number(e?.usage ?? e?.currentUsage ?? e?.current_usage ?? 0) || 0;
+        const usage = extractUsageNumber(e);
         usageByKey[key] = usage;
       }
 
@@ -247,6 +300,17 @@ function createBillingRouter({ store, stripeBilling }) {
         totalCents,
         totalUsd: Math.round((totalCents / 100) * 100) / 100,
         lines,
+        ...(debug
+          ? {
+              debug: {
+                usedCustomerId,
+                attempted: attemptIds,
+                entitlementsCount: (ent.entitlements || []).length,
+                seenKeys: Array.from(new Set(seenKeys)).slice(0, 50),
+                stripeConfigured: Boolean(s),
+              },
+            }
+          : {}),
       });
     } catch (e) {
       return res.status(400).json({ error: e instanceof Error ? e.message : "Failed to load usage summary" });
