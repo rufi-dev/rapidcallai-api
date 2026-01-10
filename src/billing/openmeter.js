@@ -455,17 +455,19 @@ async function listOpenMeterInvoices({ apiUrl, apiKey, customerId, statuses = ["
   if (!auth) return { skipped: true, reason: "OPENMETER_API_KEY not set" };
   if (!customerId) return { ok: false, reason: "customerId missing" };
 
-  const qs = new URLSearchParams({
-    customers: String(customerId),
-    expand: "lines",
-    statuses: Array.isArray(statuses) ? statuses.join(",") : String(statuses),
-    page: "1",
-    pageSize: String(pageSize),
-    order: "DESC",
-    orderBy: "createdAt",
-  }).toString();
+  // IMPORTANT: OpenMeter expects `statuses` as a repeated query parameter (array),
+  // not a comma-separated string. (Comma-separated causes 400 validation errors.)
+  const qs = new URLSearchParams();
+  qs.set("customers", String(customerId));
+  qs.set("expand", "lines");
+  const statusList = Array.isArray(statuses) ? statuses : String(statuses).split(",").map((s) => s.trim()).filter(Boolean);
+  for (const st of statusList) qs.append("statuses", st);
+  qs.set("page", "1");
+  qs.set("pageSize", String(pageSize));
+  qs.set("order", "DESC");
+  qs.set("orderBy", "createdAt");
 
-  const endpoint = `${base}/api/v1/billing/invoices?${qs}`;
+  const endpoint = `${base}/api/v1/billing/invoices?${qs.toString()}`;
   const { status, text } = await requestJson(endpoint, { method: "GET", headers: auth });
   if (!(status >= 200 && status < 300)) return { ok: false, status, text, endpoint };
 

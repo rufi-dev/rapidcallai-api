@@ -4,12 +4,77 @@ const {
   getOpenMeterCustomer,
   getOpenMeterCustomerUpcomingInvoice,
   isUlid,
+  linkStripeCustomerToOpenMeterCustomer,
   listOpenMeterCustomerEntitlements,
   listOpenMeterInvoices,
 } = require("./openmeter");
 
 function createBillingRouter({ store, stripeBilling }) {
   const r = express.Router();
+
+  // Fix identity mismatch: force link this workspace's OpenMeter customer to the provided Stripe customer id.
+  // This is needed if duplicate Stripe customers were created and OpenMeter linked the "wrong" one.
+  r.post("/link-stripe-customer", async (req, res) => {
+    if (!store) return res.status(400).json({ error: "Billing requires Postgres mode" });
+    const ws = req.workspace;
+    if (!ws?.id) return res.status(401).json({ error: "Unauthorized" });
+
+    const stripeCustomerId = String(req.body?.stripeCustomerId || "").trim();
+    if (!stripeCustomerId.startsWith("cus_")) return res.status(400).json({ error: "Invalid stripeCustomerId" });
+
+    try {
+      const s = stripeBilling?.getStripe?.() || null;
+      if (!s) return res.status(400).json({ error: "Stripe not configured on server" });
+
+      // Verify the customer exists and tie it to this workspace id (metadata is used for safe lookup).
+      const cust = await s.customers.retrieve(stripeCustomerId);
+      if (!cust || ("deleted" in cust && cust.deleted)) return res.status(400).json({ error: "Stripe customer not found" });
+
+      const mdWorkspaceId = String(cust.metadata?.workspace_id || "").trim();
+      if (mdWorkspaceId && mdWorkspaceId !== ws.id) {
+        return res.status(400).json({
+          error: "Stripe customer belongs to a different workspace",
+          details: { stripeCustomerId, customerWorkspaceId: mdWorkspaceId, expectedWorkspaceId: ws.id },
+        });
+      }
+      if (!mdWorkspaceId) {
+        await s.customers.update(stripeCustomerId, { metadata: { ...(cust.metadata || {}), workspace_id: ws.id } });
+      }
+
+      // Persist canonical Stripe customer id in DB.
+      await store.updateWorkspace(ws.id, { stripeCustomerId });
+
+      // Link OpenMeter customer (key = workspace.id) to this Stripe customer id.
+      const omLink = await linkStripeCustomerToOpenMeterCustomer({
+        apiUrl: process.env.OPENMETER_API_URL,
+        apiKey: process.env.OPENMETER_API_KEY,
+        customerIdOrKey: ws.id,
+        stripeCustomerId,
+      });
+
+      if (omLink?.skipped) {
+        return res.json({ ok: true, stripeCustomerId, openmeter: { skipped: true, reason: omLink.reason } });
+      }
+      if (!omLink?.ok) {
+        return res.status(400).json({
+          error: "Failed to link OpenMeter customer to Stripe",
+          details: { status: omLink.status, text: omLink.text },
+        });
+      }
+
+      const updated = await store.getWorkspace(ws.id);
+      return res.json({
+        ok: true,
+        workspace: {
+          id: updated?.id,
+          stripeCustomerId: updated?.stripeCustomerId ?? null,
+          stripeSubscriptionId: updated?.stripeSubscriptionId ?? null,
+        },
+      });
+    } catch (e) {
+      return res.status(400).json({ error: e instanceof Error ? e.message : "Failed to link Stripe customer" });
+    }
+  });
 
   // Recovery endpoint: if a workspace is marked paid but missing its subscription, (re)create it.
   r.post("/ensure-subscription", async (req, res) => {
