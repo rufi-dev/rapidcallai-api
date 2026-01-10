@@ -390,25 +390,48 @@ function createBillingRouter({ store, stripeBilling }) {
       let invoiceFallback = null;
       let invoiceAttemptDebug = null;
       if (noUsageData) {
-        // Try both identifiers (key vs id) like above.
+        // IMPORTANT: OpenMeter Cloud invoice listing expects the CUSTOMER ID (ULID), not the customer key.
+        // We store `openmeterCustomerId` as either key or id depending on history/migrations,
+        // so resolve to id when necessary.
+        const resolvedInvoiceCustomerIds = [];
         for (const cid of attemptIds) {
-          const inv = await getOpenMeterCustomerUpcomingInvoice({
+          if (isUlid(cid)) {
+            resolvedInvoiceCustomerIds.push({ input: cid, customerId: cid, resolvedFrom: cid });
+            continue;
+          }
+          const c = await getOpenMeterCustomer({
             apiUrl: process.env.OPENMETER_API_URL,
             apiKey: process.env.OPENMETER_API_KEY,
             customerIdOrKey: cid,
           });
+          const gotId = c?.ok && c.customer?.id ? String(c.customer.id) : null;
+          if (gotId) resolvedInvoiceCustomerIds.push({ input: cid, customerId: gotId, resolvedFrom: cid });
+        }
+
+        // Try resolved ULIDs first; if none, fall back to raw ids list (best-effort).
+        const invoiceCustomerIdsToTry =
+          resolvedInvoiceCustomerIds.length > 0
+            ? resolvedInvoiceCustomerIds.map((x) => x.customerId)
+            : attemptIds;
+
+        for (const customerId of invoiceCustomerIdsToTry) {
+          const inv = await getOpenMeterCustomerUpcomingInvoice({
+            apiUrl: process.env.OPENMETER_API_URL,
+            apiKey: process.env.OPENMETER_API_KEY,
+            customerIdOrKey: customerId,
+          });
           if (inv?.ok) {
-            invoiceFallback = { ...inv, usedCustomerId: cid };
+            invoiceFallback = { ...inv, usedCustomerId: customerId };
             break;
           }
           if (inv?.skipped) {
-            invoiceFallback = { ...inv, usedCustomerId: cid };
+            invoiceFallback = { ...inv, usedCustomerId: customerId };
             break;
           }
           if (debug && inv && !inv.ok) {
             invoiceAttemptDebug = invoiceAttemptDebug || [];
             invoiceAttemptDebug.push({
-              customerIdOrKey: cid,
+              customerIdOrKey: customerId,
               status: inv.status ?? null,
               endpoint: inv.endpoint ?? null,
               attemptResults: inv.attemptResults ?? null,
