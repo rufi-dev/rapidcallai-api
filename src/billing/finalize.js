@@ -166,11 +166,12 @@ async function finalizeBillingForCall({ store, call }) {
         const priceIds = getMeteredPriceIdsFromEnv();
         const usageByPriceId = {};
 
-        // Stripe usage records require integer quantities. We round UP to avoid underbilling.
-        const baseMin = Math.ceil(Number(q.billedMinutes || 0));
-        const upgradeMin = Math.ceil(Number(q.modelUpgradeMinutes || 0));
-        const telMin = Math.ceil(Number(q.telephonyMinutes || 0));
-        const tok1k = Math.ceil(Number(q.tokenOverage1k || 0));
+        // Stripe Billing Meter Events accept numeric values. We send fractional units so short calls
+        // don't jump to whole minutes.
+        const baseMin = Number(q.billedMinutes || 0);
+        const upgradeMin = Number(q.modelUpgradeMinutes || 0);
+        const telMin = Number(q.telephonyMinutes || 0);
+        const tok1k = Number(q.tokenOverage1k || 0);
 
         if (baseMin > 0 && priceIds.baseMinutes) usageByPriceId[priceIds.baseMinutes] = baseMin;
         if (upgradeMin > 0 && priceIds.modelUpgradeMinutes) usageByPriceId[priceIds.modelUpgradeMinutes] = upgradeMin;

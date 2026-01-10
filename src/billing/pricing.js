@@ -2,8 +2,11 @@ const { getBillingConfig } = require("./config");
 
 function billedMinutesFromDurationSec(durationSec) {
   const sec = Number(durationSec || 0);
-  if (!Number.isFinite(sec) || sec <= 0) return 1;
-  return Math.max(1, Math.ceil(sec / 60));
+  // Bill per-second (fractional minutes) instead of rounding up to whole minutes.
+  // This matches "Retell-like" transparency and avoids big jumps for short calls.
+  if (!Number.isFinite(sec) || sec <= 0) return 0;
+  // durationSec is an integer (rounded in src/index.js), so minimum non-zero is 1 second.
+  return round6(Math.max(1 / 60, sec / 60));
 }
 
 function round6(n) {
@@ -11,11 +14,31 @@ function round6(n) {
 }
 
 function getModelSurchargeUsdPerMin(llmModel, cfg) {
-  const model = String(llmModel || "").trim();
+  const raw = String(llmModel || "").trim();
+  const model = raw;
   if (!model) return 0;
-  if (model === cfg.defaultLlmModel) return 0;
+
+  const def = String(cfg.defaultLlmModel || "").trim();
+  if (def && model === def) return 0;
+
   const table = cfg.llmSurchargeUsdPerMinByModel || {};
-  const v = Number(table[model] ?? 0);
+
+  // Be forgiving about model naming differences (e.g. "gpt5.2" vs "gpt-5.2").
+  const normalize = (s) =>
+    String(s || "")
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/g, "")
+      .replace(/[_/]/g, "-")
+      .replace(/[^a-z0-9.\-]/g, "");
+
+  const keys = Object.keys(table || {});
+  const direct = table[model];
+  const directLower = table[model.toLowerCase?.()];
+  const normalized = normalize(model);
+  const matchKey = keys.find((k) => normalize(k) === normalized) || null;
+
+  const v = Number(direct ?? directLower ?? (matchKey ? table[matchKey] : 0) ?? 0);
   return Number.isFinite(v) && v > 0 ? v : 0;
 }
 

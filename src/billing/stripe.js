@@ -324,7 +324,8 @@ async function recordMeterEventsForWorkspace({ customerId, usageByPriceId, times
   const ts = Number.isFinite(Number(timestampSec)) ? Number(timestampSec) : Math.floor(Date.now() / 1000);
 
   for (const [priceId, qtyRaw] of Object.entries(usageByPriceId || {})) {
-    const quantity = Math.max(0, Math.floor(Number(qtyRaw || 0)));
+    const q = Number(qtyRaw || 0);
+    const quantity = Number.isFinite(q) ? Math.max(0, q) : 0;
     if (!priceId || quantity <= 0) continue;
 
     let meterId = null;

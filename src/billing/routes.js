@@ -25,7 +25,8 @@ function createBillingRouter({ store, stripeBilling }) {
     if (!ws.stripeSubscriptionId) return res.status(400).json({ error: "Stripe subscription not configured" });
 
     const priceKey = String(req.body?.priceKey || "baseMinutes").trim();
-    const qty = Math.max(0, Math.floor(Number(req.body?.quantity ?? 1)));
+    const q = Number(req.body?.quantity ?? 1);
+    const qty = Number.isFinite(q) ? Math.max(0, q) : 0;
 
     const ids = getMeteredPriceIdsFromEnv();
     const priceId = ids[priceKey] || null;
