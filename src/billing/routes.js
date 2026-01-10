@@ -4,6 +4,49 @@ const { getBillingConfig } = require("./config");
 function createBillingRouter({ store, stripeBilling }) {
   const r = express.Router();
 
+  // Recovery endpoint: if a workspace is marked paid but missing its subscription, (re)create it.
+  r.post("/ensure-subscription", async (req, res) => {
+    if (!store) return res.status(400).json({ error: "Billing requires Postgres mode" });
+    const ws = req.workspace;
+    if (!ws?.id) return res.status(401).json({ error: "Unauthorized" });
+    if (!ws.isPaid) return res.status(402).json({ error: "Upgrade required" });
+
+    try {
+      // Ensure customer exists
+      const { customerId } = await stripeBilling.ensureStripeCustomerForWorkspace(ws);
+      if (!ws.stripeCustomerId) await store.updateWorkspace(ws.id, { stripeCustomerId: customerId });
+
+      // Ensure subscription exists
+      const latest = await store.getWorkspace(ws.id);
+      if (!latest) return res.status(404).json({ error: "Workspace not found" });
+      if (!latest.stripeSubscriptionId) {
+        const phoneNumbers = await store.listPhoneNumbers(ws.id);
+        const sub = await stripeBilling.createSubscriptionForWorkspace({
+          workspaceId: ws.id,
+          customerId: latest.stripeCustomerId || customerId,
+          phoneNumbersCount: phoneNumbers.length,
+        });
+        await store.updateWorkspace(ws.id, {
+          stripeSubscriptionId: sub.subscriptionId,
+          stripePhoneNumbersItemId: sub.phoneNumbersItemId,
+        });
+      }
+
+      const updated = await store.getWorkspace(ws.id);
+      return res.json({
+        ok: true,
+        workspace: {
+          id: updated?.id,
+          stripeCustomerId: updated?.stripeCustomerId ?? null,
+          stripeSubscriptionId: updated?.stripeSubscriptionId ?? null,
+          stripePhoneNumbersItemId: updated?.stripePhoneNumbersItemId ?? null,
+        },
+      });
+    } catch (e) {
+      return res.status(400).json({ error: e instanceof Error ? e.message : "Failed to configure subscription" });
+    }
+  });
+
   r.get("/status", async (req, res) => {
     const cfg = getBillingConfig();
     const ws = req.workspace;
@@ -19,6 +62,10 @@ function createBillingRouter({ store, stripeBilling }) {
       isPaid: Boolean(ws.isPaid),
       hasPaymentMethod: Boolean(ws.hasPaymentMethod),
       telephonyEnabled: Boolean(ws.telephonyEnabled),
+        stripe: {
+          customerId: ws.stripeCustomerId ?? null,
+          subscriptionId: ws.stripeSubscriptionId ?? null,
+        },
       trial: {
         creditUsd: Math.max(0, Math.round(trialCreditUsd * 100) / 100),
         approxMinutesRemaining,
