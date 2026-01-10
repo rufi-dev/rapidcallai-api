@@ -1,5 +1,6 @@
 const express = require("express");
 const { getBillingConfig } = require("./config");
+const { getMeteredPriceIdsFromEnv, recordUsageForSubscription } = require("./stripe");
 const {
   getOpenMeterCustomer,
   getOpenMeterCustomerUpcomingInvoice,
@@ -13,6 +14,35 @@ const {
 
 function createBillingRouter({ store, stripeBilling }) {
   const r = express.Router();
+
+  // Debug: manually record a small usage increment into Stripe (to verify Stripe usage record pipeline).
+  // Only works for paid workspaces with a Stripe subscription.
+  r.post("/stripe-test-usage", async (req, res) => {
+    if (!store) return res.status(400).json({ error: "Billing requires Postgres mode" });
+    const ws = req.workspace;
+    if (!ws?.id) return res.status(401).json({ error: "Unauthorized" });
+    if (!ws.isPaid) return res.status(402).json({ error: "Upgrade required" });
+    if (!ws.stripeSubscriptionId) return res.status(400).json({ error: "Stripe subscription not configured" });
+
+    const priceKey = String(req.body?.priceKey || "baseMinutes").trim();
+    const qty = Math.max(0, Math.floor(Number(req.body?.quantity ?? 1)));
+
+    const ids = getMeteredPriceIdsFromEnv();
+    const priceId = ids[priceKey] || null;
+    if (!priceId) return res.status(400).json({ error: `Unknown priceKey or missing env for ${priceKey}` });
+
+    try {
+      const r1 = await recordUsageForSubscription({
+        subscriptionId: ws.stripeSubscriptionId,
+        usageByPriceId: { [priceId]: qty },
+        timestampSec: Math.floor(Date.now() / 1000),
+        idempotencyKeyPrefix: `debug:${ws.id}:${Date.now()}`,
+      });
+      return res.json({ ok: true, priceKey, priceId, quantity: qty, result: r1 });
+    } catch (e) {
+      return res.status(400).json({ error: e instanceof Error ? e.message : "Failed to record test usage" });
+    }
+  });
 
   // Debug why Stripe isn't showing usage for metered items.
   r.get("/stripe-usage-debug", async (req, res) => {
