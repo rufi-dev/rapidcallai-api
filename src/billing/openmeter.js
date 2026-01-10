@@ -409,6 +409,10 @@ function parseInvoiceSummary(inv) {
   const periodToMs = parseTimeToMs(inv.period?.to ?? inv.period?.end) ?? null;
   const totalCents = extractInvoiceTotalCents(inv);
   const url = inv.url ?? inv.pdfUrl ?? inv.hostedInvoiceUrl ?? null;
+  const externalIds = inv.externalIds ?? inv.external_ids ?? null;
+  const validationIssues = inv.validationIssues ?? inv.validation_issues ?? null;
+  const statusDetails = inv.statusDetails ?? inv.status_details ?? null;
+  const workflow = inv.workflow ?? null;
   return {
     id,
     number,
@@ -421,6 +425,11 @@ function parseInvoiceSummary(inv) {
     totalCents: totalCents == null ? null : Number(totalCents),
     totalUsd: totalCents == null ? null : Math.round((Number(totalCents) / 100) * 100) / 100,
     url: url ? String(url) : null,
+    // Debugging + Stripe sync visibility:
+    externalIds,
+    statusDetails,
+    validationIssues,
+    workflow,
   };
 }
 
@@ -444,6 +453,7 @@ function parseInvoiceLines(inv) {
       amountCents: amountCents == null ? null : parseDecimalToCents(amountCents),
       amountUsd: amountCents == null ? null : Math.round((parseDecimalToCents(amountCents) / 100) * 100) / 100,
       details,
+      externalIds: l?.externalIds ?? l?.external_ids ?? null,
     };
   });
 }
