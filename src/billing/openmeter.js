@@ -61,6 +61,47 @@ function safeJsonParse(text) {
   }
 }
 
+function normalizeEntitlementsPayload(payload) {
+  // Support multiple shapes depending on OpenMeter deployment/version
+  if (!payload) return [];
+  if (Array.isArray(payload)) return payload;
+  if (Array.isArray(payload?.items)) return payload.items;
+  if (Array.isArray(payload?.data)) return payload.data;
+  if (Array.isArray(payload?.entitlements)) return payload.entitlements;
+  return [];
+}
+
+function parseTimeToMs(v) {
+  if (v == null) return null;
+  if (typeof v === "number") {
+    // heuristics: seconds vs ms
+    if (v > 10_000_000_000) return v; // ms
+    return v * 1000; // seconds
+  }
+  const s = String(v).trim();
+  if (!s) return null;
+  const asNum = Number(s);
+  if (!Number.isNaN(asNum)) return parseTimeToMs(asNum);
+  const ms = Date.parse(s);
+  return Number.isNaN(ms) ? null : ms;
+}
+
+function extractCurrentPeriodMs(entitlements) {
+  for (const e of entitlements || []) {
+    const cp = e?.currentPeriod || e?.period || e?.current_period || null;
+    if (cp) {
+      const start = parseTimeToMs(cp.start ?? cp.from ?? cp.begin ?? cp.startsAt ?? cp.starts_at);
+      const end = parseTimeToMs(cp.end ?? cp.to ?? cp.finish ?? cp.endsAt ?? cp.ends_at);
+      if (start || end) return { start, end };
+    }
+    // fallbacks
+    const start = parseTimeToMs(e?.currentPeriodStart ?? e?.current_period_start);
+    const end = parseTimeToMs(e?.currentPeriodEnd ?? e?.current_period_end);
+    if (start || end) return { start, end };
+  }
+  return { start: null, end: null };
+}
+
 async function emitOpenMeterEvent({ apiUrl, apiKey, source, event }) {
   const base = String(apiUrl || "").trim().replace(/\/+$/, "");
   if (!base) return { skipped: true, reason: "OPENMETER_API_URL not set" };
@@ -183,11 +224,41 @@ async function grantOpenMeterEntitlement({ apiUrl, apiKey, customerIdOrKey, enti
   return { ok: false, status, text };
 }
 
+async function listOpenMeterCustomerEntitlements({ apiUrl, apiKey, customerIdOrKey }) {
+  const base = normalizeBaseUrl(apiUrl);
+  if (!base) return { skipped: true, reason: "OPENMETER_API_URL not set" };
+  const auth = normalizeAuth(apiKey);
+  if (!auth) return { skipped: true, reason: "OPENMETER_API_KEY not set" };
+  if (!customerIdOrKey) return { ok: false, reason: "customerIdOrKey missing" };
+
+  // OpenMeter has had a few API shapes across versions; try a couple of likely endpoints.
+  const attempts = [
+    `${base}/api/v2/customers/${encodeURIComponent(String(customerIdOrKey))}/entitlements`,
+    `${base}/api/v1/billing/customers/${encodeURIComponent(String(customerIdOrKey))}/entitlements`,
+    `${base}/api/v1/customers/${encodeURIComponent(String(customerIdOrKey))}/entitlements`,
+  ];
+
+  let last = null;
+  for (const endpoint of attempts) {
+    const { status, text } = await requestJson(endpoint, { method: "GET", headers: auth });
+    if (status >= 200 && status < 300) {
+      const payload = safeJsonParse(text);
+      const entitlements = normalizeEntitlementsPayload(payload);
+      const period = extractCurrentPeriodMs(entitlements);
+      return { ok: true, entitlements, period };
+    }
+    last = { status, text, endpoint };
+  }
+
+  return { ok: false, status: last?.status || 0, text: last?.text || "Failed to load entitlements", endpoint: last?.endpoint };
+}
+
 module.exports = {
   emitOpenMeterEvent,
   ensureOpenMeterCustomerForWorkspace,
   linkStripeCustomerToOpenMeterCustomer,
   grantOpenMeterEntitlement,
+  listOpenMeterCustomerEntitlements,
 };
 
 

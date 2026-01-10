@@ -1,5 +1,6 @@
 const express = require("express");
 const { getBillingConfig } = require("./config");
+const { listOpenMeterCustomerEntitlements } = require("./openmeter");
 
 function createBillingRouter({ store, stripeBilling }) {
   const r = express.Router();
@@ -138,6 +139,111 @@ function createBillingRouter({ store, stripeBilling }) {
       });
     } catch (e) {
       return res.status(400).json({ error: e instanceof Error ? e.message : "Failed to load upcoming invoice" });
+    }
+  });
+
+  // Retell-style: show "this month so far" usage directly from OpenMeter (Stripe upcoming invoice previews are confusing).
+  r.get("/usage-summary", async (req, res) => {
+    const ws = req.workspace;
+    if (!ws?.id) return res.status(401).json({ error: "Unauthorized" });
+
+    try {
+      const customerKey = String(ws.openmeterCustomerId || ws.id);
+      const ent = await listOpenMeterCustomerEntitlements({
+        apiUrl: process.env.OPENMETER_API_URL,
+        apiKey: process.env.OPENMETER_API_KEY,
+        customerIdOrKey: customerKey,
+      });
+
+      if (ent?.skipped) {
+        return res.json({
+          ok: true,
+          skipped: true,
+          reason: ent.reason,
+          periodStartMs: null,
+          periodEndMs: null,
+          totalCents: 0,
+          totalUsd: 0,
+          lines: [],
+        });
+      }
+
+      if (!ent?.ok) {
+        return res.status(400).json({
+          error: "Failed to load OpenMeter usage",
+          details: { status: ent.status, text: ent.text, endpoint: ent.endpoint },
+        });
+      }
+
+      const wanted = {
+        voice_base_minutes: { label: "Base voice minutes", unit: "min", stripePriceEnv: "STRIPE_PRICE_ID_BASE_MINUTES" },
+        voice_model_upgrade_minutes: {
+          label: "Model upgrade minutes",
+          unit: "min",
+          stripePriceEnv: "STRIPE_PRICE_ID_MODEL_UPGRADE_MINUTES",
+        },
+        telephony_minutes: { label: "Telephony minutes", unit: "min", stripePriceEnv: "STRIPE_PRICE_ID_TELEPHONY_MINUTES" },
+        llm_token_overage_1k: { label: "LLM token overage", unit: "1k tokens", stripePriceEnv: "STRIPE_PRICE_ID_TOKEN_OVERAGE" },
+      };
+
+      const usageByKey = {};
+      for (const e of ent.entitlements || []) {
+        const key =
+          String(
+            e?.featureKey ??
+              e?.feature?.key ??
+              e?.feature?.id ??
+              e?.feature ??
+              e?.key ??
+              e?.id ??
+              ""
+          ) || "";
+        if (!key || !wanted[key]) continue;
+        const usage = Number(e?.usage ?? e?.currentUsage ?? e?.current_usage ?? 0) || 0;
+        usageByKey[key] = usage;
+      }
+
+      const s = stripeBilling?.getStripe?.() || null;
+      const priceCache = new Map();
+      async function getUnitAmountCents(priceId) {
+        const id = String(priceId || "").trim();
+        if (!id) return null;
+        if (priceCache.has(id)) return priceCache.get(id);
+        if (!s) return null;
+        const p = await s.prices.retrieve(id);
+        const cents = p?.unit_amount == null ? null : Number(p.unit_amount);
+        priceCache.set(id, cents);
+        return cents;
+      }
+
+      const lines = [];
+      for (const [k, meta] of Object.entries(wanted)) {
+        const quantity = Math.max(0, Number(usageByKey[k] || 0));
+        const priceId = String(process.env[meta.stripePriceEnv] || "").trim();
+        const unitAmountCents = await getUnitAmountCents(priceId);
+        const amountCents = unitAmountCents == null ? null : Math.round(quantity * unitAmountCents);
+        lines.push({
+          key: k,
+          description: meta.label,
+          unit: meta.unit,
+          quantity,
+          unitAmountCents,
+          amountCents,
+          priceId: priceId || null,
+        });
+      }
+
+      const totalCents = lines.reduce((a, l) => a + Number(l.amountCents || 0), 0);
+      return res.json({
+        ok: true,
+        periodStartMs: ent.period?.start ?? null,
+        periodEndMs: ent.period?.end ?? null,
+        totalCents,
+        totalUsd: Math.round((totalCents / 100) * 100) / 100,
+        lines,
+      });
+    } catch (e) {
+      return res.status(400).json({ error: e instanceof Error ? e.message : "Failed to load usage summary" });
     }
   });
 
