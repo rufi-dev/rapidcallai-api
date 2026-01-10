@@ -1,6 +1,6 @@
 const express = require("express");
 const { getBillingConfig } = require("./config");
-const { listOpenMeterCustomerEntitlements } = require("./openmeter");
+const { getOpenMeterCustomerUpcomingInvoice, listOpenMeterCustomerEntitlements } = require("./openmeter");
 
 function createBillingRouter({ store, stripeBilling }) {
   const r = express.Router();
@@ -310,6 +310,90 @@ function createBillingRouter({ store, stripeBilling }) {
           unitAmountCents,
           amountCents,
           priceId: priceId || null,
+        });
+      }
+
+      // If entitlements endpoint doesn't include usage fields (common in some OpenMeter versions),
+      // fall back to OpenMeter billing upcoming-invoice preview (matches OpenMeter UI "Invoicing" tab).
+      const noUsageData = Object.keys(wanted).every((k) => !Number(usageByKey[k] || 0));
+      let invoiceFallback = null;
+      if (noUsageData) {
+        // Try both identifiers (key vs id) like above.
+        for (const cid of attemptIds) {
+          const inv = await getOpenMeterCustomerUpcomingInvoice({
+            apiUrl: process.env.OPENMETER_API_URL,
+            apiKey: process.env.OPENMETER_API_KEY,
+            customerIdOrKey: cid,
+          });
+          if (inv?.ok) {
+            invoiceFallback = { ...inv, usedCustomerId: cid };
+            break;
+          }
+          if (inv?.skipped) {
+            invoiceFallback = { ...inv, usedCustomerId: cid };
+            break;
+          }
+        }
+      }
+
+      if (invoiceFallback?.ok) {
+        const omLines = [];
+        for (const raw of invoiceFallback.lines || []) {
+          const key = String(raw?.featureKey ?? raw?.key ?? raw?.id ?? raw?.meterKey ?? raw?.meter?.key ?? raw?.meter?.slug ?? "").trim();
+          const amountCents =
+            (raw?.amountCents != null ? Number(raw.amountCents) : null) ??
+            (raw?.amount_cents != null ? Number(raw.amount_cents) : null) ??
+            (raw?.amount != null ? Math.round(Number(raw.amount) * 100) : null) ??
+            (raw?.total != null ? Math.round(Number(raw.total) * 100) : null) ??
+            null;
+          // Try to extract quantity if present, but don't depend on it.
+          const quantityRaw = raw?.quantity ?? raw?.usage ?? raw?.units ?? raw?.consumed ?? raw?.value ?? null;
+          const quantity = quantityRaw == null ? null : Number(quantityRaw);
+          const desc = String(
+            raw?.name ??
+              raw?.description ??
+              raw?.title ??
+              raw?.featureName ??
+              raw?.feature?.name ??
+              (key || "Line item")
+          );
+          omLines.push({
+            key: key || null,
+            description: desc,
+            unit: "—",
+            quantity: Number.isFinite(quantity) ? quantity : null,
+            unitAmountCents: null,
+            amountCents: Number.isFinite(amountCents) ? amountCents : null,
+            priceId: null,
+            source: "openmeter_invoice",
+          });
+        }
+        const totalCents =
+          Number.isFinite(Number(invoiceFallback.totalCents)) && invoiceFallback.totalCents != null
+            ? Number(invoiceFallback.totalCents)
+            : omLines.reduce((a, l) => a + Number(l.amountCents || 0), 0);
+
+        return res.json({
+          ok: true,
+          periodStartMs: ent.period?.start ?? null,
+          periodEndMs: ent.period?.end ?? null,
+          totalCents,
+          totalUsd: Math.round((totalCents / 100) * 100) / 100,
+          lines: omLines,
+          ...(debug
+            ? {
+                debug: {
+                  usedCustomerId: invoiceFallback.usedCustomerId ?? usedCustomerId,
+                  attempted: attemptIds,
+                  openmeterEntitlementsEndpoint: ent.endpoint ?? null,
+                  openmeterInvoiceEndpoint: invoiceFallback.endpoint ?? null,
+                  entitlementsCount: (ent.entitlements || []).length,
+                  seenKeys: Array.from(new Set(seenKeys)).slice(0, 50),
+                  stripeConfigured: Boolean(s),
+                  sampleByKey,
+                },
+              }
+            : {}),
         });
       }
 

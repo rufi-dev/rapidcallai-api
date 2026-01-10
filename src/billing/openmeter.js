@@ -253,12 +253,105 @@ async function listOpenMeterCustomerEntitlements({ apiUrl, apiKey, customerIdOrK
   return { ok: false, status: last?.status || 0, text: last?.text || "Failed to load entitlements", endpoint: last?.endpoint };
 }
 
+function normalizeInvoiceLines(payload) {
+  if (!payload) return [];
+  const candidates = [
+    payload?.lines,
+    payload?.lineItems,
+    payload?.items,
+    payload?.invoice?.lines,
+    payload?.invoice?.lineItems,
+    payload?.invoice?.items,
+    payload?.data?.lines,
+    payload?.data?.lineItems,
+    payload?.data?.items,
+  ];
+  for (const c of candidates) {
+    if (Array.isArray(c)) return c;
+    if (Array.isArray(c?.data)) return c.data;
+    if (Array.isArray(c?.items)) return c.items;
+  }
+  return [];
+}
+
+function normalizeMoneyToCents(v) {
+  if (v == null) return null;
+  if (typeof v === "number") {
+    // Heuristic: if it's already integer cents, keep it; if it's a small float, assume dollars.
+    if (Number.isInteger(v)) return v;
+    return Math.round(v * 100);
+  }
+  const s = String(v).trim();
+  if (!s) return null;
+  const n = Number(s);
+  if (!Number.isFinite(n)) return null;
+  if (Number.isInteger(n)) return n;
+  return Math.round(n * 100);
+}
+
+function extractInvoiceTotalCents(payload) {
+  const candidates = [
+    payload?.totalCents,
+    payload?.total_cents,
+    payload?.total?.cents,
+    payload?.total?.amountCents,
+    payload?.total?.amount_cents,
+    payload?.total?.amount,
+    payload?.totalAmountCents,
+    payload?.total_amount_cents,
+    payload?.totalAmount,
+    payload?.total_amount,
+    payload?.invoice?.totalCents,
+    payload?.invoice?.total_cents,
+    payload?.invoice?.total?.amount,
+    payload?.invoice?.total?.amountCents,
+    payload?.invoice?.totalAmount,
+  ];
+  for (const v of candidates) {
+    const cents = normalizeMoneyToCents(v);
+    if (cents != null) return cents;
+  }
+  return null;
+}
+
+async function getOpenMeterCustomerUpcomingInvoice({ apiUrl, apiKey, customerIdOrKey }) {
+  const base = normalizeBaseUrl(apiUrl);
+  if (!base) return { skipped: true, reason: "OPENMETER_API_URL not set" };
+  const auth = normalizeAuth(apiKey);
+  if (!auth) return { skipped: true, reason: "OPENMETER_API_KEY not set" };
+  if (!customerIdOrKey) return { ok: false, reason: "customerIdOrKey missing" };
+
+  // Try a few endpoints (OpenMeter has multiple variants across versions/deployments).
+  const cid = encodeURIComponent(String(customerIdOrKey));
+  const attempts = [
+    `${base}/api/v1/billing/customers/${cid}/invoices/upcoming`,
+    `${base}/api/v1/billing/customers/${cid}/invoices/preview`,
+    `${base}/api/v1/billing/customers/${cid}/upcoming-invoice`,
+    `${base}/api/v1/billing/customers/${cid}/upcoming`,
+  ];
+
+  let last = null;
+  for (const endpoint of attempts) {
+    const { status, text } = await requestJson(endpoint, { method: "GET", headers: auth });
+    if (status >= 200 && status < 300) {
+      const payload = safeJsonParse(text) || {};
+      const lines = normalizeInvoiceLines(payload);
+      const totalCents = extractInvoiceTotalCents(payload);
+      return { ok: true, invoice: payload, lines, totalCents, endpoint };
+    }
+    last = { status, text, endpoint };
+  }
+
+  return { ok: false, status: last?.status || 0, text: last?.text || "Failed to load upcoming invoice", endpoint: last?.endpoint };
+}
+
 module.exports = {
   emitOpenMeterEvent,
   ensureOpenMeterCustomerForWorkspace,
   linkStripeCustomerToOpenMeterCustomer,
   grantOpenMeterEntitlement,
   listOpenMeterCustomerEntitlements,
+  getOpenMeterCustomerUpcomingInvoice,
 };
 
 
