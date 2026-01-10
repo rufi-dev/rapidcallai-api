@@ -245,7 +245,7 @@ async function listOpenMeterCustomerEntitlements({ apiUrl, apiKey, customerIdOrK
       const payload = safeJsonParse(text);
       const entitlements = normalizeEntitlementsPayload(payload);
       const period = extractCurrentPeriodMs(entitlements);
-      return { ok: true, entitlements, period };
+      return { ok: true, entitlements, period, endpoint };
     }
     last = { status, text, endpoint };
   }

@@ -245,6 +245,7 @@ function createBillingRouter({ store, stripeBilling }) {
 
       const usageByKey = {};
       const seenKeys = [];
+      const sampleByKey = {};
       for (const e of ent.entitlements || []) {
         const key =
           String(
@@ -260,6 +261,26 @@ function createBillingRouter({ store, stripeBilling }) {
         if (!key || !wanted[key]) continue;
         const usage = extractUsageNumber(e);
         usageByKey[key] = usage;
+
+        // Capture a small sample of the raw entitlement shape for debugging (to fix parsing differences).
+        if (debug && !sampleByKey[key]) {
+          sampleByKey[key] = {
+            featureKey: e?.featureKey ?? null,
+            feature: e?.feature ?? null,
+            key: e?.key ?? null,
+            id: e?.id ?? null,
+            usage: e?.usage ?? null,
+            currentUsage: e?.currentUsage ?? null,
+            current_usage: e?.current_usage ?? null,
+            currentPeriod: e?.currentPeriod ?? null,
+            current_period: e?.current_period ?? null,
+            measurements: e?.measurements ?? null,
+            metered: e?.metered ?? null,
+            balance: e?.balance ?? null,
+            overage: e?.overage ?? null,
+            access: e?.access ?? null,
+          };
+        }
       }
 
       const s = stripeBilling?.getStripe?.() || null;
@@ -307,7 +328,9 @@ function createBillingRouter({ store, stripeBilling }) {
                 attempted: attemptIds,
                 entitlementsCount: (ent.entitlements || []).length,
                 seenKeys: Array.from(new Set(seenKeys)).slice(0, 50),
+                openmeterEndpoint: ent.endpoint ?? null,
                 stripeConfigured: Boolean(s),
+                sampleByKey,
               },
             }
           : {}),
