@@ -87,6 +87,10 @@ async function createStripeMeterEvent({ customerId, meterId, value, timestampSec
 
   const body = {
     event_name: eventName,
+    // Stripe expects the customer to be passed in the payload under a specific key.
+    // Error seen: "pass the customer ID in the event payload with key \"stripe_customer_id\"."
+    "payload[stripe_customer_id]": customer,
+    // Keep the generic key as well (harmless if ignored) for forward/backward compatibility.
     "payload[customer]": customer,
     "payload[value]": String(value),
     ...(timestampSec ? { timestamp: String(timestampSec) } : {}),
