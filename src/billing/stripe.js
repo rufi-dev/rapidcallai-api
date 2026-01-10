@@ -72,18 +72,36 @@ async function createSubscriptionForWorkspace({ workspaceId, customerId, phoneNu
   const ids = getMeteredPriceIdsFromEnv();
   assertStripePriceIds(ids);
 
-  const sub = await s.subscriptions.create({
-    customer: customerId,
-    collection_method: "charge_automatically",
-    items: [
-      { price: ids.baseMinutes },
-      { price: ids.modelUpgradeMinutes },
-      { price: ids.tokenOverage },
-      { price: ids.telephonyMinutes },
-      { price: ids.phoneNumberMonthly, quantity: Math.max(0, Number(phoneNumbersCount || 0)) },
-    ],
-    metadata: { workspace_id: String(workspaceId || "") },
-  });
+  let sub = null;
+  try {
+    sub = await s.subscriptions.create({
+      customer: customerId,
+      collection_method: "charge_automatically",
+      items: [
+        { price: ids.baseMinutes },
+        { price: ids.modelUpgradeMinutes },
+        { price: ids.tokenOverage },
+        { price: ids.telephonyMinutes },
+        { price: ids.phoneNumberMonthly, quantity: Math.max(0, Number(phoneNumbersCount || 0)) },
+      ],
+      metadata: { workspace_id: String(workspaceId || "") },
+    });
+  } catch (e) {
+    const msg = String(e?.message || "");
+    if (msg.includes("No such price")) {
+      const key = String(process.env.STRIPE_SECRET_KEY || "").trim();
+      const mode = key.startsWith("sk_live_") ? "LIVE" : key.startsWith("sk_test_") ? "TEST" : "UNKNOWN";
+      throw new Error(
+        [
+          msg,
+          "",
+          `Hint: your API is using a ${mode} Stripe secret key, but the price ID you configured may belong to a different Stripe mode/account.`,
+          `Fix: copy the price IDs from the same Stripe dashboard mode (Test vs Live) as your STRIPE_SECRET_KEY, then restart the API container.`,
+        ].join("\n")
+      );
+    }
+    throw e;
+  }
 
   const phoneItem = (sub.items?.data || []).find((it) => it.price?.id === ids.phoneNumberMonthly) || null;
 

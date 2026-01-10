@@ -117,15 +117,22 @@ function createBillingRouter({ store, stripeBilling }) {
         quantity: l.quantity == null ? null : Number(l.quantity),
         unitAmountCents: l.price?.unit_amount == null ? null : Number(l.price.unit_amount),
         priceId: l.price?.id ?? null,
+        proration: Boolean(l.proration),
         periodStart: l.period?.start ? Number(l.period.start) * 1000 : null,
         periodEnd: l.period?.end ? Number(l.period.end) * 1000 : null,
       }));
 
       const sumCents = lines.reduce((a, x) => a + Number(x.amountCents || 0), 0);
+      const dueNowCents = lines.filter((l) => l.proration).reduce((a, x) => a + Number(x.amountCents || 0), 0);
+      const nextInvoiceCents = totalCents;
       return res.json({
         currency,
         totalCents,
         totalUsd: Math.round((totalCents / 100) * 100) / 100,
+        dueNowCents,
+        dueNowUsd: Math.round((dueNowCents / 100) * 100) / 100,
+        nextInvoiceCents,
+        nextInvoiceUsd: Math.round((nextInvoiceCents / 100) * 100) / 100,
         lines,
         sums: { linesCents: sumCents, matchesTotal: sumCents === totalCents },
       });
