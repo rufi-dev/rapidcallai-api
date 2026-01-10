@@ -29,7 +29,10 @@ async function provisionBillingForWorkspace({ store, stripeBilling, workspace, u
   let stripeCustomerId = workspace.stripeCustomerId ?? null;
   try {
     if (!stripeCustomerId) {
-      const res = await stripeBilling.ensureStripeCustomerForWorkspace(workspace);
+      const res = await stripeBilling.ensureStripeCustomerForWorkspace({
+        ...workspace,
+        userEmail: user?.email,
+      });
       stripeCustomerId = res?.customerId ?? null;
       if (stripeCustomerId) {
         await store.updateWorkspace(workspace.id, { stripeCustomerId });

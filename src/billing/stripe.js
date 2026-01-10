@@ -18,10 +18,26 @@ function getFirstClientOrigin() {
 async function ensureStripeCustomerForWorkspace(ws) {
   const s = getStripe();
   if (!s) throw new Error("Stripe not configured (STRIPE_SECRET_KEY missing)");
-  if (ws.stripeCustomerId) return { customerId: ws.stripeCustomerId, created: false };
+  const email = String(ws?.userEmail || "").trim();
+
+  // If customer already exists, best-effort ensure email is set (helps user find it in Stripe UI).
+  if (ws.stripeCustomerId) {
+    if (email) {
+      try {
+        const existing = await s.customers.retrieve(ws.stripeCustomerId);
+        if (existing && !("deleted" in existing && existing.deleted) && !existing.email) {
+          await s.customers.update(ws.stripeCustomerId, { email });
+        }
+      } catch {
+        // best-effort only
+      }
+    }
+    return { customerId: ws.stripeCustomerId, created: false };
+  }
 
   const customer = await s.customers.create({
     name: ws.name || ws.id,
+    ...(email ? { email } : {}),
     metadata: { workspace_id: ws.id },
   });
   return { customerId: customer.id, created: true };

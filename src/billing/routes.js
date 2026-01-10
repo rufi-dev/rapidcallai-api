@@ -14,7 +14,10 @@ function createBillingRouter({ store, stripeBilling }) {
 
     try {
       // Ensure customer exists
-      const { customerId } = await stripeBilling.ensureStripeCustomerForWorkspace(ws);
+      const { customerId } = await stripeBilling.ensureStripeCustomerForWorkspace({
+        ...ws,
+        userEmail: req.user?.email,
+      });
       if (!ws.stripeCustomerId) await store.updateWorkspace(ws.id, { stripeCustomerId: customerId });
 
       // Ensure subscription exists
@@ -92,7 +95,10 @@ function createBillingRouter({ store, stripeBilling }) {
     if (ws.isPaid && ws.hasPaymentMethod) return res.json({ ok: true, alreadyPaid: true });
 
     try {
-      const { customerId } = await stripeBilling.ensureStripeCustomerForWorkspace(ws);
+      const { customerId } = await stripeBilling.ensureStripeCustomerForWorkspace({
+        ...ws,
+        userEmail: req.user?.email,
+      });
       if (!ws.stripeCustomerId) await store.updateWorkspace(ws.id, { stripeCustomerId: customerId });
       const session = await stripeBilling.createUpgradeCheckoutSession({ customerId, workspaceId: ws.id });
       return res.json({ ok: true, url: session.url });
