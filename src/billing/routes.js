@@ -1,6 +1,6 @@
 const express = require("express");
 const { getBillingConfig } = require("./config");
-const { getMeteredPriceIdsFromEnv, recordMeterEventsForWorkspace } = require("./stripe");
+const { getMeteredPriceIdsFromEnv, recordMeterEventsForWorkspace, getStripePriceInfoCached } = require("./stripe");
 const {
   getOpenMeterCustomer,
   getOpenMeterCustomerUpcomingInvoice,
@@ -14,6 +14,10 @@ const {
 
 function createBillingRouter({ store, stripeBilling }) {
   const r = express.Router();
+
+  function safeObj(x) {
+    return x && typeof x === "object" ? x : {};
+  }
 
   // Debug: manually record a small usage increment into Stripe (to verify Stripe usage record pipeline).
   // Only works for paid workspaces with a Stripe subscription.
@@ -60,6 +64,23 @@ function createBillingRouter({ store, stripeBilling }) {
       const calls = await store.listCalls(ws.id);
       const last = calls?.[0]?.id ? await store.getCall(ws.id, calls[0].id) : null;
       const billing = last?.metrics?.billing || null;
+      const metrics = safeObj(last?.metrics);
+      const models = safeObj(metrics.models);
+      const usage = safeObj(metrics.usage);
+      const normalized = safeObj(safeObj(metrics.normalized));
+      const source = String(normalized.source || (last?.to === "webtest" ? "web" : "unknown"));
+
+      const promptTokens = Number(usage.llm_prompt_tokens || 0);
+      const completionTokens = Number(usage.llm_completion_tokens || 0);
+      const cachedPromptTokens = Number(usage.llm_prompt_cached_tokens || usage.llm_cached_prompt_tokens || 0);
+      const tokensTotal =
+        typeof metrics.tokensTotal === "number" && Number.isFinite(metrics.tokensTotal)
+          ? metrics.tokensTotal
+          : promptTokens + completionTokens;
+
+      const durSec = Number(last?.durationSec || 0);
+      const mins = durSec > 0 ? durSec / 60 : 0;
+      const tokensPerMin = mins > 0 ? tokensTotal / mins : 0;
 
       const sub = await s.subscriptions.retrieve(ws.stripeSubscriptionId, { expand: ["items.data.price"] });
       const items = (sub.items?.data || []).map((it) => ({
@@ -104,6 +125,19 @@ function createBillingRouter({ store, stripeBilling }) {
               endedAt: last.endedAt ?? null,
               durationSec: last.durationSec ?? null,
               to: last.to ?? null,
+              source,
+              models: {
+                llm: String(models.llm || usage.llm_model || "").trim() || null,
+                stt: String(models.stt || "").trim() || null,
+                tts: String(models.tts || "").trim() || null,
+              },
+              tokens: {
+                total: Number(tokensTotal || 0),
+                prompt: Number(promptTokens || 0),
+                promptCached: Number(cachedPromptTokens || 0),
+                completion: Number(completionTokens || 0),
+                perMin: Math.round(Number(tokensPerMin || 0) * 100) / 100,
+              },
               billing,
             }
           : null,
@@ -228,8 +262,33 @@ function createBillingRouter({ store, stripeBilling }) {
     const ws = req.workspace;
 
     const trialCreditUsd = typeof ws?.trialCreditUsd === "number" ? ws.trialCreditUsd : Number(ws?.trialCreditUsd || 0);
-    const base = Math.max(0.000001, Number(cfg.basePriceUsdPerMin || 0.13));
+    const base = Math.max(0.000001, Number(cfg.basePriceUsdPerMin || 0.10));
     const approxMinutesRemaining = Math.max(0, Math.floor(Math.max(0, trialCreditUsd) / base));
+
+    // Prefer Stripe price amounts for display (so UI always matches what Stripe will actually charge).
+    // This avoids drift when config defaults differ from Stripe, or when Stripe prices change.
+    const ids = getMeteredPriceIdsFromEnv();
+    const stripePrices = {};
+    try {
+      if (stripeBilling?.getStripe?.()) {
+        const entries = [
+          ["baseUsdPerMin", ids.baseMinutes],
+          ["modelUpgradeUsdPerMin", ids.modelUpgradeMinutes],
+          ["tokenOverageUsdPer1K", ids.tokenOverage],
+          ["telephonyUsdPerMin", ids.telephonyMinutes],
+          ["phoneNumberMonthlyFeeUsd", ids.phoneNumberMonthly],
+        ];
+        for (const [k, pid] of entries) {
+          if (!pid) continue;
+          const info = await getStripePriceInfoCached(pid);
+          if (info?.ok && typeof info.usdPerUnit === "number") {
+            stripePrices[k] = info.usdPerUnit;
+          }
+        }
+      }
+    } catch {
+      // best-effort only
+    }
 
     return res.json({
       workspaceId: ws.id,
@@ -249,14 +308,16 @@ function createBillingRouter({ store, stripeBilling }) {
         allowNumberPurchase: Boolean(cfg.trialAllowNumberPurchase),
       },
       pricing: {
-        baseUsdPerMin: Number(cfg.basePriceUsdPerMin || 0.13),
+        baseUsdPerMin: stripePrices.baseUsdPerMin ?? Number(cfg.basePriceUsdPerMin || 0.10),
         defaultLlmModel: cfg.defaultLlmModel,
         includedTokensPerMin: Number(cfg.includedTokensPerMin || 0),
-        tokenOverageUsdPer1K: Number(cfg.tokenOverageUsdPer1K || 0),
+        tokenOverageUsdPer1K: stripePrices.tokenOverageUsdPer1K ?? Number(cfg.tokenOverageUsdPer1K || 0),
         llmSurchargeUsdPerMinByModel: cfg.llmSurchargeUsdPerMinByModel || {},
-        telephonyUsdPerMin: Number(cfg.telephonyUsdPerMin || 0),
+        telephonyUsdPerMin: stripePrices.telephonyUsdPerMin ?? Number(cfg.telephonyUsdPerMin || 0),
         telephonyMarkupRate: Number(cfg.telephonyMarkupRate || 0),
-        phoneNumberMonthlyFeeUsd: Number(cfg.phoneNumberMonthlyFeeUsd || 0),
+        phoneNumberMonthlyFeeUsd: stripePrices.phoneNumberMonthlyFeeUsd ?? Number(cfg.phoneNumberMonthlyFeeUsd || 0),
+        // Helpful for UI/diagnostics: what Stripe prices currently say.
+        stripePrices: Object.keys(stripePrices).length ? stripePrices : null,
       },
     });
   });

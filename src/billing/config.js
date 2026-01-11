@@ -24,12 +24,15 @@ function jsonEnv(name, def = null) {
 
 function getBillingConfig() {
   return {
-    basePriceUsdPerMin: numEnv("BASE_PRICE_USD_PER_MIN", 0.13),
+    // Defaults should match your Stripe metered price amounts to avoid confusing UI/trial debits.
+    // (Paid billing uses Stripe price IDs; these defaults matter mainly for trial + UI display.)
+    basePriceUsdPerMin: numEnv("BASE_PRICE_USD_PER_MIN", 0.10),
     defaultLlmModel: String(process.env.DEFAULT_LLM_MODEL || "gpt-5-mini").trim() || "gpt-5-mini",
     includedTokensPerMin: numEnv("INCLUDED_TOKENS_PER_MIN", 2000),
-    tokenOverageUsdPer1K: numEnv("TOKEN_OVERAGE_USD_PER_1K", 0.01),
+    tokenOverageUsdPer1K: numEnv("TOKEN_OVERAGE_USD_PER_1K", 0.002),
     llmSurchargeUsdPerMinByModel: jsonEnv("LLM_SURCHARGE_JSON", {}) || {},
-    telephonyUsdPerMin: numEnv("TELEPHONY_USD_PER_MIN", 0.013),
+    // This is an informational number used in the UI; actual paid billing telephony charges are in Stripe.
+    telephonyUsdPerMin: numEnv("TELEPHONY_USD_PER_MIN", 0.015),
     telephonyMarkupRate: numEnv("TELEPHONY_MARKUP_RATE", 0.2),
     phoneNumberMonthlyFeeUsd: numEnv("PHONE_NUMBER_MONTHLY_FEE_USD", 2.0),
     trialCreditUsd: numEnv("TRIAL_CREDIT_USD", 20),

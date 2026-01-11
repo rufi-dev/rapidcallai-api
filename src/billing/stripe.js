@@ -3,6 +3,8 @@ const https = require("https");
 const querystring = require("querystring");
 
 let stripe = null;
+const priceInfoCache = new Map(); // priceId -> { atMs, info }
+const PRICE_CACHE_TTL_MS = 10 * 60 * 1000;
 
 function getStripe() {
   const key = String(process.env.STRIPE_SECRET_KEY || "").trim();
@@ -59,6 +61,49 @@ async function retrieveStripePrice(priceId) {
   const s = getStripe();
   if (!s) throw new Error("Stripe not configured (STRIPE_SECRET_KEY missing)");
   return await s.prices.retrieve(String(priceId));
+}
+
+function priceUnitUsdFromStripePrice(price) {
+  const currency = String(price?.currency || "").toLowerCase();
+  // We only support USD-style 2-decimal currencies here. If you add more currencies, expand this.
+  const decimals = currency === "usd" ? 2 : 2;
+
+  const raw =
+    price?.unit_amount_decimal != null
+      ? Number(price.unit_amount_decimal)
+      : price?.unit_amount != null
+        ? Number(price.unit_amount)
+        : null;
+
+  if (!Number.isFinite(raw) || raw == null) return null;
+  return raw / Math.pow(10, decimals);
+}
+
+async function getStripePriceInfoCached(priceId) {
+  const id = String(priceId || "").trim();
+  if (!id) return { ok: false, error: "priceId missing" };
+
+  const now = Date.now();
+  const cached = priceInfoCache.get(id);
+  if (cached && now - cached.atMs < PRICE_CACHE_TTL_MS) return { ok: true, ...cached.info, cached: true };
+
+  try {
+    const p = await retrieveStripePrice(id);
+    const info = {
+      id: p.id,
+      active: Boolean(p.active),
+      currency: p.currency,
+      nickname: p.nickname || null,
+      recurring: p.recurring || null,
+      billing_scheme: p.billing_scheme || null,
+      // USD per billed unit (minute, 1k tokens, etc) derived from Stripe price
+      usdPerUnit: priceUnitUsdFromStripePrice(p),
+    };
+    priceInfoCache.set(id, { atMs: now, info });
+    return { ok: true, ...info, cached: false };
+  } catch (e) {
+    return { ok: false, error: String(e?.message || e) };
+  }
 }
 
 async function retrieveStripeMeter(meterId) {
@@ -364,6 +409,7 @@ module.exports = {
   getMeteredPriceIdsFromEnv,
   recordUsageForSubscription,
   recordMeterEventsForWorkspace,
+  getStripePriceInfoCached,
 };
 
 
