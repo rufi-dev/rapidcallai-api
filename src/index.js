@@ -18,6 +18,12 @@ const pdfParse = require("pdf-parse");
 const promClient = require("prom-client");
 const { WebhookReceiver } = require("livekit-server-sdk");
 
+// Upload helpers (must be defined BEFORE any routes that reference them).
+const kbUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 20 * 1024 * 1024 },
+});
+
 const {
   readAgents,
   writeAgents,
@@ -2778,11 +2784,7 @@ const upload = multer({
   limits: { fileSize: 50 * 1024 * 1024 },
 });
 
-// KB uploads: smaller limit per PDF (text extraction + storage)
-const kbUpload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 20 * 1024 * 1024 },
-});
+// (kbUpload declared near top; keep route declarations above stable)
 
 app.post("/api/calls/:id/recording", requireAuth, upload.single("file"), async (req, res) => {
   const { id } = req.params;
