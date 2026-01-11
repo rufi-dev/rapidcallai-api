@@ -525,7 +525,8 @@ async function updateAgent(workspaceId, id, { name, promptDraft, publish, welcom
     voiceId: v.voiceId ?? null,
   };
 
-  const nextLlmModel = llmModel == null ? (current.llmModel ?? "") : String(llmModel || "");
+  const llmTrim = llmModel == null ? null : String(llmModel || "").trim();
+  const nextLlmModel = llmTrim ? llmTrim : (current.llmModel ?? "");
   const nextMaxCallSeconds =
     maxCallSeconds == null ? Number(current.maxCallSeconds || 0) : Math.max(0, Math.round(Number(maxCallSeconds || 0)));
 

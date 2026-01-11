@@ -344,7 +344,13 @@ const VoiceConfigSchema = z
   })
   .optional();
 
-const LlmModelSchema = z.string().min(1).max(120).optional();
+// Allow omission, and treat empty strings as "unset" (so the server can fall back to defaults).
+const LlmModelSchema = z
+  .preprocess((v) => {
+    if (typeof v === "string" && v.trim().length === 0) return undefined;
+    return v;
+  }, z.string().min(1).max(120))
+  .optional();
 const MaxCallSecondsSchema = z.number().int().min(0).max(24 * 60 * 60).optional(); // up to 24h
 
 // Allow one or many origins. Use comma-separated list in CLIENT_ORIGIN, e.g.:
@@ -959,6 +965,7 @@ app.get("/api/agents", requireAuth, async (req, res) => {
 });
 
 app.post("/api/agents", requireAuth, async (req, res) => {
+  const cfg = getBillingConfig();
   const schema = z.object({
     name: z.string().min(1).max(60),
     promptDraft: z.string().max(PROMPT_MAX).optional(),
@@ -978,7 +985,11 @@ app.post("/api/agents", requireAuth, async (req, res) => {
   }
 
   if (USE_DB) {
-    const agent = await store.createAgent({ ...parsed.data, workspaceId: req.workspace.id });
+    const agent = await store.createAgent({
+      ...parsed.data,
+      workspaceId: req.workspace.id,
+      llmModel: parsed.data.llmModel ?? cfg.defaultLlmModel,
+    });
     return res.status(201).json({ agent });
   }
 
@@ -990,7 +1001,7 @@ app.post("/api/agents", requireAuth, async (req, res) => {
     promptDraft: parsed.data.promptDraft ?? "",
     promptPublished: parsed.data.promptPublished ?? "",
     publishedAt: parsed.data.promptPublished ? now : null,
-    llmModel: parsed.data.llmModel ?? "",
+    llmModel: parsed.data.llmModel ?? cfg.defaultLlmModel,
     maxCallSeconds: Math.max(0, Math.round(Number(parsed.data.maxCallSeconds || 0))),
     welcome: {
       mode: parsed.data.welcome?.mode ?? "user",
@@ -1588,7 +1599,7 @@ app.post("/api/agents/:id/start", requireAuth, async (req, res) => {
     aiDelaySeconds: startParsed?.data?.welcome?.aiDelaySeconds ?? agent.welcome?.aiDelaySeconds ?? 0,
   };
   const voice = agent.voice ?? {};
-  const llmModel = String(agent.llmModel || "").trim();
+  const llmModel = String(agent.llmModel || "").trim() || getBillingConfig().defaultLlmModel;
   const maxCallSeconds = Number(agent.maxCallSeconds || 0);
 
   // IMPORTANT:
