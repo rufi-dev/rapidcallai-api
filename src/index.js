@@ -14,6 +14,7 @@ const { z } = require("zod");
 const path = require("path");
 const fs = require("fs");
 const multer = require("multer");
+const pdfParse = require("pdf-parse");
 const promClient = require("prom-client");
 const { WebhookReceiver } = require("livekit-server-sdk");
 
@@ -352,6 +353,7 @@ const LlmModelSchema = z
   }, z.string().min(1).max(120))
   .optional();
 const MaxCallSecondsSchema = z.number().int().min(0).max(24 * 60 * 60).optional(); // up to 24h
+const KnowledgeFolderIdsSchema = z.array(z.string().min(1).max(40)).max(50).optional();
 
 // Allow one or many origins. Use comma-separated list in CLIENT_ORIGIN, e.g.:
 // CLIENT_ORIGIN=https://dashboard.rapidcallai.com,http://localhost:5173
@@ -644,6 +646,145 @@ app.get("/api/me", requireAuth, async (req, res) => {
   return res.json({ user: req.user, workspace: req.workspace });
 });
 
+// --- Knowledge Base (folders + docs) ---
+app.get("/api/kb/folders", requireAuth, async (req, res) => {
+  if (!USE_DB) return res.status(400).json({ error: "Knowledge Base requires Postgres mode" });
+  const folders = await store.listKbFolders(req.workspace.id);
+  return res.json({ folders });
+});
+
+app.post("/api/kb/folders", requireAuth, async (req, res) => {
+  if (!USE_DB) return res.status(400).json({ error: "Knowledge Base requires Postgres mode" });
+  const schema = z.object({
+    name: z.string().min(1).max(120),
+    parentId: z.string().min(1).max(40).nullable().optional(),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "Validation failed", details: parsed.error.flatten() });
+  const folder = await store.createKbFolder(req.workspace.id, { name: parsed.data.name, parentId: parsed.data.parentId ?? null });
+  return res.status(201).json({ folder });
+});
+
+app.put("/api/kb/folders/:id", requireAuth, async (req, res) => {
+  if (!USE_DB) return res.status(400).json({ error: "Knowledge Base requires Postgres mode" });
+  const folderId = String(req.params.id || "").trim();
+  const schema = z.object({
+    name: z.string().min(1).max(120).optional(),
+    parentId: z.string().min(1).max(40).nullable().optional(),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "Validation failed", details: parsed.error.flatten() });
+  const folder = await store.updateKbFolder(req.workspace.id, folderId, parsed.data);
+  if (!folder) return res.status(404).json({ error: "Folder not found" });
+  return res.json({ folder });
+});
+
+app.delete("/api/kb/folders/:id", requireAuth, async (req, res) => {
+  if (!USE_DB) return res.status(400).json({ error: "Knowledge Base requires Postgres mode" });
+  const folderId = String(req.params.id || "").trim();
+  await store.deleteKbFolder(req.workspace.id, folderId);
+  return res.json({ ok: true });
+});
+
+app.get("/api/kb/folders/:id/docs", requireAuth, async (req, res) => {
+  if (!USE_DB) return res.status(400).json({ error: "Knowledge Base requires Postgres mode" });
+  const folderId = String(req.params.id || "").trim();
+  const docs = await store.listKbDocs(req.workspace.id, folderId);
+  return res.json({ docs });
+});
+
+app.post("/api/kb/folders/:id/text", requireAuth, async (req, res) => {
+  if (!USE_DB) return res.status(400).json({ error: "Knowledge Base requires Postgres mode" });
+  const folderId = String(req.params.id || "").trim();
+  const schema = z.object({
+    title: z.string().max(200).optional(),
+    contentText: z.string().min(1).max(2_000_000),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "Validation failed", details: parsed.error.flatten() });
+  const doc = await store.createKbTextDoc(req.workspace.id, { folderId, title: parsed.data.title ?? "", contentText: parsed.data.contentText });
+  return res.status(201).json({ doc });
+});
+
+app.post("/api/kb/folders/:id/pdf", requireAuth, kbUpload.single("file"), async (req, res) => {
+  if (!USE_DB) return res.status(400).json({ error: "Knowledge Base requires Postgres mode" });
+  const folderId = String(req.params.id || "").trim();
+  if (!req.file) return res.status(400).json({ error: "Missing file" });
+
+  const mime = String(req.file.mimetype || "");
+  if (!mime.includes("pdf")) return res.status(400).json({ error: "Only PDF files are supported right now" });
+
+  let extracted = "";
+  try {
+    const r = await pdfParse(req.file.buffer);
+    extracted = String(r?.text || "");
+  } catch (e) {
+    return res.status(400).json({ error: "Failed to parse PDF", details: String(e?.message || e) });
+  }
+
+  // Keep DB payload bounded.
+  const contentText = extracted.replace(/\u0000/g, "").trim().slice(0, 2_000_000);
+  if (!contentText) return res.status(400).json({ error: "PDF contains no extractable text" });
+
+  const title = String(req.body?.title || req.file.originalname || "Document").trim().slice(0, 200);
+  const doc = await store.createKbPdfDoc(req.workspace.id, {
+    folderId,
+    title,
+    contentText,
+    sourceFilename: req.file.originalname || null,
+    mime: req.file.mimetype || null,
+    sizeBytes: Number(req.file.size || 0) || null,
+  });
+  return res.status(201).json({ doc });
+});
+
+app.delete("/api/kb/docs/:id", requireAuth, async (req, res) => {
+  if (!USE_DB) return res.status(400).json({ error: "Knowledge Base requires Postgres mode" });
+  const docId = String(req.params.id || "").trim();
+  await store.deleteKbDoc(req.workspace.id, docId);
+  return res.json({ ok: true });
+});
+
+app.post("/api/kb/search", requireAuth, async (req, res) => {
+  if (!USE_DB) return res.status(400).json({ error: "Knowledge Base requires Postgres mode" });
+  const schema = z.object({
+    folderIds: z.array(z.string().min(1).max(40)).min(1).max(50),
+    query: z.string().min(1).max(500),
+    limit: z.number().int().min(1).max(10).optional(),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "Validation failed", details: parsed.error.flatten() });
+
+  const q = parsed.data.query.toLowerCase();
+  const limit = parsed.data.limit ?? 5;
+  const results = [];
+
+  // Naive search: load docs in those folders and rank by substring matches.
+  for (const folderId of parsed.data.folderIds) {
+    const docs = await store.listKbDocs(req.workspace.id, folderId);
+    for (const d of docs) {
+      const text = String(d.contentText || "");
+      const hay = text.toLowerCase();
+      const idx = hay.indexOf(q);
+      if (idx === -1) continue;
+      const start = Math.max(0, idx - 180);
+      const end = Math.min(text.length, idx + q.length + 180);
+      const excerpt = text.slice(start, end).replace(/\s+/g, " ").trim();
+      results.push({
+        docId: d.id,
+        folderId: d.folderId,
+        title: d.title || d.sourceFilename || "Document",
+        kind: d.kind,
+        excerpt,
+        score: 1,
+      });
+    }
+  }
+
+  results.sort((a, b) => b.score - a.score);
+  return res.json({ results: results.slice(0, limit) });
+});
+
 // Billing API routes (Trial credits + Stripe + OpenMeter)
 app.use("/api/billing", requireAuth, createBillingRouter({ store: USE_DB ? store : null, stripeBilling }));
 
@@ -763,6 +904,7 @@ app.post("/api/internal/telephony/inbound/start", requireAgentSecret, async (req
     voice: agent.voice ?? {},
     llmModel: String(agent.llmModel || ""),
     maxCallSeconds: Number(agent.maxCallSeconds || 0),
+    knowledgeFolderIds: Array.isArray(agent.knowledgeFolderIds) ? agent.knowledgeFolderIds : [],
     phoneNumber: { id: phoneRow.id, e164: phoneRow.e164 },
   });
 });
@@ -873,6 +1015,54 @@ app.post("/api/internal/calls/:id/end", requireAgentSecret, async (req, res) => 
   return res.json({ call: updated });
 });
 
+// --- Internal KB search (for the LiveKit agent tools) ---
+app.post("/api/internal/kb/search", requireAgentSecret, async (req, res) => {
+  const schema = z.object({
+    callId: z.string().min(1).max(64),
+    query: z.string().min(1).max(500),
+    folderIds: z.array(z.string().min(1).max(40)).max(50).optional(),
+    limit: z.number().int().min(1).max(10).optional(),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "Validation failed", details: parsed.error.flatten() });
+  if (!USE_DB) return res.status(400).json({ error: "Internal endpoints require Postgres mode" });
+
+  const call = await store.getCallById(parsed.data.callId);
+  if (!call?.workspaceId) return res.status(404).json({ error: "Call not found" });
+  const workspaceId = call.workspaceId;
+
+  const validFolderIds = new Set((await store.listKbFolders(workspaceId)).map((f) => f.id));
+  const requested = (parsed.data.folderIds || []).filter((id) => validFolderIds.has(id));
+  const folderIdsToUse = requested.length ? requested : [];
+  if (!folderIdsToUse.length) return res.json({ results: [] });
+
+  const q = parsed.data.query.toLowerCase();
+  const limit = parsed.data.limit ?? 5;
+  const results = [];
+  for (const folderId of folderIdsToUse) {
+    const docs = await store.listKbDocs(workspaceId, folderId);
+    for (const d of docs) {
+      const text = String(d.contentText || "");
+      const hay = text.toLowerCase();
+      const idx = hay.indexOf(q);
+      if (idx === -1) continue;
+      const start = Math.max(0, idx - 220);
+      const end = Math.min(text.length, idx + q.length + 220);
+      const excerpt = text.slice(start, end).replace(/\s+/g, " ").trim();
+      results.push({
+        docId: d.id,
+        folderId: d.folderId,
+        title: d.title || d.sourceFilename || "Document",
+        kind: d.kind,
+        excerpt,
+        score: 1,
+      });
+    }
+  }
+  results.sort((a, b) => b.score - a.score);
+  return res.json({ results: results.slice(0, limit) });
+});
+
 function normalizeCountries(v) {
   if (!v) return ["all"];
   if (Array.isArray(v)) return v.length ? v : ["all"];
@@ -973,6 +1163,7 @@ app.post("/api/agents", requireAuth, async (req, res) => {
     welcome: WelcomeConfigSchema,
     voice: VoiceConfigSchema,
     llmModel: LlmModelSchema,
+    knowledgeFolderIds: KnowledgeFolderIdsSchema,
     maxCallSeconds: MaxCallSecondsSchema,
   });
   const parsed = schema.safeParse(req.body);
@@ -989,6 +1180,7 @@ app.post("/api/agents", requireAuth, async (req, res) => {
       ...parsed.data,
       workspaceId: req.workspace.id,
       llmModel: parsed.data.llmModel ?? cfg.defaultLlmModel,
+      knowledgeFolderIds: parsed.data.knowledgeFolderIds ?? [],
     });
     return res.status(201).json({ agent });
   }
@@ -1002,6 +1194,7 @@ app.post("/api/agents", requireAuth, async (req, res) => {
     promptPublished: parsed.data.promptPublished ?? "",
     publishedAt: parsed.data.promptPublished ? now : null,
     llmModel: parsed.data.llmModel ?? cfg.defaultLlmModel,
+    knowledgeFolderIds: parsed.data.knowledgeFolderIds ?? [],
     maxCallSeconds: Math.max(0, Math.round(Number(parsed.data.maxCallSeconds || 0))),
     welcome: {
       mode: parsed.data.welcome?.mode ?? "user",
@@ -1081,6 +1274,7 @@ app.put("/api/agents/:id", requireAuth, async (req, res) => {
     welcome: WelcomeConfigSchema,
     voice: VoiceConfigSchema,
     llmModel: LlmModelSchema,
+    knowledgeFolderIds: KnowledgeFolderIdsSchema,
     maxCallSeconds: MaxCallSecondsSchema,
   });
   const parsed = schema.safeParse(req.body);
@@ -1120,6 +1314,7 @@ app.put("/api/agents/:id", requireAuth, async (req, res) => {
     welcome: parsed.data.welcome ? { ...(current.welcome ?? {}), ...parsed.data.welcome } : current.welcome,
     voice: parsed.data.voice ? { ...(current.voice ?? {}), ...parsed.data.voice } : current.voice,
     llmModel: parsed.data.llmModel ?? (current.llmModel ?? ""),
+    knowledgeFolderIds: parsed.data.knowledgeFolderIds ?? (current.knowledgeFolderIds ?? []),
     maxCallSeconds:
       parsed.data.maxCallSeconds == null
         ? (current.maxCallSeconds ?? 0)
@@ -1649,7 +1844,15 @@ app.post("/api/agents/:id/start", requireAuth, async (req, res) => {
     name: roomName,
     metadata: JSON.stringify({
       call: { id: callId, to: "webtest" },
-      agent: { id: agent.id, name: agent.name, prompt: promptUsed, voice, llmModel, maxCallSeconds },
+      agent: {
+        id: agent.id,
+        name: agent.name,
+        prompt: promptUsed,
+        voice,
+        llmModel,
+        maxCallSeconds,
+        knowledgeFolderIds: Array.isArray(agent.knowledgeFolderIds) ? agent.knowledgeFolderIds : [],
+      },
       welcome,
     }),
     agents: webAgentName
@@ -2349,9 +2552,10 @@ app.post("/api/tts/preview", requireAuth, async (req, res) => {
 
   try {
     if (provider === "elevenlabs") {
-      const apiKey = String(process.env.ELEVENLABS_API_KEY || "").trim();
-      if (!apiKey) return res.status(500).json({ error: "ELEVENLABS_API_KEY is not set on the server" });
-      const modelId = parsed.data.model || "eleven_multilingual_v2";
+      // LiveKit docs use ELEVEN_API_KEY; keep ELEVENLABS_API_KEY for backward compat.
+      const apiKey = String(process.env.ELEVEN_API_KEY || process.env.ELEVENLABS_API_KEY || "").trim();
+      if (!apiKey) return res.status(500).json({ error: "ELEVEN_API_KEY (or ELEVENLABS_API_KEY) is not set on the server" });
+      const modelId = parsed.data.model || "eleven_flash_v2_5";
 
       const r = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(parsed.data.voiceId)}`, {
         method: "POST",
@@ -2572,6 +2776,12 @@ app.post("/api/calls/:id/end", requireAuth, async (req, res) => {
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 50 * 1024 * 1024 },
+});
+
+// KB uploads: smaller limit per PDF (text extraction + storage)
+const kbUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 20 * 1024 * 1024 },
 });
 
 app.post("/api/calls/:id/recording", requireAuth, upload.single("file"), async (req, res) => {

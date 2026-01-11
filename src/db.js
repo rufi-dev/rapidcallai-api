@@ -99,6 +99,7 @@ async function initSchema() {
       welcome JSONB NOT NULL DEFAULT '{}'::jsonb,
       voice JSONB NOT NULL DEFAULT '{}'::jsonb,
       llm_model TEXT NOT NULL DEFAULT '',
+      knowledge_folder_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
       max_call_seconds INT NOT NULL DEFAULT 0,
       created_at BIGINT NOT NULL,
       updated_at BIGINT NOT NULL
@@ -108,8 +109,41 @@ async function initSchema() {
   await p.query(`ALTER TABLE agents ADD COLUMN IF NOT EXISTS workspace_id TEXT NULL;`);
   await p.query(`ALTER TABLE agents ADD COLUMN IF NOT EXISTS voice JSONB NOT NULL DEFAULT '{}'::jsonb;`);
   await p.query(`ALTER TABLE agents ADD COLUMN IF NOT EXISTS llm_model TEXT NOT NULL DEFAULT '';`);
+  await p.query(`ALTER TABLE agents ADD COLUMN IF NOT EXISTS knowledge_folder_ids JSONB NOT NULL DEFAULT '[]'::jsonb;`);
   await p.query(`ALTER TABLE agents ADD COLUMN IF NOT EXISTS max_call_seconds INT NOT NULL DEFAULT 0;`);
   await p.query(`CREATE INDEX IF NOT EXISTS agents_workspace_idx ON agents(workspace_id, created_at DESC);`);
+
+  // Knowledge Base (folders + documents)
+  await p.query(`
+    CREATE TABLE IF NOT EXISTS kb_folders (
+      id TEXT PRIMARY KEY,
+      workspace_id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      parent_id TEXT NULL,
+      created_at BIGINT NOT NULL,
+      updated_at BIGINT NOT NULL
+    );
+  `);
+  await p.query(`CREATE INDEX IF NOT EXISTS kb_folders_workspace_idx ON kb_folders(workspace_id, created_at DESC);`);
+  await p.query(`CREATE INDEX IF NOT EXISTS kb_folders_parent_idx ON kb_folders(workspace_id, parent_id);`);
+
+  await p.query(`
+    CREATE TABLE IF NOT EXISTS kb_docs (
+      id TEXT PRIMARY KEY,
+      workspace_id TEXT NOT NULL,
+      folder_id TEXT NOT NULL,
+      kind TEXT NOT NULL DEFAULT 'text', -- text | pdf
+      title TEXT NOT NULL DEFAULT '',
+      content_text TEXT NOT NULL DEFAULT '',
+      source_filename TEXT NULL,
+      mime TEXT NULL,
+      size_bytes INT NULL,
+      created_at BIGINT NOT NULL,
+      updated_at BIGINT NOT NULL
+    );
+  `);
+  await p.query(`CREATE INDEX IF NOT EXISTS kb_docs_workspace_idx ON kb_docs(workspace_id, created_at DESC);`);
+  await p.query(`CREATE INDEX IF NOT EXISTS kb_docs_folder_idx ON kb_docs(workspace_id, folder_id, created_at DESC);`);
 
   await p.query(`
     CREATE TABLE IF NOT EXISTS calls (

@@ -22,6 +22,7 @@ function rowToAgent(r) {
     welcome: r.welcome ?? {},
     voice: r.voice ?? {},
     llmModel: r.llm_model ?? "",
+    knowledgeFolderIds: Array.isArray(r.knowledge_folder_ids) ? r.knowledge_folder_ids : (r.knowledge_folder_ids ?? []),
     maxCallSeconds: Number(r.max_call_seconds || 0),
     createdAt: r.created_at,
     updatedAt: r.updated_at,
@@ -448,6 +449,7 @@ async function createAgent({
   welcome = null,
   voice = null,
   llmModel = "",
+  knowledgeFolderIds = [],
   maxCallSeconds = 0,
 }) {
   const p = getPool();
@@ -472,8 +474,8 @@ async function createAgent({
 
   const { rows } = await p.query(
     `
-    INSERT INTO agents (id, workspace_id, name, prompt_draft, prompt_published, published_at, welcome, voice, llm_model, max_call_seconds, created_at, updated_at)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+    INSERT INTO agents (id, workspace_id, name, prompt_draft, prompt_published, published_at, welcome, voice, llm_model, knowledge_folder_ids, max_call_seconds, created_at, updated_at)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
     RETURNING *
   `,
     [
@@ -486,6 +488,7 @@ async function createAgent({
       JSON.stringify(welcomeNorm),
       JSON.stringify(voiceNorm),
       String(llmModel || ""),
+      JSON.stringify(Array.isArray(knowledgeFolderIds) ? knowledgeFolderIds : []),
       Math.max(0, Math.round(Number(maxCallSeconds || 0))),
       now,
       now,
@@ -500,7 +503,7 @@ async function getAgent(workspaceId, id) {
   return rows[0] ? rowToAgent(rows[0]) : null;
 }
 
-async function updateAgent(workspaceId, id, { name, promptDraft, publish, welcome, voice, llmModel, maxCallSeconds }) {
+async function updateAgent(workspaceId, id, { name, promptDraft, publish, welcome, voice, llmModel, knowledgeFolderIds, maxCallSeconds }) {
   const p = getPool();
   const current = await getAgent(workspaceId, id);
   if (!current) return null;
@@ -527,6 +530,7 @@ async function updateAgent(workspaceId, id, { name, promptDraft, publish, welcom
 
   const llmTrim = llmModel == null ? null : String(llmModel || "").trim();
   const nextLlmModel = llmTrim ? llmTrim : (current.llmModel ?? "");
+  const nextKbFolderIds = Array.isArray(knowledgeFolderIds) ? knowledgeFolderIds : (current.knowledgeFolderIds ?? []);
   const nextMaxCallSeconds =
     maxCallSeconds == null ? Number(current.maxCallSeconds || 0) : Math.max(0, Math.round(Number(maxCallSeconds || 0)));
 
@@ -541,9 +545,10 @@ async function updateAgent(workspaceId, id, { name, promptDraft, publish, welcom
         welcome=$6,
         voice=$7,
         llm_model=$8,
-        max_call_seconds=$9,
-        updated_at=$10
-    WHERE workspace_id=$11 AND id=$1
+        knowledge_folder_ids=$9,
+        max_call_seconds=$10,
+        updated_at=$11
+    WHERE workspace_id=$12 AND id=$1
     RETURNING *
   `,
     [
@@ -555,12 +560,129 @@ async function updateAgent(workspaceId, id, { name, promptDraft, publish, welcom
       JSON.stringify(welcomeNorm),
       JSON.stringify(voiceNorm),
       nextLlmModel,
+      JSON.stringify(nextKbFolderIds),
       nextMaxCallSeconds,
       updatedAt,
       workspaceId,
     ]
   );
   return rows[0] ? rowToAgent(rows[0]) : null;
+}
+
+function rowToKbFolder(r) {
+  return {
+    id: r.id,
+    workspaceId: r.workspace_id,
+    name: r.name,
+    parentId: r.parent_id ?? null,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+  };
+}
+
+function rowToKbDoc(r) {
+  return {
+    id: r.id,
+    workspaceId: r.workspace_id,
+    folderId: r.folder_id,
+    kind: r.kind,
+    title: r.title ?? "",
+    contentText: r.content_text ?? "",
+    sourceFilename: r.source_filename ?? null,
+    mime: r.mime ?? null,
+    sizeBytes: r.size_bytes ?? null,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+  };
+}
+
+async function listKbFolders(workspaceId) {
+  const p = getPool();
+  const { rows } = await p.query(`SELECT * FROM kb_folders WHERE workspace_id=$1 ORDER BY created_at DESC`, [workspaceId]);
+  return rows.map(rowToKbFolder);
+}
+
+async function createKbFolder(workspaceId, { name, parentId = null }) {
+  const p = getPool();
+  const now = Date.now();
+  const id = nanoid(10);
+  const { rows } = await p.query(
+    `
+    INSERT INTO kb_folders (id, workspace_id, name, parent_id, created_at, updated_at)
+    VALUES ($1,$2,$3,$4,$5,$6)
+    RETURNING *
+  `,
+    [id, workspaceId, String(name || "").trim(), parentId ? String(parentId) : null, now, now]
+  );
+  return rows[0] ? rowToKbFolder(rows[0]) : null;
+}
+
+async function updateKbFolder(workspaceId, id, { name, parentId }) {
+  const p = getPool();
+  const now = Date.now();
+  const { rows } = await p.query(
+    `
+    UPDATE kb_folders
+    SET name=COALESCE($3,name),
+        parent_id=$4,
+        updated_at=$5
+    WHERE workspace_id=$1 AND id=$2
+    RETURNING *
+  `,
+    [workspaceId, id, name == null ? null : String(name || "").trim(), parentId == null ? null : String(parentId), now]
+  );
+  return rows[0] ? rowToKbFolder(rows[0]) : null;
+}
+
+async function deleteKbFolder(workspaceId, id) {
+  const p = getPool();
+  // Best-effort cascade: delete docs in folder, then folder. (Subfolders are user-managed for now.)
+  await p.query(`DELETE FROM kb_docs WHERE workspace_id=$1 AND folder_id=$2`, [workspaceId, id]);
+  await p.query(`DELETE FROM kb_folders WHERE workspace_id=$1 AND id=$2`, [workspaceId, id]);
+}
+
+async function listKbDocs(workspaceId, folderId) {
+  const p = getPool();
+  const { rows } = await p.query(
+    `SELECT * FROM kb_docs WHERE workspace_id=$1 AND folder_id=$2 ORDER BY created_at DESC`,
+    [workspaceId, folderId]
+  );
+  return rows.map(rowToKbDoc);
+}
+
+async function createKbTextDoc(workspaceId, { folderId, title = "", contentText }) {
+  const p = getPool();
+  const now = Date.now();
+  const id = nanoid(10);
+  const { rows } = await p.query(
+    `
+    INSERT INTO kb_docs (id, workspace_id, folder_id, kind, title, content_text, created_at, updated_at)
+    VALUES ($1,$2,$3,'text',$4,$5,$6,$7)
+    RETURNING *
+  `,
+    [id, workspaceId, folderId, String(title || "").trim(), String(contentText || ""), now, now]
+  );
+  return rows[0] ? rowToKbDoc(rows[0]) : null;
+}
+
+async function createKbPdfDoc(workspaceId, { folderId, title = "", contentText, sourceFilename, mime, sizeBytes }) {
+  const p = getPool();
+  const now = Date.now();
+  const id = nanoid(10);
+  const { rows } = await p.query(
+    `
+    INSERT INTO kb_docs (id, workspace_id, folder_id, kind, title, content_text, source_filename, mime, size_bytes, created_at, updated_at)
+    VALUES ($1,$2,$3,'pdf',$4,$5,$6,$7,$8,$9,$10)
+    RETURNING *
+  `,
+    [id, workspaceId, folderId, String(title || "").trim(), String(contentText || ""), sourceFilename || null, mime || null, sizeBytes ?? null, now, now]
+  );
+  return rows[0] ? rowToKbDoc(rows[0]) : null;
+}
+
+async function deleteKbDoc(workspaceId, id) {
+  const p = getPool();
+  await p.query(`DELETE FROM kb_docs WHERE workspace_id=$1 AND id=$2`, [workspaceId, id]);
 }
 
 async function deleteAgent(workspaceId, id) {
@@ -796,6 +918,15 @@ module.exports = {
   getAgent,
   updateAgent,
   deleteAgent,
+  // Knowledge Base
+  listKbFolders,
+  createKbFolder,
+  updateKbFolder,
+  deleteKbFolder,
+  listKbDocs,
+  createKbTextDoc,
+  createKbPdfDoc,
+  deleteKbDoc,
   createCall,
   updateCall,
   listCalls,
