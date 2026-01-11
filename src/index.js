@@ -36,7 +36,7 @@ const {
 } = require("./storage");
 const { getPool, initSchema } = require("./db");
 const store = require("./store_pg");
-const { roomService, createParticipantToken } = require("./livekit");
+const { roomService, agentDispatchService, createParticipantToken } = require("./livekit");
 const { startCallEgress, stopEgress, getEgressInfo } = require("./egress");
 const { getObject, headObject } = require("./s3");
 const tw = require("./twilio");
@@ -1861,17 +1861,27 @@ app.post("/api/agents/:id/start", requireAuth, async (req, res) => {
       },
       welcome,
     }),
-    agents: webAgentName
-      ? [
-          {
-            agentName: webAgentName,
-            metadata: JSON.stringify({ source: "webtest", callId, agentId: agent.id }),
-          },
-        ]
-      : undefined,
     emptyTimeout: 10,
     maxParticipants: 2,
   });
+
+  // Explicit dispatch (more reliable on Cloud than createRoom.agents)
+  if (webAgentName) {
+    try {
+      const dc = agentDispatchService();
+      await dc.createDispatch(roomName, webAgentName, {
+        metadata: JSON.stringify({ source: "webtest", callId, agentId: agent.id }),
+      });
+    } catch (e) {
+      // Surface this to the UI; otherwise it looks like an infinite "Connecting..."
+      return res.status(502).json({
+        error: "Failed to dispatch LiveKit agent to room",
+        details: String(e?.message || e),
+        hint:
+          "Check that your LiveKit Cloud agent is deployable (not Builder), is running, and that LIVEKIT_AGENT_NAME matches LIVEKIT_WEB_AGENT_NAME.",
+      });
+    }
+  }
 
   // Start egress recording (audio-only) to S3 if configured.
   try {

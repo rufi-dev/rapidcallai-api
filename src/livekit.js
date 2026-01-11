@@ -1,4 +1,4 @@
-const { AccessToken, RoomServiceClient } = require("livekit-server-sdk");
+const { AccessToken, RoomServiceClient, AgentDispatchClient } = require("livekit-server-sdk");
 
 function getLiveKitConfig() {
   const url = process.env.LIVEKIT_URL;
@@ -7,12 +7,24 @@ function getLiveKitConfig() {
   if (!url || !apiKey || !apiSecret) {
     throw new Error("Missing LIVEKIT_URL / LIVEKIT_API_KEY / LIVEKIT_API_SECRET in server environment");
   }
-  return { url, apiKey, apiSecret };
+
+  // LIVEKIT_URL used by browser clients is typically wss://...
+  // Server SDK clients (RoomService/Dispatch) must use an HTTP(S) endpoint.
+  let apiUrl = String(url);
+  if (apiUrl.startsWith("wss://")) apiUrl = `https://${apiUrl.slice("wss://".length)}`;
+  if (apiUrl.startsWith("ws://")) apiUrl = `http://${apiUrl.slice("ws://".length)}`;
+
+  return { url, apiUrl, apiKey, apiSecret };
 }
 
 function roomService() {
-  const { url, apiKey, apiSecret } = getLiveKitConfig();
-  return new RoomServiceClient(url, apiKey, apiSecret);
+  const { apiUrl, apiKey, apiSecret } = getLiveKitConfig();
+  return new RoomServiceClient(apiUrl, apiKey, apiSecret);
+}
+
+function agentDispatchService() {
+  const { apiUrl, apiKey, apiSecret } = getLiveKitConfig();
+  return new AgentDispatchClient(apiUrl, apiKey, apiSecret);
 }
 
 async function createParticipantToken({ roomName, identity, name, metadata }) {
@@ -22,6 +34,6 @@ async function createParticipantToken({ roomName, identity, name, metadata }) {
   return await at.toJwt();
 }
 
-module.exports = { roomService, createParticipantToken };
+module.exports = { roomService, agentDispatchService, createParticipantToken };
 
 
