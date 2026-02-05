@@ -22,6 +22,7 @@ function rowToAgent(r) {
     welcome: r.welcome ?? {},
     voice: r.voice ?? {},
     llmModel: r.llm_model ?? "",
+    autoEvalEnabled: Boolean(r.auto_eval_enabled),
     knowledgeFolderIds: Array.isArray(r.knowledge_folder_ids) ? r.knowledge_folder_ids : (r.knowledge_folder_ids ?? []),
     maxCallSeconds: Number(r.max_call_seconds || 0),
     createdAt: r.created_at,
@@ -449,6 +450,7 @@ async function createAgent({
   welcome = null,
   voice = null,
   llmModel = "",
+  autoEvalEnabled = false,
   knowledgeFolderIds = [],
   maxCallSeconds = 0,
 }) {
@@ -474,8 +476,8 @@ async function createAgent({
 
   const { rows } = await p.query(
     `
-    INSERT INTO agents (id, workspace_id, name, prompt_draft, prompt_published, published_at, welcome, voice, llm_model, knowledge_folder_ids, max_call_seconds, created_at, updated_at)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+    INSERT INTO agents (id, workspace_id, name, prompt_draft, prompt_published, published_at, welcome, voice, llm_model, auto_eval_enabled, knowledge_folder_ids, max_call_seconds, created_at, updated_at)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
     RETURNING *
   `,
     [
@@ -488,6 +490,7 @@ async function createAgent({
       JSON.stringify(welcomeNorm),
       JSON.stringify(voiceNorm),
       String(llmModel || ""),
+      Boolean(autoEvalEnabled),
       JSON.stringify(Array.isArray(knowledgeFolderIds) ? knowledgeFolderIds : []),
       Math.max(0, Math.round(Number(maxCallSeconds || 0))),
       now,
@@ -503,7 +506,11 @@ async function getAgent(workspaceId, id) {
   return rows[0] ? rowToAgent(rows[0]) : null;
 }
 
-async function updateAgent(workspaceId, id, { name, promptDraft, publish, welcome, voice, llmModel, knowledgeFolderIds, maxCallSeconds }) {
+async function updateAgent(
+  workspaceId,
+  id,
+  { name, promptDraft, publish, welcome, voice, llmModel, autoEvalEnabled, knowledgeFolderIds, maxCallSeconds }
+) {
   const p = getPool();
   const current = await getAgent(workspaceId, id);
   if (!current) return null;
@@ -533,6 +540,7 @@ async function updateAgent(workspaceId, id, { name, promptDraft, publish, welcom
   const nextKbFolderIds = Array.isArray(knowledgeFolderIds) ? knowledgeFolderIds : (current.knowledgeFolderIds ?? []);
   const nextMaxCallSeconds =
     maxCallSeconds == null ? Number(current.maxCallSeconds || 0) : Math.max(0, Math.round(Number(maxCallSeconds || 0)));
+  const nextAutoEvalEnabled = autoEvalEnabled == null ? Boolean(current.autoEvalEnabled) : Boolean(autoEvalEnabled);
 
   const updatedAt = Date.now();
   const { rows } = await p.query(
@@ -545,10 +553,11 @@ async function updateAgent(workspaceId, id, { name, promptDraft, publish, welcom
         welcome=$6,
         voice=$7,
         llm_model=$8,
-        knowledge_folder_ids=$9,
-        max_call_seconds=$10,
-        updated_at=$11
-    WHERE workspace_id=$12 AND id=$1
+        auto_eval_enabled=$9,
+        knowledge_folder_ids=$10,
+        max_call_seconds=$11,
+        updated_at=$12
+    WHERE workspace_id=$13 AND id=$1
     RETURNING *
   `,
     [
@@ -560,6 +569,7 @@ async function updateAgent(workspaceId, id, { name, promptDraft, publish, welcom
       JSON.stringify(welcomeNorm),
       JSON.stringify(voiceNorm),
       nextLlmModel,
+      nextAutoEvalEnabled,
       JSON.stringify(nextKbFolderIds),
       nextMaxCallSeconds,
       updatedAt,
@@ -963,7 +973,9 @@ function rowToCallEvaluation(r) {
     callId: r.call_id,
     workspaceId: r.workspace_id,
     score: Number(r.score || 0),
+    source: r.source ?? "manual",
     notes: r.notes ?? "",
+    details: r.details ?? {},
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   };
@@ -978,18 +990,18 @@ async function listCallEvaluations(workspaceId, callId) {
   return rows.map(rowToCallEvaluation);
 }
 
-async function createCallEvaluation(workspaceId, callId, { score, notes }) {
+async function createCallEvaluation(workspaceId, callId, { score, notes, source = "manual", details = {} }) {
   const p = getPool();
   const now = Date.now();
   const id = nanoid(10);
   const s = Math.max(0, Math.min(100, Math.round(Number(score || 0))));
   const { rows } = await p.query(
     `
-    INSERT INTO call_evaluations (id, call_id, workspace_id, score, notes, created_at, updated_at)
-    VALUES ($1,$2,$3,$4,$5,$6,$7)
+    INSERT INTO call_evaluations (id, call_id, workspace_id, score, source, notes, details, created_at, updated_at)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
     RETURNING *
   `,
-    [id, callId, workspaceId, s, String(notes || ""), now, now]
+    [id, callId, workspaceId, s, String(source || "manual"), String(notes || ""), JSON.stringify(details || {}), now, now]
   );
   return rowToCallEvaluation(rows[0]);
 }

@@ -99,6 +99,7 @@ async function initSchema() {
       welcome JSONB NOT NULL DEFAULT '{}'::jsonb,
       voice JSONB NOT NULL DEFAULT '{}'::jsonb,
       llm_model TEXT NOT NULL DEFAULT '',
+      auto_eval_enabled BOOLEAN NOT NULL DEFAULT false,
       knowledge_folder_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
       max_call_seconds INT NOT NULL DEFAULT 0,
       created_at BIGINT NOT NULL,
@@ -109,6 +110,7 @@ async function initSchema() {
   await p.query(`ALTER TABLE agents ADD COLUMN IF NOT EXISTS workspace_id TEXT NULL;`);
   await p.query(`ALTER TABLE agents ADD COLUMN IF NOT EXISTS voice JSONB NOT NULL DEFAULT '{}'::jsonb;`);
   await p.query(`ALTER TABLE agents ADD COLUMN IF NOT EXISTS llm_model TEXT NOT NULL DEFAULT '';`);
+  await p.query(`ALTER TABLE agents ADD COLUMN IF NOT EXISTS auto_eval_enabled BOOLEAN NOT NULL DEFAULT false;`);
   await p.query(`ALTER TABLE agents ADD COLUMN IF NOT EXISTS knowledge_folder_ids JSONB NOT NULL DEFAULT '[]'::jsonb;`);
   await p.query(`ALTER TABLE agents ADD COLUMN IF NOT EXISTS max_call_seconds INT NOT NULL DEFAULT 0;`);
   await p.query(`CREATE INDEX IF NOT EXISTS agents_workspace_idx ON agents(workspace_id, created_at DESC);`);
@@ -194,11 +196,15 @@ async function initSchema() {
       call_id TEXT NOT NULL,
       workspace_id TEXT NOT NULL,
       score INT NOT NULL,
+      source TEXT NOT NULL DEFAULT 'manual',
       notes TEXT NOT NULL DEFAULT '',
+      details JSONB NOT NULL DEFAULT '{}'::jsonb,
       created_at BIGINT NOT NULL,
       updated_at BIGINT NOT NULL
     );
   `);
+  await p.query(`ALTER TABLE call_evaluations ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'manual';`);
+  await p.query(`ALTER TABLE call_evaluations ADD COLUMN IF NOT EXISTS details JSONB NOT NULL DEFAULT '{}'::jsonb;`);
   await p.query(`CREATE INDEX IF NOT EXISTS call_evaluations_call_idx ON call_evaluations(call_id, created_at DESC);`);
 
   // Call labels / tags

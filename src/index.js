@@ -1313,6 +1313,63 @@ function openaiGenerateAgentPrompt({ apiKey, model, input }) {
   });
 }
 
+function openaiAutoEvaluateCall({ apiKey, model, input }) {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify({
+      model,
+      temperature: 0.2,
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are a strict QA evaluator for voice agents. " +
+            "Return ONLY valid JSON with keys: score (0-100), summary (string), " +
+            "strengths (array of strings), issues (array of strings), " +
+            "suggestedFixes (array of strings), nextTests (array of strings). " +
+            "Be concise, actionable, and grounded in the transcript.",
+        },
+        {
+          role: "user",
+          content: JSON.stringify(input, null, 2),
+        },
+      ],
+    });
+
+    const req = https.request(
+      {
+        hostname: "api.openai.com",
+        path: "/v1/chat/completions",
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${apiKey}`,
+          "content-type": "application/json",
+          "content-length": Buffer.byteLength(body),
+        },
+      },
+      (res) => {
+        let data = "";
+        res.on("data", (c) => (data += c));
+        res.on("end", () => {
+          try {
+            if (res.statusCode < 200 || res.statusCode >= 300) {
+              return reject(new Error(`OpenAI error ${res.statusCode}: ${String(data).slice(0, 400)}`));
+            }
+            const parsed = JSON.parse(data);
+            const txt =
+              parsed?.choices?.[0]?.message?.content != null ? String(parsed.choices[0].message.content) : "";
+            resolve(txt);
+          } catch (e) {
+            reject(e);
+          }
+        });
+      }
+    );
+    req.on("error", reject);
+    req.write(body);
+    req.end();
+  });
+}
+
 // Serve uploaded call recordings (web-test recordings)
 const RECORDINGS_DIR = path.join(__dirname, "..", "recordings");
 if (!fs.existsSync(RECORDINGS_DIR)) fs.mkdirSync(RECORDINGS_DIR, { recursive: true });
@@ -1336,6 +1393,7 @@ app.post("/api/agents", requireAuth, async (req, res) => {
     welcome: WelcomeConfigSchema,
     voice: VoiceConfigSchema,
     llmModel: LlmModelSchema,
+    autoEvalEnabled: z.boolean().optional(),
     knowledgeFolderIds: KnowledgeFolderIdsSchema,
     maxCallSeconds: MaxCallSecondsSchema,
   });
@@ -1367,6 +1425,7 @@ app.post("/api/agents", requireAuth, async (req, res) => {
     promptPublished: parsed.data.promptPublished ?? "",
     publishedAt: parsed.data.promptPublished ? now : null,
     llmModel: parsed.data.llmModel ?? cfg.defaultLlmModel,
+    autoEvalEnabled: Boolean(parsed.data.autoEvalEnabled),
     knowledgeFolderIds: parsed.data.knowledgeFolderIds ?? [],
     maxCallSeconds: Math.max(0, Math.round(Number(parsed.data.maxCallSeconds || 0))),
     welcome: {
@@ -1493,6 +1552,7 @@ app.put("/api/agents/:id", requireAuth, async (req, res) => {
     welcome: WelcomeConfigSchema,
     voice: VoiceConfigSchema,
     llmModel: LlmModelSchema,
+    autoEvalEnabled: z.boolean().optional(),
     knowledgeFolderIds: KnowledgeFolderIdsSchema,
     maxCallSeconds: MaxCallSecondsSchema,
   });
@@ -1533,6 +1593,7 @@ app.put("/api/agents/:id", requireAuth, async (req, res) => {
     welcome: parsed.data.welcome ? { ...(current.welcome ?? {}), ...parsed.data.welcome } : current.welcome,
     voice: parsed.data.voice ? { ...(current.voice ?? {}), ...parsed.data.voice } : current.voice,
     llmModel: parsed.data.llmModel ?? (current.llmModel ?? ""),
+    autoEvalEnabled: parsed.data.autoEvalEnabled == null ? (current.autoEvalEnabled ?? false) : Boolean(parsed.data.autoEvalEnabled),
     knowledgeFolderIds: parsed.data.knowledgeFolderIds ?? (current.knowledgeFolderIds ?? []),
     maxCallSeconds:
       parsed.data.maxCallSeconds == null
@@ -2267,8 +2328,69 @@ app.post("/api/calls/:id/evaluations", requireAuth, async (req, res) => {
   });
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "Validation failed", details: parsed.error.flatten() });
-  const row = await store.createCallEvaluation(req.workspace.id, callId, parsed.data);
+  const row = await store.createCallEvaluation(req.workspace.id, callId, { ...parsed.data, source: "manual" });
   return res.status(201).json({ evaluation: row });
+});
+
+// Auto-evaluate a call with AI
+app.post("/api/calls/:id/auto-evaluate", requireAuth, async (req, res) => {
+  if (!USE_DB) return res.status(400).json({ error: "Evaluations require Postgres mode" });
+  const callId = String(req.params.id || "").trim();
+  const call = await store.getCall(req.workspace.id, callId);
+  if (!call) return res.status(404).json({ error: "Call not found" });
+  if (!call.transcript || call.transcript.length === 0) {
+    return res.status(400).json({ error: "Transcript required for auto evaluation" });
+  }
+
+  const apiKey = String(process.env.OPENAI_API_KEY || "").trim();
+  if (!apiKey) return res.status(500).json({ error: "OPENAI_API_KEY is not set on the server" });
+  const model = String(process.env.OPENAI_EVAL_MODEL || process.env.OPENAI_GENERATE_MODEL || "gpt-4.1-mini").trim();
+
+  const agent = await store.getAgent(req.workspace.id, call.agentId);
+  const transcriptText = call.transcript
+    .map((t) => `${t.role === "user" ? "USER" : "AGENT"}: ${String(t.text || "").trim()}`)
+    .filter(Boolean)
+    .join("\n")
+    .slice(0, 9000);
+
+  try {
+    const raw = await openaiAutoEvaluateCall({
+      apiKey,
+      model,
+      input: {
+        agentName: agent?.name ?? call.agentName ?? "Agent",
+        prompt: agent?.promptPublished ?? agent?.promptDraft ?? "",
+        outcome: call.outcome ?? null,
+        durationSec: call.durationSec ?? null,
+        transcript: transcriptText,
+      },
+    });
+    const text = String(raw || "").trim();
+    let details = null;
+    try {
+      details = JSON.parse(text);
+    } catch {
+      const start = text.indexOf("{");
+      const end = text.lastIndexOf("}");
+      if (start !== -1 && end !== -1 && end > start) {
+        details = JSON.parse(text.slice(start, end + 1));
+      }
+    }
+    if (!details || typeof details !== "object") {
+      return res.status(502).json({ error: "Auto evaluation failed to parse JSON" });
+    }
+    const score = Math.max(0, Math.min(100, Math.round(Number(details.score ?? 0))));
+    const summary = typeof details.summary === "string" ? details.summary : "";
+    const row = await store.createCallEvaluation(req.workspace.id, callId, {
+      score,
+      notes: summary,
+      source: "auto",
+      details,
+    });
+    return res.status(201).json({ evaluation: row });
+  } catch (e) {
+    return res.status(502).json({ error: "Auto evaluation failed" });
+  }
 });
 
 // Call labels (tags)
@@ -3094,6 +3216,60 @@ app.post("/api/calls/:id/end", requireAuth, async (req, res) => {
     } catch (e) {
       logger.warn({ requestId: req.requestId, err: String(e?.message || e) }, "[calls.end] billing finalize failed");
       sendAlert("billing_finalize_failed", { requestId: req.requestId, error: String(e?.message || e) });
+    }
+
+    // Auto-evaluate in the background if enabled on the agent.
+    if (updated?.agentId) {
+      setTimeout(async () => {
+        try {
+          const agent = await store.getAgent(req.workspace.id, updated.agentId);
+          if (!agent?.autoEvalEnabled) return;
+          const apiKey = String(process.env.OPENAI_API_KEY || "").trim();
+          if (!apiKey) return;
+          const transcriptText = (updated.transcript ?? [])
+            .map((t) => `${t.role === "user" ? "USER" : "AGENT"}: ${String(t.text || "").trim()}`)
+            .filter(Boolean)
+            .join("\n")
+            .slice(0, 9000);
+          if (!transcriptText) return;
+          const existing = await store.listCallEvaluations(req.workspace.id, updated.id);
+          if (existing.some((e) => e.source === "auto")) return;
+          const model = String(process.env.OPENAI_EVAL_MODEL || process.env.OPENAI_GENERATE_MODEL || "gpt-4.1-mini").trim();
+          const raw = await openaiAutoEvaluateCall({
+            apiKey,
+            model,
+            input: {
+              agentName: agent?.name ?? updated.agentName ?? "Agent",
+              prompt: agent?.promptPublished ?? agent?.promptDraft ?? "",
+              outcome: updated.outcome ?? null,
+              durationSec: updated.durationSec ?? null,
+              transcript: transcriptText,
+            },
+          });
+          const text = String(raw || "").trim();
+          let details = null;
+          try {
+            details = JSON.parse(text);
+          } catch {
+            const start = text.indexOf("{");
+            const end = text.lastIndexOf("}");
+            if (start !== -1 && end !== -1 && end > start) {
+              details = JSON.parse(text.slice(start, end + 1));
+            }
+          }
+          if (!details || typeof details !== "object") return;
+          const score = Math.max(0, Math.min(100, Math.round(Number(details.score ?? 0))));
+          const summary = typeof details.summary === "string" ? details.summary : "";
+          await store.createCallEvaluation(req.workspace.id, updated.id, {
+            score,
+            notes: summary,
+            source: "auto",
+            details,
+          });
+        } catch {
+          // ignore auto-eval errors
+        }
+      }, 0);
     }
     return res.json({ call: updated });
   }
