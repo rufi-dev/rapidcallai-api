@@ -1,4 +1,10 @@
-const { nanoid } = require("nanoid");
+// Ensure server/.env is loaded for the worker process.
+require("dotenv").config({
+  path: require("path").join(__dirname, "..", ".env"),
+  override: true,
+});
+
+const { nanoid } = require("./id");
 const { logger } = require("./logger");
 const store = require("./store_pg");
 const { roomService } = require("./livekit");

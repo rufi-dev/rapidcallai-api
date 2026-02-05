@@ -1,4 +1,4 @@
-const { nanoid } = require("nanoid");
+const { nanoid } = require("./id");
 const { getPool } = require("./db");
 
 function rowToUser(r) {
