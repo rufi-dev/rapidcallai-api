@@ -409,38 +409,49 @@ const KnowledgeFolderIdsSchema = z.array(z.string().min(1).max(40)).max(50).opti
 
 // Allow one or many origins. Use comma-separated list in CLIENT_ORIGIN, e.g.:
 // CLIENT_ORIGIN=https://dashboard.rapidcallai.com,http://localhost:5173
+// Use "*" to allow any origin (not recommended for production).
 const clientOrigins = String(process.env.CLIENT_ORIGIN || "http://localhost:5173")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
 
-app.use(
-  cors({
-    origin(origin, cb) {
-      // Allow non-browser requests (no Origin header)
-      if (!origin) return cb(null, true);
-      if (clientOrigins.includes(origin)) return cb(null, true);
-      return cb(new Error(`CORS blocked for origin: ${origin}`));
-    },
+function isAuthPath(pathname) {
+  return pathname === "/api/auth/login" || pathname === "/api/auth/register";
+}
+
+function isAllowedOrigin(origin) {
+  if (!origin) return false;
+  if (clientOrigins.includes("*")) return true;
+  return clientOrigins.includes(origin);
+}
+
+app.use((req, res, next) => {
+  const origin = String(req.headers.origin || "").trim();
+  const allowAll = clientOrigins.includes("*");
+  const allowOrigin =
+    !origin ? true : allowAll || isAllowedOrigin(origin) || (isAuthPath(req.path) && origin);
+  return cors({
+    origin: allowOrigin ? (origin || true) : false,
     credentials: true,
     // Explicitly allow auth header; without this, browsers can block the GET after a successful preflight.
     allowedHeaders: ["authorization", "content-type", "x-agent-secret"],
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     exposedHeaders: ["content-range", "accept-ranges", "content-length"],
     optionsSuccessStatus: 204,
-  })
-);
+  })(req, res, next);
+});
 
 // Enforce Origin + CSRF for state-changing requests when using cookie auth.
 app.use((req, res, next) => {
   if (!isUnsafeMethod(req.method)) return next();
   if (req.method === "OPTIONS") return next();
+  if (isAuthPath(req.path)) return next();
 
   const origin = String(req.headers.origin || "").trim();
   const referer = String(req.headers.referer || "").trim();
   const derivedOrigin = origin || extractOriginFromReferer(referer);
   if (!derivedOrigin || !isAllowedOrigin(derivedOrigin)) {
-    return res.status(403).json({ error: "Origin not allowed" });
+    return res.status(403).json({ error: "Origin not allowed. Add it to CLIENT_ORIGIN." });
   }
 
   // If using Bearer token, skip CSRF (token is not sent automatically by browser).
@@ -675,10 +686,6 @@ function isUnsafeMethod(method) {
   return m === "POST" || m === "PUT" || m === "PATCH" || m === "DELETE";
 }
 
-function isAllowedOrigin(origin) {
-  if (!origin) return false;
-  return clientOrigins.includes(origin);
-}
 
 function extractOriginFromReferer(referer) {
   try {
