@@ -71,6 +71,7 @@ async function buyNumber({ subaccountSid, phoneNumber, friendlyName }) {
 
 module.exports = {
   getMasterCreds,
+  getSubaccountClient,
   ensureSubaccount,
   searchAvailableNumbers,
   buyNumber,
