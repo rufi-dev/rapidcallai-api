@@ -171,6 +171,48 @@ async function initSchema() {
   await p.query(`CREATE INDEX IF NOT EXISTS calls_agent_started_idx ON calls(agent_id, started_at DESC);`);
   await p.query(`CREATE INDEX IF NOT EXISTS calls_workspace_started_idx ON calls(workspace_id, started_at DESC);`);
 
+  // Agent variants (A/B prompt testing)
+  await p.query(`
+    CREATE TABLE IF NOT EXISTS agent_variants (
+      id TEXT PRIMARY KEY,
+      agent_id TEXT NOT NULL,
+      workspace_id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      prompt TEXT NOT NULL,
+      traffic_percent INT NOT NULL DEFAULT 0,
+      enabled BOOLEAN NOT NULL DEFAULT true,
+      created_at BIGINT NOT NULL,
+      updated_at BIGINT NOT NULL
+    );
+  `);
+  await p.query(`CREATE INDEX IF NOT EXISTS agent_variants_agent_idx ON agent_variants(agent_id, created_at DESC);`);
+
+  // Call evaluations (QA / grading)
+  await p.query(`
+    CREATE TABLE IF NOT EXISTS call_evaluations (
+      id TEXT PRIMARY KEY,
+      call_id TEXT NOT NULL,
+      workspace_id TEXT NOT NULL,
+      score INT NOT NULL,
+      notes TEXT NOT NULL DEFAULT '',
+      created_at BIGINT NOT NULL,
+      updated_at BIGINT NOT NULL
+    );
+  `);
+  await p.query(`CREATE INDEX IF NOT EXISTS call_evaluations_call_idx ON call_evaluations(call_id, created_at DESC);`);
+
+  // Call labels / tags
+  await p.query(`
+    CREATE TABLE IF NOT EXISTS call_labels (
+      id TEXT PRIMARY KEY,
+      call_id TEXT NOT NULL,
+      workspace_id TEXT NOT NULL,
+      label TEXT NOT NULL,
+      created_at BIGINT NOT NULL
+    );
+  `);
+  await p.query(`CREATE INDEX IF NOT EXISTS call_labels_call_idx ON call_labels(call_id, created_at DESC);`);
+
   await p.query(`
     CREATE TABLE IF NOT EXISTS phone_numbers (
       id TEXT PRIMARY KEY,

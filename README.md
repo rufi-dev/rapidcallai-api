@@ -118,6 +118,32 @@ The Python agent posts metrics to:
 
 ```
 POST /api/calls/:callId/metrics
+
+## Observability (recommended for production)
+
+**Structured logs (JSON):**
+- Install `pino` + `pino-http` and set `LOG_LEVEL=info`
+
+**Alerting:**
+- Set `ALERT_WEBHOOK_URL` to receive billing/egress failure alerts
+
+## Security & secrets rotation (recommended)
+
+**Secrets to rotate regularly:**
+- `AGENT_SHARED_SECRET`
+- `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET`
+- `STRIPE_SECRET_KEY` / `STRIPE_WEBHOOK_SECRET`
+- `TWILIO_AUTH_TOKEN`
+- `EGRESS_S3_ACCESS_KEY` / `EGRESS_S3_SECRET`
+
+**Rotation plan:**
+1) Create a new secret in the provider (Stripe/Twilio/LiveKit/AWS).
+2) Add the new secret to your `.env` (or secret manager) **alongside** the old one.
+3) Deploy the API/agent with both secrets temporarily supported.
+4) Verify new traffic works (logins, calls, webhooks).
+5) Remove the old secret and redeploy.
+
+**Tip:** Keep a calendar reminder (monthly or quarterly) and log each rotation.
 ```
 
 For this to work in LiveKit Cloud, the agent must have:

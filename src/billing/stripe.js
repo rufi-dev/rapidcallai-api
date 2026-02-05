@@ -5,6 +5,19 @@ const querystring = require("querystring");
 let stripe = null;
 const priceInfoCache = new Map(); // priceId -> { atMs, info }
 const PRICE_CACHE_TTL_MS = 10 * 60 * 1000;
+const STRIPE_CIRCUIT = {
+  failures: 0,
+  openUntilMs: 0,
+};
+
+function isRetryableStripeStatus(status) {
+  return status >= 500 || status === 0 || status === 408 || status === 429;
+}
+
+function isRetryableStripeError(e) {
+  const msg = String(e?.message || e);
+  return /timeout/i.test(msg) || /ECONNRESET/i.test(msg) || /rate/i.test(msg);
+}
 
 function getStripe() {
   const key = String(process.env.STRIPE_SECRET_KEY || "").trim();
@@ -57,10 +70,57 @@ function stripeRequestJson({ method, path, apiKey, body, timeoutMs = 10000 }) {
   });
 }
 
+async function stripeRequestJsonWithRetry({ method, path, apiKey, body, timeoutMs = 10000, maxRetries = 3 }) {
+  const now = Date.now();
+  if (STRIPE_CIRCUIT.openUntilMs > now) {
+    throw new Error("Stripe circuit open; retry later");
+  }
+  for (let attempt = 0; attempt < maxRetries; attempt += 1) {
+    try {
+      const res = await stripeRequestJson({ method, path, apiKey, body, timeoutMs });
+      if (res.status >= 200 && res.status < 300) {
+        STRIPE_CIRCUIT.failures = 0;
+        STRIPE_CIRCUIT.openUntilMs = 0;
+        return res;
+      }
+      if (isRetryableStripeStatus(res.status) && attempt < maxRetries - 1) {
+        STRIPE_CIRCUIT.failures += 1;
+        await new Promise((r) => setTimeout(r, 500 * (2 ** attempt)));
+        continue;
+      }
+      if (isRetryableStripeStatus(res.status)) {
+        STRIPE_CIRCUIT.failures += 1;
+      } else {
+        STRIPE_CIRCUIT.failures = 0;
+      }
+      if (STRIPE_CIRCUIT.failures >= 5) STRIPE_CIRCUIT.openUntilMs = Date.now() + 60_000;
+      return res;
+    } catch (e) {
+      STRIPE_CIRCUIT.failures += 1;
+      if (STRIPE_CIRCUIT.failures >= 5) STRIPE_CIRCUIT.openUntilMs = Date.now() + 60_000;
+      if (attempt >= maxRetries - 1 || !isRetryableStripeError(e)) throw e;
+      await new Promise((r) => setTimeout(r, 500 * (2 ** attempt)));
+    }
+  }
+  throw new Error("Stripe request failed after retries");
+}
+
+async function stripeSdkWithRetry(fn, maxRetries = 3) {
+  for (let attempt = 0; attempt < maxRetries; attempt += 1) {
+    try {
+      return await fn();
+    } catch (e) {
+      if (attempt >= maxRetries - 1 || !isRetryableStripeError(e)) throw e;
+      await new Promise((r) => setTimeout(r, 500 * (2 ** attempt)));
+    }
+  }
+  throw new Error("Stripe SDK call failed after retries");
+}
+
 async function retrieveStripePrice(priceId) {
   const s = getStripe();
   if (!s) throw new Error("Stripe not configured (STRIPE_SECRET_KEY missing)");
-  return await s.prices.retrieve(String(priceId));
+  return await stripeSdkWithRetry(() => s.prices.retrieve(String(priceId)));
 }
 
 function priceUnitUsdFromStripePrice(price) {
@@ -110,7 +170,11 @@ async function retrieveStripeMeter(meterId) {
   const key = String(process.env.STRIPE_SECRET_KEY || "").trim();
   const id = String(meterId || "").trim();
   if (!id) throw new Error("meterId missing");
-  const res = await stripeRequestJson({ method: "GET", path: `/v1/billing/meters/${encodeURIComponent(id)}`, apiKey: key });
+  const res = await stripeRequestJsonWithRetry({
+    method: "GET",
+    path: `/v1/billing/meters/${encodeURIComponent(id)}`,
+    apiKey: key,
+  });
   if (res.status >= 200 && res.status < 300) return { ok: true, meter: res.json || null };
   return { ok: false, status: res.status, error: res.json?.error?.message || res.text };
 }
@@ -141,7 +205,7 @@ async function createStripeMeterEvent({ customerId, meterId, value, timestampSec
     ...(timestampSec ? { timestamp: String(timestampSec) } : {}),
   };
 
-  const res = await stripeRequestJson({
+  const res = await stripeRequestJsonWithRetry({
     method: "POST",
     path: "/v1/billing/meter_events",
     apiKey: key,
@@ -350,10 +414,12 @@ async function recordUsageForSubscription({ subscriptionId, usageByPriceId, time
 
     try {
       const idempotencyKey = `${String(idempotencyKeyPrefix || "usage")}:${subscriptionId}:${priceId}`;
-      const r = await s.subscriptionItems.createUsageRecord(
-        itemId,
-        { quantity, timestamp: ts, action: "increment" },
-        { idempotencyKey }
+      const r = await stripeSdkWithRetry(() =>
+        s.subscriptionItems.createUsageRecord(
+          itemId,
+          { quantity, timestamp: ts, action: "increment" },
+          { idempotencyKey }
+        )
       );
       results[priceId] = { ok: true, usageRecordId: r?.id ?? null, quantity };
     } catch (e) {

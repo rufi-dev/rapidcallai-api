@@ -888,6 +888,151 @@ async function upsertCallForMigration(call) {
   );
 }
 
+function rowToAgentVariant(r) {
+  return {
+    id: r.id,
+    agentId: r.agent_id,
+    workspaceId: r.workspace_id,
+    name: r.name,
+    prompt: r.prompt,
+    trafficPercent: Number(r.traffic_percent || 0),
+    enabled: Boolean(r.enabled),
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+  };
+}
+
+async function listAgentVariants(workspaceId, agentId) {
+  const p = getPool();
+  const { rows } = await p.query(
+    `SELECT * FROM agent_variants WHERE workspace_id=$1 AND agent_id=$2 ORDER BY created_at DESC`,
+    [workspaceId, agentId]
+  );
+  return rows.map(rowToAgentVariant);
+}
+
+async function createAgentVariant(workspaceId, agentId, { name, prompt, trafficPercent = 0, enabled = true }) {
+  const p = getPool();
+  const now = Date.now();
+  const id = nanoid(10);
+  const tp = Math.max(0, Math.min(100, Math.round(Number(trafficPercent || 0))));
+  const { rows } = await p.query(
+    `
+    INSERT INTO agent_variants (id, agent_id, workspace_id, name, prompt, traffic_percent, enabled, created_at, updated_at)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+    RETURNING *
+  `,
+    [id, agentId, workspaceId, name, prompt, tp, Boolean(enabled), now, now]
+  );
+  return rowToAgentVariant(rows[0]);
+}
+
+async function updateAgentVariant(workspaceId, id, patch) {
+  const p = getPool();
+  const { rows } = await p.query(`SELECT * FROM agent_variants WHERE workspace_id=$1 AND id=$2`, [workspaceId, id]);
+  if (!rows[0]) return null;
+  const cur = rowToAgentVariant(rows[0]);
+  const next = {
+    name: patch.name ?? cur.name,
+    prompt: patch.prompt ?? cur.prompt,
+    trafficPercent:
+      patch.trafficPercent == null ? cur.trafficPercent : Math.max(0, Math.min(100, Math.round(Number(patch.trafficPercent || 0)))),
+    enabled: patch.enabled == null ? cur.enabled : Boolean(patch.enabled),
+  };
+  const updatedAt = Date.now();
+  const { rows: rows2 } = await p.query(
+    `
+    UPDATE agent_variants
+    SET name=$1, prompt=$2, traffic_percent=$3, enabled=$4, updated_at=$5
+    WHERE workspace_id=$6 AND id=$7
+    RETURNING *
+  `,
+    [next.name, next.prompt, next.trafficPercent, next.enabled, updatedAt, workspaceId, id]
+  );
+  return rows2[0] ? rowToAgentVariant(rows2[0]) : null;
+}
+
+async function deleteAgentVariant(workspaceId, id) {
+  const p = getPool();
+  await p.query(`DELETE FROM agent_variants WHERE workspace_id=$1 AND id=$2`, [workspaceId, id]);
+}
+
+function rowToCallEvaluation(r) {
+  return {
+    id: r.id,
+    callId: r.call_id,
+    workspaceId: r.workspace_id,
+    score: Number(r.score || 0),
+    notes: r.notes ?? "",
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+  };
+}
+
+async function listCallEvaluations(workspaceId, callId) {
+  const p = getPool();
+  const { rows } = await p.query(
+    `SELECT * FROM call_evaluations WHERE workspace_id=$1 AND call_id=$2 ORDER BY created_at DESC`,
+    [workspaceId, callId]
+  );
+  return rows.map(rowToCallEvaluation);
+}
+
+async function createCallEvaluation(workspaceId, callId, { score, notes }) {
+  const p = getPool();
+  const now = Date.now();
+  const id = nanoid(10);
+  const s = Math.max(0, Math.min(100, Math.round(Number(score || 0))));
+  const { rows } = await p.query(
+    `
+    INSERT INTO call_evaluations (id, call_id, workspace_id, score, notes, created_at, updated_at)
+    VALUES ($1,$2,$3,$4,$5,$6,$7)
+    RETURNING *
+  `,
+    [id, callId, workspaceId, s, String(notes || ""), now, now]
+  );
+  return rowToCallEvaluation(rows[0]);
+}
+
+function rowToCallLabel(r) {
+  return {
+    id: r.id,
+    callId: r.call_id,
+    workspaceId: r.workspace_id,
+    label: r.label,
+    createdAt: r.created_at,
+  };
+}
+
+async function listCallLabels(workspaceId, callId) {
+  const p = getPool();
+  const { rows } = await p.query(
+    `SELECT * FROM call_labels WHERE workspace_id=$1 AND call_id=$2 ORDER BY created_at DESC`,
+    [workspaceId, callId]
+  );
+  return rows.map(rowToCallLabel);
+}
+
+async function addCallLabel(workspaceId, callId, label) {
+  const p = getPool();
+  const now = Date.now();
+  const id = nanoid(10);
+  const { rows } = await p.query(
+    `
+    INSERT INTO call_labels (id, call_id, workspace_id, label, created_at)
+    VALUES ($1,$2,$3,$4,$5)
+    RETURNING *
+  `,
+    [id, callId, workspaceId, String(label || "").trim(), now]
+  );
+  return rowToCallLabel(rows[0]);
+}
+
+async function deleteCallLabel(workspaceId, callId, label) {
+  const p = getPool();
+  await p.query(`DELETE FROM call_labels WHERE workspace_id=$1 AND call_id=$2 AND label=$3`, [workspaceId, callId, label]);
+}
+
 module.exports = {
   // Auth
   createUser,
@@ -934,6 +1079,21 @@ module.exports = {
   getCallById,
   upsertAgentForMigration,
   upsertCallForMigration,
+
+  // A/B variants
+  listAgentVariants,
+  createAgentVariant,
+  updateAgentVariant,
+  deleteAgentVariant,
+
+  // Call evaluations
+  listCallEvaluations,
+  createCallEvaluation,
+
+  // Call labels
+  listCallLabels,
+  addCallLabel,
+  deleteCallLabel,
 };
 
 

@@ -52,6 +52,22 @@ async function finalizeBillingForCall({ store, call }) {
 
   const metrics = safeObj(call.metrics);
   const billingPrev = safeObj(metrics.billing);
+  const finalizeKey = `${call.id}:${Number(call.endedAt || 0)}`;
+  if (billingPrev.finalizeKey === finalizeKey && billingPrev.finalizedAt) {
+    return null;
+  }
+  if (billingPrev.finalizeKey !== finalizeKey) {
+    await store.updateCall(call.id, {
+      metrics: {
+        ...metrics,
+        billing: {
+          ...billingPrev,
+          finalizeKey,
+          finalizeStartedAt: Date.now(),
+        },
+      },
+    });
+  }
 
   // --- Trial debit (WEB only) ---
   if (ws.isTrial && !ws.isPaid) {
@@ -77,6 +93,8 @@ async function finalizeBillingForCall({ store, call }) {
             tokenOverage1k: q.tokenOverage1k,
             trialDebitedUsd: debitUsd,
             trialDebitedAt: Date.now(),
+            finalizeKey,
+            finalizedAt: Date.now(),
           },
         },
       });
@@ -203,6 +221,9 @@ async function finalizeBillingForCall({ store, call }) {
       .map(([k]) => k);
     const allRequiredSent = requiredTypes.every((t) => Boolean(nextEvents[t]?.sentAt));
 
+    const shouldFinalize =
+      allRequiredSent && (!ws.stripeCustomerId || Boolean(nextStripe?.sentAt));
+
     await store.updateCall(call.id, {
       metrics: {
         ...metrics,
@@ -216,6 +237,8 @@ async function finalizeBillingForCall({ store, call }) {
           openmeterLastAttemptAt: Date.now(),
           openmeterSentAt: allRequiredSent ? Date.now() : null,
           stripeUsage: nextStripe,
+          finalizeKey,
+          finalizedAt: shouldFinalize ? Date.now() : null,
         },
       },
     });

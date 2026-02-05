@@ -17,6 +17,8 @@ const multer = require("multer");
 const pdfParse = require("pdf-parse");
 const promClient = require("prom-client");
 const { WebhookReceiver } = require("livekit-server-sdk");
+const { logger, requestLogger } = require("./logger");
+const { sendAlert } = require("./alerting");
 
 // Upload helpers (must be defined BEFORE any routes that reference them).
 const kbUpload = multer({
@@ -207,6 +209,9 @@ app.use((req, res, next) => {
   return next();
 });
 
+// Request logging (structured JSON when pino is installed)
+app.use(requestLogger());
+
 // Simple in-memory rate limiter (per instance).
 const rateLimitBuckets = new Map();
 function rateLimit({ windowMs, max, keyPrefix }) {
@@ -247,7 +252,7 @@ app.post("/api/livekit/webhook", express.raw({ type: "application/webhook+json" 
     const auth = req.get("Authorization") || req.get("Authorize") || "";
     if (!auth) {
       // eslint-disable-next-line no-console
-      console.warn("[livekit.webhook] missing Authorization header");
+      logger.warn({ requestId: req.requestId }, "[livekit.webhook] missing Authorization header");
       return res.status(401).send("Missing Authorization header");
     }
     const ev = await receiver.receive(bodyStr, auth);
@@ -337,7 +342,7 @@ app.post("/api/livekit/webhook", express.raw({ type: "application/webhook+json" 
     return res.status(200).json({ ok: true });
   } catch (e) {
     // eslint-disable-next-line no-console
-    console.warn("[livekit.webhook] failed:", e?.message || e);
+      logger.warn({ requestId: req.requestId, err: String(e?.message || e) }, "[livekit.webhook] failed");
     return res.status(400).send("Invalid webhook");
   }
 });
@@ -425,6 +430,31 @@ app.use(
     optionsSuccessStatus: 204,
   })
 );
+
+// Enforce Origin + CSRF for state-changing requests when using cookie auth.
+app.use((req, res, next) => {
+  if (!isUnsafeMethod(req.method)) return next();
+  if (req.method === "OPTIONS") return next();
+
+  const origin = String(req.headers.origin || "").trim();
+  const referer = String(req.headers.referer || "").trim();
+  const derivedOrigin = origin || extractOriginFromReferer(referer);
+  if (!derivedOrigin || !isAllowedOrigin(derivedOrigin)) {
+    return res.status(403).json({ error: "Origin not allowed" });
+  }
+
+  // If using Bearer token, skip CSRF (token is not sent automatically by browser).
+  if (getBearerToken(req)) return next();
+
+  // If using cookie auth, require CSRF token header to match cookie.
+  const cookieToken = getCookie(req, "csrf_token");
+  const headerToken = String(req.headers["x-csrf-token"] || "").trim();
+  if (!cookieToken || !headerToken || cookieToken !== headerToken) {
+    return res.status(403).json({ error: "CSRF validation failed" });
+  }
+
+  return next();
+});
 
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
@@ -599,12 +629,34 @@ function authCookieOptions(req) {
   };
 }
 
+function csrfCookieOptions(req) {
+  const proto = String(req.headers["x-forwarded-proto"] || req.protocol || "").toLowerCase();
+  const secure = proto.includes("https");
+  return {
+    httpOnly: false,
+    secure,
+    sameSite: "lax",
+    path: "/",
+    maxAge: 30 * 24 * 60 * 60 * 1000, // 30 days
+  };
+}
+
 function setAuthCookie(req, res, token) {
   res.cookie("auth_token", token, authCookieOptions(req));
 }
 
 function clearAuthCookie(req, res) {
   res.clearCookie("auth_token", { ...authCookieOptions(req), maxAge: 0 });
+}
+
+function setCsrfCookie(req, res) {
+  const token = crypto.randomBytes(24).toString("hex");
+  res.cookie("csrf_token", token, csrfCookieOptions(req));
+  return token;
+}
+
+function clearCsrfCookie(req, res) {
+  res.clearCookie("csrf_token", { ...csrfCookieOptions(req), maxAge: 0 });
 }
 
 function getBearerToken(req) {
@@ -616,6 +668,25 @@ function getBearerToken(req) {
 
 function getAuthToken(req) {
   return getBearerToken(req) || getCookie(req, "auth_token");
+}
+
+function isUnsafeMethod(method) {
+  const m = String(method || "").toUpperCase();
+  return m === "POST" || m === "PUT" || m === "PATCH" || m === "DELETE";
+}
+
+function isAllowedOrigin(origin) {
+  if (!origin) return false;
+  return clientOrigins.includes(origin);
+}
+
+function extractOriginFromReferer(referer) {
+  try {
+    const u = new URL(referer);
+    return `${u.protocol}//${u.host}`;
+  } catch {
+    return null;
+  }
 }
 
 async function requireAuth(req, res, next) {
@@ -650,7 +721,8 @@ async function requireAuth(req, res, next) {
   try {
     await provisionBillingForWorkspace({ store, stripeBilling, workspace, user });
   } catch (e) {
-    console.warn("[billing.provision] failed", e?.message || e);
+      logger.warn({ err: String(e?.message || e), requestId: req.requestId }, "[billing.provision] failed");
+      captureException(e, { requestId: req.requestId, area: "billing.provision" });
   }
 
   req.workspace = await store.getWorkspace(workspace.id);
@@ -700,6 +772,7 @@ app.post("/api/auth/register", authLimiter, async (req, res) => {
   const token = makeSessionToken();
   await store.createSession({ userId: user.id, token });
   setAuthCookie(req, res, token);
+  setCsrfCookie(req, res);
   const workspace = await store.ensureWorkspaceForUser({ user, nameHint: `${user.name || user.email} workspace` });
 
   return res.status(201).json({ token, user, workspace });
@@ -728,6 +801,7 @@ app.post("/api/auth/login", authLimiter, async (req, res) => {
   const token = makeSessionToken();
   await store.createSession({ userId: user.id, token });
   setAuthCookie(req, res, token);
+  setCsrfCookie(req, res);
   const workspace = await store.ensureWorkspaceForUser({ user, nameHint: `${user.name || user.email} workspace` });
   return res.json({ token, user, workspace });
 });
@@ -735,6 +809,7 @@ app.post("/api/auth/login", authLimiter, async (req, res) => {
 app.post("/api/auth/logout", requireAuth, async (req, res) => {
   if (USE_DB && req.sessionToken) await store.deleteSession(req.sessionToken);
   clearAuthCookie(req, res);
+  clearCsrfCookie(req, res);
   return res.json({ ok: true });
 });
 
@@ -989,7 +1064,8 @@ app.post("/api/internal/telephony/inbound/start", requireAgentSecret, async (req
       await store.updateCall(callId, { recording });
     }
   } catch (e) {
-    console.warn("[internal.telephony.inbound.start] failed to start egress", e?.message || e);
+    logger.warn({ requestId: req.requestId, err: String(e?.message || e) }, "[internal.telephony.inbound.start] failed to start egress");
+    sendAlert("egress_start_failed", { requestId: req.requestId, error: String(e?.message || e) });
   }
 
   return res.status(201).json({
@@ -1044,7 +1120,8 @@ app.post("/api/internal/calls/:id/end", requireAgentSecret, async (req, res) => 
   try {
     await finalizeBillingForCall({ store, call: updated });
   } catch (e) {
-    console.warn("[internal.calls.end] billing finalize failed", e?.message || e);
+    logger.warn({ requestId: req.requestId, err: String(e?.message || e) }, "[internal.calls.end] billing finalize failed");
+    sendAlert("billing_finalize_failed", { requestId: req.requestId, error: String(e?.message || e) });
   }
 
   // Metrics: telephony end
@@ -1361,6 +1438,52 @@ app.get("/api/agents/:id", requireAuth, async (req, res) => {
   res.json({ agent });
 });
 
+// Agent variants (A/B prompt testing)
+app.get("/api/agents/:id/variants", requireAuth, async (req, res) => {
+  if (!USE_DB) return res.status(400).json({ error: "Variants require Postgres mode" });
+  const agentId = String(req.params.id || "").trim();
+  const rows = await store.listAgentVariants(req.workspace.id, agentId);
+  return res.json({ variants: rows });
+});
+
+app.post("/api/agents/:id/variants", requireAuth, async (req, res) => {
+  if (!USE_DB) return res.status(400).json({ error: "Variants require Postgres mode" });
+  const agentId = String(req.params.id || "").trim();
+  const schema = z.object({
+    name: z.string().min(1).max(80),
+    prompt: z.string().min(1).max(200_000),
+    trafficPercent: z.number().int().min(0).max(100),
+    enabled: z.boolean().optional(),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "Validation failed", details: parsed.error.flatten() });
+  const row = await store.createAgentVariant(req.workspace.id, agentId, parsed.data);
+  return res.status(201).json({ variant: row });
+});
+
+app.put("/api/agents/:id/variants/:variantId", requireAuth, async (req, res) => {
+  if (!USE_DB) return res.status(400).json({ error: "Variants require Postgres mode" });
+  const variantId = String(req.params.variantId || "").trim();
+  const schema = z.object({
+    name: z.string().min(1).max(80).optional(),
+    prompt: z.string().min(1).max(200_000).optional(),
+    trafficPercent: z.number().int().min(0).max(100).optional(),
+    enabled: z.boolean().optional(),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "Validation failed", details: parsed.error.flatten() });
+  const row = await store.updateAgentVariant(req.workspace.id, variantId, parsed.data);
+  if (!row) return res.status(404).json({ error: "Variant not found" });
+  return res.json({ variant: row });
+});
+
+app.delete("/api/agents/:id/variants/:variantId", requireAuth, async (req, res) => {
+  if (!USE_DB) return res.status(400).json({ error: "Variants require Postgres mode" });
+  const variantId = String(req.params.variantId || "").trim();
+  await store.deleteAgentVariant(req.workspace.id, variantId);
+  return res.json({ ok: true });
+});
+
 app.put("/api/agents/:id", requireAuth, async (req, res) => {
   const { id } = req.params;
   const schema = z.object({
@@ -1592,7 +1715,8 @@ app.post("/api/workspaces/:id/twilio/buy-number", requireAuth, async (req, res) 
           });
         }
       } catch (e) {
-        console.warn("[twilio.buy-number] failed to sync stripe quantity", e?.message || e);
+        logger.warn({ requestId: req.requestId, err: String(e?.message || e) }, "[twilio.buy-number] failed to sync stripe quantity");
+        sendAlert("stripe_quantity_sync_failed", { requestId: req.requestId, error: String(e?.message || e) });
       }
       return res.status(201).json({ phoneNumber, purchased });
     }
@@ -1878,7 +2002,29 @@ app.post("/api/agents/:id/start", requireAuth, async (req, res) => {
   if (!agent) return res.status(404).json({ error: "Agent not found" });
   const promptDraft = agent.promptDraft ?? agent.prompt ?? "";
   const promptPublished = agent.promptPublished ?? "";
-  const promptUsed = (promptDraft && String(promptDraft).trim()) ? promptDraft : promptPublished;
+  let promptUsed = (promptDraft && String(promptDraft).trim()) ? promptDraft : promptPublished;
+  let variantChosen = null;
+  if (USE_DB) {
+    try {
+      const variants = await store.listAgentVariants(req.workspace.id, agent.id);
+      const enabled = variants.filter((v) => v.enabled && v.trafficPercent > 0);
+      const total = enabled.reduce((acc, v) => acc + v.trafficPercent, 0);
+      if (enabled.length && total > 0) {
+        const roll = Math.random() * total;
+        let acc = 0;
+        for (const v of enabled) {
+          acc += v.trafficPercent;
+          if (roll <= acc) {
+            variantChosen = v;
+            break;
+          }
+        }
+        if (variantChosen?.prompt) promptUsed = variantChosen.prompt;
+      }
+    } catch (e) {
+      logger.warn({ requestId: req.requestId, err: String(e?.message || e) }, "variant selection failed");
+    }
+  }
   if (!promptUsed || String(promptUsed).trim().length === 0) {
     return res.status(400).json({ error: "Agent prompt is empty. Set a prompt before starting a session." });
   }
@@ -1919,7 +2065,10 @@ app.post("/api/agents/:id/start", requireAuth, async (req, res) => {
     costUsd: null,
     transcript: [],
     recording: null, // will be filled if egress is enabled
-    metrics: { normalized: { source: "web" } },
+    metrics: {
+      normalized: { source: "web" },
+      abTest: variantChosen ? { variantId: variantChosen.id, variantName: variantChosen.name } : null,
+    },
     createdAt: now,
     updatedAt: now,
   };
@@ -1948,6 +2097,7 @@ app.post("/api/agents/:id/start", requireAuth, async (req, res) => {
         llmModel,
         maxCallSeconds,
         knowledgeFolderIds: Array.isArray(agent.knowledgeFolderIds) ? agent.knowledgeFolderIds : [],
+        variant: variantChosen ? { id: variantChosen.id, name: variantChosen.name } : null,
       },
       welcome,
     }),
@@ -1999,7 +2149,8 @@ app.post("/api/agents/:id/start", requireAuth, async (req, res) => {
   } catch (e) {
     // Non-fatal: call still works, just no recording.
     // eslint-disable-next-line no-console
-    console.warn("Failed to start egress:", e?.message || e);
+    logger.warn({ requestId: req.requestId, err: String(e?.message || e) }, "Failed to start egress");
+    sendAlert("egress_start_failed", { requestId: req.requestId, error: String(e?.message || e) });
   }
 
   const token = await createParticipantToken({
@@ -2074,6 +2225,78 @@ app.get("/api/calls/:id", requireAuth, async (req, res) => {
   const call = USE_DB ? await store.getCall(req.workspace.id, id) : readCalls().find((c) => c.id === id);
   if (!call) return res.status(404).json({ error: "Call not found" });
   res.json({ call });
+});
+
+// Export call data (transcript + metrics) for QA/review
+app.get("/api/calls/:id/export", requireAuth, async (req, res) => {
+  const id = String(req.params.id || "").trim();
+  if (!id) return res.status(400).json({ error: "Missing call id" });
+  const call = USE_DB ? await store.getCall(req.workspace.id, id) : readCalls().find((c) => c.id === id);
+  if (!call) return res.status(404).json({ error: "Call not found" });
+  return res.json({
+    call: {
+      id: call.id,
+      agentId: call.agentId,
+      agentName: call.agentName,
+      roomName: call.roomName,
+      to: call.to,
+      startedAt: call.startedAt,
+      endedAt: call.endedAt,
+      durationSec: call.durationSec,
+      outcome: call.outcome,
+      metrics: call.metrics ?? null,
+      transcript: call.transcript ?? [],
+    },
+  });
+});
+
+// Call evaluations (QA scoring)
+app.get("/api/calls/:id/evaluations", requireAuth, async (req, res) => {
+  if (!USE_DB) return res.status(400).json({ error: "Evaluations require Postgres mode" });
+  const callId = String(req.params.id || "").trim();
+  const rows = await store.listCallEvaluations(req.workspace.id, callId);
+  return res.json({ evaluations: rows });
+});
+
+app.post("/api/calls/:id/evaluations", requireAuth, async (req, res) => {
+  if (!USE_DB) return res.status(400).json({ error: "Evaluations require Postgres mode" });
+  const callId = String(req.params.id || "").trim();
+  const schema = z.object({
+    score: z.number().int().min(0).max(100),
+    notes: z.string().max(2000).optional(),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "Validation failed", details: parsed.error.flatten() });
+  const row = await store.createCallEvaluation(req.workspace.id, callId, parsed.data);
+  return res.status(201).json({ evaluation: row });
+});
+
+// Call labels (tags)
+app.get("/api/calls/:id/labels", requireAuth, async (req, res) => {
+  if (!USE_DB) return res.status(400).json({ error: "Labels require Postgres mode" });
+  const callId = String(req.params.id || "").trim();
+  const rows = await store.listCallLabels(req.workspace.id, callId);
+  return res.json({ labels: rows });
+});
+
+app.post("/api/calls/:id/labels", requireAuth, async (req, res) => {
+  if (!USE_DB) return res.status(400).json({ error: "Labels require Postgres mode" });
+  const callId = String(req.params.id || "").trim();
+  const schema = z.object({ label: z.string().min(1).max(80) });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "Validation failed", details: parsed.error.flatten() });
+  const row = await store.addCallLabel(req.workspace.id, callId, parsed.data.label);
+  return res.status(201).json({ label: row });
+});
+
+app.delete("/api/calls/:id/labels", requireAuth, async (req, res) => {
+  if (!USE_DB) return res.status(400).json({ error: "Labels require Postgres mode" });
+  const callId = String(req.params.id || "").trim();
+  const schema = z.object({ label: z.string().min(1).max(80) });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "Validation failed", details: parsed.error.flatten() });
+  await store.deleteCallLabel(req.workspace.id, callId, parsed.data.label);
+  return res.json({ ok: true });
 });
 
 // Called by the Python agent to attach per-call metrics (usage/models/latency) to the call record.
@@ -2527,7 +2750,8 @@ app.get("/api/calls/:id/recording", requireAuth, async (req, res) => {
     return;
   } catch (e) {
     // eslint-disable-next-line no-console
-    console.warn("Recording stream failed:", e?.name || e?.message || e);
+    logger.warn({ requestId: req.requestId, err: String(e?.name || e?.message || e) }, "Recording stream failed");
+    sendAlert("recording_stream_failed", { requestId: req.requestId, error: String(e?.name || e?.message || e) });
     return res.status(500).send("Failed to stream recording");
   }
 });
@@ -2601,7 +2825,8 @@ app.get("/api/calls/:id/recording-playback", async (req, res) => {
     return;
   } catch (e) {
     // eslint-disable-next-line no-console
-    console.warn("Recording playback stream failed:", e?.name || e?.message || e);
+    logger.warn({ requestId: req.requestId, err: String(e?.name || e?.message || e) }, "Recording playback stream failed");
+    sendAlert("recording_playback_failed", { requestId: req.requestId, error: String(e?.name || e?.message || e) });
     return res.status(500).send("Failed to stream recording");
   }
 });
@@ -2867,7 +3092,8 @@ app.post("/api/calls/:id/end", requireAuth, async (req, res) => {
     try {
       await finalizeBillingForCall({ store, call: updated });
     } catch (e) {
-      console.warn("[calls.end] billing finalize failed", e?.message || e);
+      logger.warn({ requestId: req.requestId, err: String(e?.message || e) }, "[calls.end] billing finalize failed");
+      sendAlert("billing_finalize_failed", { requestId: req.requestId, error: String(e?.message || e) });
     }
     return res.json({ call: updated });
   }
@@ -2936,7 +3162,7 @@ async function main() {
     }
   } else {
     // eslint-disable-next-line no-console
-    console.warn("DATABASE_URL not set; falling back to local JSON storage (./data/*.json).");
+    logger.warn("DATABASE_URL not set; falling back to local JSON storage (./data/*.json).");
   }
 
   // Background cleanup: ensure "in_progress" calls don't stick forever.
