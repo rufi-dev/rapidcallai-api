@@ -743,7 +743,12 @@ function requireAgentSecret(req, res, next) {
 }
 
 // --- Auth (real auth when using Postgres) ---
-const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 8, keyPrefix: "auth" });
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 8,
+  keyPrefix: "auth",
+  message: { error: "Too many attempts. Please wait a few minutes and try again." },
+});
 
 app.post("/api/auth/register", authLimiter, async (req, res) => {
   const schema = z.object({
@@ -754,28 +759,36 @@ app.post("/api/auth/register", authLimiter, async (req, res) => {
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "Validation failed", details: parsed.error.flatten() });
 
-  if (!USE_DB) {
-    const token = `token:${parsed.data.email}:${Date.now()}`;
-    const workspace = await ensureDefaultWorkspace();
-    return res.status(201).json({
-      token,
-      user: { id: "demo", email: parsed.data.email, name: parsed.data.name },
-      workspace,
-    });
+  try {
+    if (!USE_DB) {
+      const token = `token:${parsed.data.email}:${Date.now()}`;
+      const workspace = await ensureDefaultWorkspace();
+      return res.status(201).json({
+        token,
+        user: { id: "demo", email: parsed.data.email, name: parsed.data.name },
+        workspace,
+      });
+    }
+
+    const existing = await store.getUserByEmail(parsed.data.email);
+    if (existing) return res.status(400).json({ error: "Email already registered" });
+
+    const passwordHash = await bcrypt.hash(parsed.data.password, 10);
+    const user = await store.createUser({ email: parsed.data.email, name: parsed.data.name, passwordHash });
+    const token = makeSessionToken();
+    await store.createSession({ userId: user.id, token });
+    setAuthCookie(req, res, token);
+    setCsrfCookie(req, res);
+    const workspace = await store.ensureWorkspaceForUser({ user, nameHint: `${user.name || user.email} workspace` });
+
+    return res.status(201).json({ token, user, workspace });
+  } catch (e) {
+    logger.error({ requestId: req.requestId, err: String(e?.message || e) }, "[auth.register] failed");
+    if (String(e?.code || "") === "23505") {
+      return res.status(400).json({ error: "Email already registered" });
+    }
+    return res.status(500).json({ error: "Registration failed. Check server logs for details." });
   }
-
-  const existing = await store.getUserByEmail(parsed.data.email);
-  if (existing) return res.status(400).json({ error: "Email already registered" });
-
-  const passwordHash = await bcrypt.hash(parsed.data.password, 10);
-  const user = await store.createUser({ email: parsed.data.email, name: parsed.data.name, passwordHash });
-  const token = makeSessionToken();
-  await store.createSession({ userId: user.id, token });
-  setAuthCookie(req, res, token);
-  setCsrfCookie(req, res);
-  const workspace = await store.ensureWorkspaceForUser({ user, nameHint: `${user.name || user.email} workspace` });
-
-  return res.status(201).json({ token, user, workspace });
 });
 
 app.post("/api/auth/login", authLimiter, async (req, res) => {
@@ -786,24 +799,29 @@ app.post("/api/auth/login", authLimiter, async (req, res) => {
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "Validation failed", details: parsed.error.flatten() });
 
-  if (!USE_DB) {
-    const token = `token:${parsed.data.email}:${Date.now()}`;
-    const workspace = await ensureDefaultWorkspace();
-    return res.json({ token, user: { id: "demo", email: parsed.data.email, name: parsed.data.email }, workspace });
+  try {
+    if (!USE_DB) {
+      const token = `token:${parsed.data.email}:${Date.now()}`;
+      const workspace = await ensureDefaultWorkspace();
+      return res.json({ token, user: { id: "demo", email: parsed.data.email, name: parsed.data.email }, workspace });
+    }
+
+    const u = await store.getUserByEmail(parsed.data.email);
+    if (!u) return res.status(401).json({ error: "Invalid email or password" });
+    const ok = await bcrypt.compare(parsed.data.password, u.passwordHash);
+    if (!ok) return res.status(401).json({ error: "Invalid email or password" });
+
+    const user = { id: u.id, email: u.email, name: u.name, createdAt: u.createdAt, updatedAt: u.updatedAt };
+    const token = makeSessionToken();
+    await store.createSession({ userId: user.id, token });
+    setAuthCookie(req, res, token);
+    setCsrfCookie(req, res);
+    const workspace = await store.ensureWorkspaceForUser({ user, nameHint: `${user.name || user.email} workspace` });
+    return res.json({ token, user, workspace });
+  } catch (e) {
+    logger.error({ requestId: req.requestId, err: String(e?.message || e) }, "[auth.login] failed");
+    return res.status(500).json({ error: "Login failed. Check server logs for details." });
   }
-
-  const u = await store.getUserByEmail(parsed.data.email);
-  if (!u) return res.status(401).json({ error: "Invalid email or password" });
-  const ok = await bcrypt.compare(parsed.data.password, u.passwordHash);
-  if (!ok) return res.status(401).json({ error: "Invalid email or password" });
-
-  const user = { id: u.id, email: u.email, name: u.name, createdAt: u.createdAt, updatedAt: u.updatedAt };
-  const token = makeSessionToken();
-  await store.createSession({ userId: user.id, token });
-  setAuthCookie(req, res, token);
-  setCsrfCookie(req, res);
-  const workspace = await store.ensureWorkspaceForUser({ user, nameHint: `${user.name || user.email} workspace` });
-  return res.json({ token, user, workspace });
 });
 
 app.post("/api/auth/logout", requireAuth, async (req, res) => {
