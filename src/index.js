@@ -200,6 +200,42 @@ const app = express();
 // When running behind a reverse proxy (Render/Fly/Nginx), this ensures req.protocol reflects X-Forwarded-Proto.
 app.set("trust proxy", 1);
 
+// Attach a request id for tracing across logs.
+app.use((req, res, next) => {
+  req.requestId = crypto.randomUUID();
+  res.setHeader("X-Request-Id", req.requestId);
+  return next();
+});
+
+// Simple in-memory rate limiter (per instance).
+const rateLimitBuckets = new Map();
+function rateLimit({ windowMs, max, keyPrefix }) {
+  return (req, res, next) => {
+    const ip = String(req.headers["x-forwarded-for"] || req.ip || "unknown").split(",")[0].trim();
+    const key = `${keyPrefix}:${ip}`;
+    const now = Date.now();
+    const bucket = rateLimitBuckets.get(key) || { count: 0, resetAt: now + windowMs };
+    if (now > bucket.resetAt) {
+      bucket.count = 0;
+      bucket.resetAt = now + windowMs;
+    }
+    bucket.count += 1;
+    rateLimitBuckets.set(key, bucket);
+    if (bucket.count > max) {
+      const retryAfterSec = Math.max(1, Math.ceil((bucket.resetAt - now) / 1000));
+      res.setHeader("Retry-After", String(retryAfterSec));
+      return res.status(429).json({ error: "Too many requests. Please try again later." });
+    }
+    return next();
+  };
+}
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, bucket] of rateLimitBuckets.entries()) {
+    if (!bucket || now > bucket.resetAt) rateLimitBuckets.delete(key);
+  }
+}, 10 * 60 * 1000);
+
 // --- LiveKit Webhooks (for billed participant-minutes) ---
 // Must be registered BEFORE express.json middleware so we can access raw body bytes.
 app.post("/api/livekit/webhook", express.raw({ type: "application/webhook+json" }), async (req, res) => {
@@ -209,6 +245,11 @@ app.post("/api/livekit/webhook", express.raw({ type: "application/webhook+json" 
   try {
     const bodyStr = Buffer.isBuffer(req.body) ? req.body.toString("utf8") : String(req.body || "");
     const auth = req.get("Authorization") || req.get("Authorize") || "";
+    if (!auth) {
+      // eslint-disable-next-line no-console
+      console.warn("[livekit.webhook] missing Authorization header");
+      return res.status(401).send("Missing Authorization header");
+    }
     const ev = await receiver.receive(bodyStr, auth);
 
     const roomName = String(ev?.room?.name || "").trim();
@@ -526,11 +567,55 @@ function makeSessionToken() {
   return crypto.randomBytes(24).toString("hex");
 }
 
+function parseCookies(req) {
+  const raw = String(req.headers.cookie || "").trim();
+  if (!raw) return {};
+  const out = {};
+  for (const part of raw.split(";")) {
+    const idx = part.indexOf("=");
+    if (idx === -1) continue;
+    const k = part.slice(0, idx).trim();
+    const v = part.slice(idx + 1).trim();
+    if (!k) continue;
+    out[k] = decodeURIComponent(v);
+  }
+  return out;
+}
+
+function getCookie(req, name) {
+  const cookies = parseCookies(req);
+  return cookies[name] || null;
+}
+
+function authCookieOptions(req) {
+  const proto = String(req.headers["x-forwarded-proto"] || req.protocol || "").toLowerCase();
+  const secure = proto.includes("https");
+  return {
+    httpOnly: true,
+    secure,
+    sameSite: "lax",
+    path: "/",
+    maxAge: 30 * 24 * 60 * 60 * 1000, // 30 days
+  };
+}
+
+function setAuthCookie(req, res, token) {
+  res.cookie("auth_token", token, authCookieOptions(req));
+}
+
+function clearAuthCookie(req, res) {
+  res.clearCookie("auth_token", { ...authCookieOptions(req), maxAge: 0 });
+}
+
 function getBearerToken(req) {
   const h = String(req.headers.authorization || "").trim();
   const m = h.match(/^Bearer\s+(.+)$/i);
   if (!m) return null;
   return m[1].trim();
+}
+
+function getAuthToken(req) {
+  return getBearerToken(req) || getCookie(req, "auth_token");
 }
 
 async function requireAuth(req, res, next) {
@@ -541,8 +626,8 @@ async function requireAuth(req, res, next) {
     return next();
   }
 
-  const token = getBearerToken(req);
-  if (!token) return res.status(401).json({ error: "Missing Authorization header" });
+  const token = getAuthToken(req);
+  if (!token) return res.status(401).json({ error: "Missing auth token" });
 
   const session = await store.getSession(token);
   if (!session) return res.status(401).json({ error: "Invalid session" });
@@ -586,7 +671,9 @@ function requireAgentSecret(req, res, next) {
 }
 
 // --- Auth (real auth when using Postgres) ---
-app.post("/api/auth/register", async (req, res) => {
+const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 8, keyPrefix: "auth" });
+
+app.post("/api/auth/register", authLimiter, async (req, res) => {
   const schema = z.object({
     name: z.string().min(1).max(80),
     email: z.string().email().max(200),
@@ -612,12 +699,13 @@ app.post("/api/auth/register", async (req, res) => {
   const user = await store.createUser({ email: parsed.data.email, name: parsed.data.name, passwordHash });
   const token = makeSessionToken();
   await store.createSession({ userId: user.id, token });
+  setAuthCookie(req, res, token);
   const workspace = await store.ensureWorkspaceForUser({ user, nameHint: `${user.name || user.email} workspace` });
 
   return res.status(201).json({ token, user, workspace });
 });
 
-app.post("/api/auth/login", async (req, res) => {
+app.post("/api/auth/login", authLimiter, async (req, res) => {
   const schema = z.object({
     email: z.string().email().max(200),
     password: z.string().min(1).max(200),
@@ -639,12 +727,14 @@ app.post("/api/auth/login", async (req, res) => {
   const user = { id: u.id, email: u.email, name: u.name, createdAt: u.createdAt, updatedAt: u.updatedAt };
   const token = makeSessionToken();
   await store.createSession({ userId: user.id, token });
+  setAuthCookie(req, res, token);
   const workspace = await store.ensureWorkspaceForUser({ user, nameHint: `${user.name || user.email} workspace` });
   return res.json({ token, user, workspace });
 });
 
 app.post("/api/auth/logout", requireAuth, async (req, res) => {
   if (USE_DB && req.sessionToken) await store.deleteSession(req.sessionToken);
+  clearAuthCookie(req, res);
   return res.json({ ok: true });
 });
 

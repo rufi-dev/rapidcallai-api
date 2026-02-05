@@ -123,14 +123,24 @@ async function emitOpenMeterEvent({ apiUrl, apiKey, source, event }) {
     data: event.data,
   };
 
-  const { status, text } = await requestJson(endpoint, {
-    method: "POST",
-    headers: auth,
-    body,
-  });
-
-  if (status >= 200 && status < 300) return { ok: true };
-  return { ok: false, status, text };
+  const maxRetries = 3;
+  for (let attempt = 0; attempt < maxRetries; attempt += 1) {
+    try {
+      const { status, text } = await requestJson(endpoint, {
+        method: "POST",
+        headers: auth,
+        body,
+      });
+      if (status >= 200 && status < 300) return { ok: true };
+      if (status < 500) return { ok: false, status, text };
+    } catch (e) {
+      if (attempt >= maxRetries - 1) {
+        return { ok: false, status: 0, text: String(e?.message || e) };
+      }
+    }
+    await new Promise((r) => setTimeout(r, 500 * (2 ** attempt)));
+  }
+  return { ok: false, status: 0, text: "OpenMeter request failed after retries" };
 }
 
 async function getOpenMeterCustomer({ apiUrl, apiKey, customerIdOrKey }) {
