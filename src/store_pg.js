@@ -51,6 +51,45 @@ function rowToCall(r) {
   };
 }
 
+function rowToOutboundJob(r) {
+  return {
+    id: r.id,
+    workspaceId: r.workspace_id,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+    status: r.status,
+    leadName: r.lead_name ?? "",
+    phoneE164: r.phone_e164,
+    timezone: r.timezone ?? "UTC",
+    attempts: Number(r.attempts || 0),
+    maxAttempts: Number(r.max_attempts || 0),
+    nextAttemptAt: r.next_attempt_at ?? null,
+    lastError: r.last_error ?? "",
+    roomName: r.room_name ?? null,
+    agentId: r.agent_id,
+    recordingEnabled: Boolean(r.recording_enabled),
+    dnc: Boolean(r.dnc),
+    dncReason: r.dnc_reason ?? "",
+    metadata: r.metadata ?? {},
+    providerCallId: r.provider_call_id ?? null,
+    callId: r.call_id ?? null,
+    lockedAt: r.locked_at ?? null,
+    lockedBy: r.locked_by ?? null,
+  };
+}
+
+function rowToOutboundJobLog(r) {
+  return {
+    id: r.id,
+    workspaceId: r.workspace_id,
+    jobId: r.job_id,
+    level: r.level ?? "info",
+    message: r.message,
+    meta: r.meta ?? {},
+    createdAt: r.created_at,
+  };
+}
+
 function rowToWorkspace(r) {
   return {
     id: r.id,
@@ -1045,6 +1084,249 @@ async function deleteCallLabel(workspaceId, callId, label) {
   await p.query(`DELETE FROM call_labels WHERE workspace_id=$1 AND call_id=$2 AND label=$3`, [workspaceId, callId, label]);
 }
 
+async function createOutboundJob(workspaceId, input) {
+  const p = getPool();
+  const now = Date.now();
+  const id = nanoid(12);
+  const {
+    leadName = "",
+    phoneE164,
+    timezone = "UTC",
+    maxAttempts = 3,
+    agentId,
+    recordingEnabled = false,
+    metadata = {},
+  } = input || {};
+  const { rows } = await p.query(
+    `
+    INSERT INTO outbound_jobs (
+      id, workspace_id, created_at, updated_at, status, lead_name, phone_e164, timezone,
+      attempts, max_attempts, next_attempt_at, last_error, room_name, agent_id,
+      recording_enabled, dnc, dnc_reason, metadata, provider_call_id, call_id, locked_at, locked_by
+    )
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+    RETURNING *
+  `,
+    [
+      id,
+      workspaceId,
+      now,
+      now,
+      "queued",
+      String(leadName || ""),
+      String(phoneE164 || ""),
+      String(timezone || "UTC"),
+      0,
+      Math.max(1, Math.round(Number(maxAttempts || 3))),
+      now,
+      "",
+      null,
+      String(agentId || ""),
+      Boolean(recordingEnabled),
+      false,
+      "",
+      JSON.stringify(metadata || {}),
+      null,
+      null,
+      null,
+      null,
+    ]
+  );
+  return rowToOutboundJob(rows[0]);
+}
+
+async function getOutboundJob(workspaceId, id) {
+  const p = getPool();
+  const { rows } = await p.query(`SELECT * FROM outbound_jobs WHERE workspace_id=$1 AND id=$2`, [workspaceId, id]);
+  return rows[0] ? rowToOutboundJob(rows[0]) : null;
+}
+
+async function listOutboundJobs(workspaceId, { status, limit = 100, offset = 0 } = {}) {
+  const p = getPool();
+  const params = [workspaceId];
+  let where = `WHERE workspace_id=$1`;
+  if (status) {
+    params.push(status);
+    where += ` AND status=$${params.length}`;
+  }
+  params.push(Math.min(200, Math.max(1, Number(limit || 100))));
+  params.push(Math.max(0, Number(offset || 0)));
+  const { rows } = await p.query(
+    `
+    SELECT * FROM outbound_jobs
+    ${where}
+    ORDER BY created_at DESC
+    LIMIT $${params.length - 1} OFFSET $${params.length}
+  `,
+    params
+  );
+  return rows.map(rowToOutboundJob);
+}
+
+async function getOutboundJobByProviderCallId(workspaceId, providerCallId) {
+  const p = getPool();
+  const { rows } = await p.query(
+    `SELECT * FROM outbound_jobs WHERE workspace_id=$1 AND provider_call_id=$2 ORDER BY created_at DESC LIMIT 1`,
+    [workspaceId, providerCallId]
+  );
+  return rows[0] ? rowToOutboundJob(rows[0]) : null;
+}
+
+async function updateOutboundJob(workspaceId, id, patch) {
+  const p = getPool();
+  const current = await getOutboundJob(workspaceId, id);
+  if (!current) return null;
+  const next = {
+    status: patch.status ?? current.status,
+    leadName: patch.leadName ?? current.leadName,
+    phoneE164: patch.phoneE164 ?? current.phoneE164,
+    timezone: patch.timezone ?? current.timezone,
+    attempts: patch.attempts == null ? current.attempts : Number(patch.attempts || 0),
+    maxAttempts: patch.maxAttempts == null ? current.maxAttempts : Number(patch.maxAttempts || 0),
+    nextAttemptAt: patch.nextAttemptAt == null ? current.nextAttemptAt : patch.nextAttemptAt,
+    lastError: patch.lastError ?? current.lastError,
+    roomName: patch.roomName ?? current.roomName,
+    agentId: patch.agentId ?? current.agentId,
+    recordingEnabled: patch.recordingEnabled == null ? current.recordingEnabled : Boolean(patch.recordingEnabled),
+    dnc: patch.dnc == null ? current.dnc : Boolean(patch.dnc),
+    dncReason: patch.dncReason ?? current.dncReason,
+    metadata: patch.metadata == null ? current.metadata : patch.metadata,
+    providerCallId: patch.providerCallId ?? current.providerCallId,
+    callId: patch.callId ?? current.callId,
+    lockedAt: patch.lockedAt == null ? current.lockedAt : patch.lockedAt,
+    lockedBy: patch.lockedBy ?? current.lockedBy,
+  };
+  const updatedAt = Date.now();
+  const { rows } = await p.query(
+    `
+    UPDATE outbound_jobs
+    SET status=$3,
+        lead_name=$4,
+        phone_e164=$5,
+        timezone=$6,
+        attempts=$7,
+        max_attempts=$8,
+        next_attempt_at=$9,
+        last_error=$10,
+        room_name=$11,
+        agent_id=$12,
+        recording_enabled=$13,
+        dnc=$14,
+        dnc_reason=$15,
+        metadata=$16,
+        provider_call_id=$17,
+        call_id=$18,
+        locked_at=$19,
+        locked_by=$20,
+        updated_at=$21
+    WHERE workspace_id=$1 AND id=$2
+    RETURNING *
+  `,
+    [
+      workspaceId,
+      id,
+      next.status,
+      next.leadName,
+      next.phoneE164,
+      next.timezone,
+      next.attempts,
+      next.maxAttempts,
+      next.nextAttemptAt,
+      next.lastError,
+      next.roomName,
+      next.agentId,
+      next.recordingEnabled,
+      next.dnc,
+      next.dncReason,
+      JSON.stringify(next.metadata || {}),
+      next.providerCallId,
+      next.callId,
+      next.lockedAt,
+      next.lockedBy,
+      updatedAt,
+    ]
+  );
+  return rows[0] ? rowToOutboundJob(rows[0]) : null;
+}
+
+async function countOutboundActive(workspaceId) {
+  const p = getPool();
+  const { rows } = await p.query(
+    `SELECT COUNT(*)::int AS cnt FROM outbound_jobs WHERE workspace_id=$1 AND status IN ('dialing','in_call')`,
+    [workspaceId]
+  );
+  return rows[0] ? Number(rows[0].cnt || 0) : 0;
+}
+
+async function countInProgressCalls(workspaceId) {
+  const p = getPool();
+  const { rows } = await p.query(
+    `SELECT COUNT(*)::int AS cnt FROM calls WHERE workspace_id=$1 AND outcome='in_progress'`,
+    [workspaceId]
+  );
+  return rows[0] ? Number(rows[0].cnt || 0) : 0;
+}
+
+async function claimOutboundJobs(workspaceId, nowMs, limit, workerId) {
+  const p = getPool();
+  const { rows } = await p.query(
+    `
+    WITH cte AS (
+      SELECT id
+      FROM outbound_jobs
+      WHERE workspace_id=$1
+        AND status='queued'
+        AND dnc=false
+        AND (next_attempt_at IS NULL OR next_attempt_at <= $2)
+        AND attempts < max_attempts
+      ORDER BY COALESCE(next_attempt_at, created_at) ASC, created_at ASC
+      LIMIT $3
+      FOR UPDATE SKIP LOCKED
+    )
+    UPDATE outbound_jobs
+    SET status='dialing',
+        attempts=attempts+1,
+        locked_at=$2,
+        locked_by=$4,
+        updated_at=$2
+    FROM cte
+    WHERE outbound_jobs.id=cte.id
+    RETURNING outbound_jobs.*
+  `,
+    [workspaceId, nowMs, Math.max(1, Number(limit || 1)), String(workerId || "")] 
+  );
+  return rows.map(rowToOutboundJob);
+}
+
+async function addOutboundJobLog(workspaceId, jobId, { level = "info", message, meta = {} }) {
+  const p = getPool();
+  const id = nanoid(12);
+  const now = Date.now();
+  const { rows } = await p.query(
+    `
+    INSERT INTO outbound_job_logs (id, workspace_id, job_id, level, message, meta, created_at)
+    VALUES ($1,$2,$3,$4,$5,$6,$7)
+    RETURNING *
+  `,
+    [id, workspaceId, jobId, String(level || "info"), String(message || ""), JSON.stringify(meta || {}), now]
+  );
+  return rows[0] ? rowToOutboundJobLog(rows[0]) : null;
+}
+
+async function listOutboundJobLogs(workspaceId, jobId, limit = 200) {
+  const p = getPool();
+  const { rows } = await p.query(
+    `
+    SELECT * FROM outbound_job_logs
+    WHERE workspace_id=$1 AND job_id=$2
+    ORDER BY created_at DESC
+    LIMIT $3
+  `,
+    [workspaceId, jobId, Math.min(300, Math.max(1, Number(limit || 200)))]
+  );
+  return rows.map(rowToOutboundJobLog);
+}
+
 module.exports = {
   // Auth
   createUser,
@@ -1106,6 +1388,18 @@ module.exports = {
   listCallLabels,
   addCallLabel,
   deleteCallLabel,
+
+  // Outbound jobs
+  createOutboundJob,
+  getOutboundJob,
+  getOutboundJobByProviderCallId,
+  listOutboundJobs,
+  updateOutboundJob,
+  countOutboundActive,
+  countInProgressCalls,
+  claimOutboundJobs,
+  addOutboundJobLog,
+  listOutboundJobLogs,
 };
 
 

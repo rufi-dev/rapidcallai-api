@@ -173,6 +173,75 @@ async function initSchema() {
   await p.query(`CREATE INDEX IF NOT EXISTS calls_agent_started_idx ON calls(agent_id, started_at DESC);`);
   await p.query(`CREATE INDEX IF NOT EXISTS calls_workspace_started_idx ON calls(workspace_id, started_at DESC);`);
 
+  // Outbound call jobs (queue + state machine)
+  await p.query(`
+    CREATE TABLE IF NOT EXISTS outbound_jobs (
+      id TEXT PRIMARY KEY,
+      workspace_id TEXT NOT NULL,
+      created_at BIGINT NOT NULL,
+      updated_at BIGINT NOT NULL,
+      status TEXT NOT NULL,
+      lead_name TEXT NOT NULL DEFAULT '',
+      phone_e164 TEXT NOT NULL,
+      timezone TEXT NOT NULL DEFAULT 'UTC',
+      attempts INT NOT NULL DEFAULT 0,
+      max_attempts INT NOT NULL DEFAULT 3,
+      next_attempt_at BIGINT NULL,
+      last_error TEXT NOT NULL DEFAULT '',
+      room_name TEXT NULL,
+      agent_id TEXT NOT NULL,
+      recording_enabled BOOLEAN NOT NULL DEFAULT false,
+      dnc BOOLEAN NOT NULL DEFAULT false,
+      dnc_reason TEXT NOT NULL DEFAULT '',
+      metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+      provider_call_id TEXT NULL,
+      call_id TEXT NULL,
+      locked_at BIGINT NULL,
+      locked_by TEXT NULL
+    );
+  `);
+  await p.query(`CREATE INDEX IF NOT EXISTS outbound_jobs_workspace_idx ON outbound_jobs(workspace_id, created_at DESC);`);
+  await p.query(`CREATE INDEX IF NOT EXISTS outbound_jobs_status_idx ON outbound_jobs(status, next_attempt_at);`);
+  await p.query(`CREATE INDEX IF NOT EXISTS outbound_jobs_call_idx ON outbound_jobs(call_id);`);
+  await p.query(`ALTER TABLE outbound_jobs ADD COLUMN IF NOT EXISTS workspace_id TEXT NOT NULL DEFAULT '';`);
+  await p.query(`ALTER TABLE outbound_jobs ADD COLUMN IF NOT EXISTS created_at BIGINT NOT NULL DEFAULT 0;`);
+  await p.query(`ALTER TABLE outbound_jobs ADD COLUMN IF NOT EXISTS updated_at BIGINT NOT NULL DEFAULT 0;`);
+  await p.query(`ALTER TABLE outbound_jobs ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'queued';`);
+  await p.query(`ALTER TABLE outbound_jobs ADD COLUMN IF NOT EXISTS lead_name TEXT NOT NULL DEFAULT '';`);
+  await p.query(`ALTER TABLE outbound_jobs ADD COLUMN IF NOT EXISTS phone_e164 TEXT NOT NULL DEFAULT '';`);
+  await p.query(`ALTER TABLE outbound_jobs ADD COLUMN IF NOT EXISTS timezone TEXT NOT NULL DEFAULT 'UTC';`);
+  await p.query(`ALTER TABLE outbound_jobs ADD COLUMN IF NOT EXISTS attempts INT NOT NULL DEFAULT 0;`);
+  await p.query(`ALTER TABLE outbound_jobs ADD COLUMN IF NOT EXISTS max_attempts INT NOT NULL DEFAULT 3;`);
+  await p.query(`ALTER TABLE outbound_jobs ADD COLUMN IF NOT EXISTS next_attempt_at BIGINT NULL;`);
+  await p.query(`ALTER TABLE outbound_jobs ADD COLUMN IF NOT EXISTS last_error TEXT NOT NULL DEFAULT '';`);
+  await p.query(`ALTER TABLE outbound_jobs ADD COLUMN IF NOT EXISTS room_name TEXT NULL;`);
+  await p.query(`ALTER TABLE outbound_jobs ADD COLUMN IF NOT EXISTS agent_id TEXT NOT NULL DEFAULT '';`);
+  await p.query(`ALTER TABLE outbound_jobs ADD COLUMN IF NOT EXISTS recording_enabled BOOLEAN NOT NULL DEFAULT false;`);
+  await p.query(`ALTER TABLE outbound_jobs ADD COLUMN IF NOT EXISTS dnc BOOLEAN NOT NULL DEFAULT false;`);
+  await p.query(`ALTER TABLE outbound_jobs ADD COLUMN IF NOT EXISTS dnc_reason TEXT NOT NULL DEFAULT '';`);
+  await p.query(`ALTER TABLE outbound_jobs ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'::jsonb;`);
+  await p.query(`ALTER TABLE outbound_jobs ADD COLUMN IF NOT EXISTS provider_call_id TEXT NULL;`);
+  await p.query(`ALTER TABLE outbound_jobs ADD COLUMN IF NOT EXISTS call_id TEXT NULL;`);
+  await p.query(`ALTER TABLE outbound_jobs ADD COLUMN IF NOT EXISTS locked_at BIGINT NULL;`);
+  await p.query(`ALTER TABLE outbound_jobs ADD COLUMN IF NOT EXISTS locked_by TEXT NULL;`);
+
+  // Outbound job logs
+  await p.query(`
+    CREATE TABLE IF NOT EXISTS outbound_job_logs (
+      id TEXT PRIMARY KEY,
+      workspace_id TEXT NOT NULL,
+      job_id TEXT NOT NULL,
+      level TEXT NOT NULL DEFAULT 'info',
+      message TEXT NOT NULL,
+      meta JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at BIGINT NOT NULL
+    );
+  `);
+  await p.query(`CREATE INDEX IF NOT EXISTS outbound_job_logs_job_idx ON outbound_job_logs(job_id, created_at DESC);`);
+  await p.query(`ALTER TABLE outbound_job_logs ADD COLUMN IF NOT EXISTS workspace_id TEXT NOT NULL DEFAULT '';`);
+  await p.query(`ALTER TABLE outbound_job_logs ADD COLUMN IF NOT EXISTS level TEXT NOT NULL DEFAULT 'info';`);
+  await p.query(`ALTER TABLE outbound_job_logs ADD COLUMN IF NOT EXISTS meta JSONB NOT NULL DEFAULT '{}'::jsonb;`);
+
   // Agent variants (A/B prompt testing)
   await p.query(`
     CREATE TABLE IF NOT EXISTS agent_variants (

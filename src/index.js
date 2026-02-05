@@ -17,6 +17,7 @@ const multer = require("multer");
 const pdfParse = require("pdf-parse");
 const promClient = require("prom-client");
 const { WebhookReceiver } = require("livekit-server-sdk");
+const twilio = require("twilio");
 const { logger, requestLogger } = require("./logger");
 const { sendAlert } = require("./alerting");
 
@@ -38,6 +39,9 @@ const {
 } = require("./storage");
 const { getPool, initSchema } = require("./db");
 const store = require("./store_pg");
+const { scheduleNextAttempt } = require("./outbound_scheduler");
+const { hangupCall } = require("./telephony/provider_twilio");
+const { handleTelephonyEvent } = require("./outbound_events");
 const { roomService, agentDispatchService, createParticipantToken } = require("./livekit");
 const { startCallEgress, stopEgress, getEgressInfo } = require("./egress");
 const { getObject, headObject } = require("./s3");
@@ -101,6 +105,38 @@ const callMetricsPostedTotal = new promClient.Counter({
   labelNames: ["hasUsage"],
 });
 metricsRegister.registerMetric(callMetricsPostedTotal);
+
+const outboundJobsQueuedTotal = new promClient.Counter({
+  name: "rapidcall_outbound_jobs_queued_total",
+  help: "Number of outbound jobs queued",
+});
+metricsRegister.registerMetric(outboundJobsQueuedTotal);
+
+const outboundJobsDialedTotal = new promClient.Counter({
+  name: "rapidcall_outbound_jobs_dialed_total",
+  help: "Number of outbound jobs dialed",
+});
+metricsRegister.registerMetric(outboundJobsDialedTotal);
+
+const outboundJobsFailedTotal = new promClient.Counter({
+  name: "rapidcall_outbound_jobs_failed_total",
+  help: "Number of outbound jobs failed",
+  labelNames: ["reason"],
+});
+metricsRegister.registerMetric(outboundJobsFailedTotal);
+
+const outboundCallsAnsweredTotal = new promClient.Counter({
+  name: "rapidcall_outbound_calls_answered_total",
+  help: "Number of outbound calls answered",
+});
+metricsRegister.registerMetric(outboundCallsAnsweredTotal);
+
+const outboundTimeToAnswerSeconds = new promClient.Histogram({
+  name: "rapidcall_outbound_time_to_answer_seconds",
+  help: "Time from dial to answered (seconds)",
+  buckets: [1, 3, 5, 10, 15, 20, 30, 45, 60],
+});
+metricsRegister.registerMetric(outboundTimeToAnswerSeconds);
 
 // Best-effort in-process gauge (accurate per instance only).
 let inProgressCallsGaugeValue = 0;
@@ -419,6 +455,15 @@ function isAuthPath(pathname) {
   return pathname === "/api/auth/login" || pathname === "/api/auth/register";
 }
 
+function isWebhookPath(pathname) {
+  return (
+    pathname === "/api/livekit/webhook" ||
+    pathname === "/api/stripe/webhook" ||
+    pathname === "/api/twilio/inbound" ||
+    pathname === "/webhooks/telephony"
+  );
+}
+
 function isAllowedOrigin(origin) {
   if (!origin) return false;
   if (clientOrigins.includes("*")) return true;
@@ -445,7 +490,7 @@ app.use((req, res, next) => {
 app.use((req, res, next) => {
   if (!isUnsafeMethod(req.method)) return next();
   if (req.method === "OPTIONS") return next();
-  if (isAuthPath(req.path)) return next();
+  if (isAuthPath(req.path) || isWebhookPath(req.path)) return next();
 
   const origin = String(req.headers.origin || "").trim();
   const referer = String(req.headers.referer || "").trim();
@@ -694,6 +739,15 @@ function extractOriginFromReferer(referer) {
   } catch {
     return null;
   }
+}
+
+function getPublicBaseUrl(req) {
+  const envBase = String(process.env.PUBLIC_API_BASE_URL || "").trim();
+  if (envBase) return envBase.replace(/\/$/, "");
+  const proto = String(req.headers["x-forwarded-proto"] || req.protocol || "https").split(",")[0].trim();
+  const host = String(req.headers["x-forwarded-host"] || req.headers.host || "").split(",")[0].trim();
+  if (!host) return "";
+  return `${proto}://${host}`;
 }
 
 async function requireAuth(req, res, next) {
@@ -1984,6 +2038,104 @@ app.delete("/api/phone-numbers/:id", requireAuth, async (req, res) => {
   return res.json({ ok: true });
 });
 
+// --- Outbound Jobs (MVP) ---
+app.post("/api/outbound/jobs", requireAuth, async (req, res) => {
+  if (!USE_DB) return res.status(400).json({ error: "Outbound jobs require Postgres mode" });
+  const schema = z.object({
+    agentId: z.string().min(1).max(40),
+    leadName: z.string().max(120).optional(),
+    phoneE164: z.string().min(6).max(20),
+    timezone: z.string().max(60).optional(),
+    maxAttempts: z.number().int().min(1).max(10).optional(),
+    recordingEnabled: z.boolean().optional(),
+    metadata: z.record(z.any()).optional(),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "Validation failed", details: parsed.error.flatten() });
+
+  const phone = String(parsed.data.phoneE164 || "").trim();
+  if (!/^\+?[1-9]\d{6,14}$/.test(phone)) {
+    return res.status(400).json({ error: "phoneE164 must be in E.164 format" });
+  }
+
+  const agent = await store.getAgent(req.workspace.id, parsed.data.agentId);
+  if (!agent) return res.status(404).json({ error: "Agent not found" });
+
+  const job = await store.createOutboundJob(req.workspace.id, {
+    leadName: parsed.data.leadName ?? "",
+    phoneE164: phone,
+    timezone: parsed.data.timezone ?? "UTC",
+    maxAttempts: parsed.data.maxAttempts ?? 3,
+    agentId: parsed.data.agentId,
+    recordingEnabled: Boolean(parsed.data.recordingEnabled),
+    metadata: parsed.data.metadata ?? {},
+  });
+  await store.addOutboundJobLog(req.workspace.id, job.id, {
+    level: "info",
+    message: "Job created",
+    meta: { agentId: job.agentId, phoneE164: job.phoneE164 },
+  });
+  outboundJobsQueuedTotal.inc();
+  return res.status(201).json({ job });
+});
+
+app.get("/api/outbound/jobs", requireAuth, async (req, res) => {
+  if (!USE_DB) return res.status(400).json({ error: "Outbound jobs require Postgres mode" });
+  const status = req.query.status ? String(req.query.status) : undefined;
+  const limit = req.query.limit ? Number(req.query.limit) : undefined;
+  const offset = req.query.offset ? Number(req.query.offset) : undefined;
+  const jobs = await store.listOutboundJobs(req.workspace.id, { status, limit, offset });
+  return res.json({ jobs });
+});
+
+app.get("/api/outbound/jobs/:id", requireAuth, async (req, res) => {
+  if (!USE_DB) return res.status(400).json({ error: "Outbound jobs require Postgres mode" });
+  const job = await store.getOutboundJob(req.workspace.id, String(req.params.id || ""));
+  if (!job) return res.status(404).json({ error: "Job not found" });
+  return res.json({ job });
+});
+
+app.get("/api/outbound/jobs/:id/logs", requireAuth, async (req, res) => {
+  if (!USE_DB) return res.status(400).json({ error: "Outbound jobs require Postgres mode" });
+  const id = String(req.params.id || "");
+  const logs = await store.listOutboundJobLogs(req.workspace.id, id, 200);
+  return res.json({ logs });
+});
+
+app.post("/api/outbound/jobs/:id/cancel", requireAuth, async (req, res) => {
+  if (!USE_DB) return res.status(400).json({ error: "Outbound jobs require Postgres mode" });
+  const id = String(req.params.id || "");
+  const job = await store.getOutboundJob(req.workspace.id, id);
+  if (!job) return res.status(404).json({ error: "Job not found" });
+  const next = await store.updateOutboundJob(req.workspace.id, id, {
+    status: "canceled",
+    lastError: "Canceled by user",
+  });
+  await store.addOutboundJobLog(req.workspace.id, id, { level: "warn", message: "Job canceled by user" });
+  return res.json({ job: next });
+});
+
+app.post("/api/outbound/jobs/:id/dnc", requireAuth, async (req, res) => {
+  if (!USE_DB) return res.status(400).json({ error: "Outbound jobs require Postgres mode" });
+  const id = String(req.params.id || "");
+  const schema = z.object({ reason: z.string().max(200).optional() });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "Validation failed", details: parsed.error.flatten() });
+  const job = await store.getOutboundJob(req.workspace.id, id);
+  if (!job) return res.status(404).json({ error: "Job not found" });
+  const next = await store.updateOutboundJob(req.workspace.id, id, {
+    dnc: true,
+    dncReason: parsed.data.reason ?? "",
+    status: "canceled",
+  });
+  await store.addOutboundJobLog(req.workspace.id, id, {
+    level: "warn",
+    message: "DNC set for job",
+    meta: { reason: parsed.data.reason ?? "" },
+  });
+  return res.json({ job: next });
+});
+
 // --- Twilio inbound webhook -> bridge into LiveKit SIP (Phase 3) ---
 app.get("/api/twilio/inbound", async (_req, res) => {
   // Useful for quick connectivity tests from browser/curl.
@@ -2060,6 +2212,88 @@ app.post("/api/twilio/inbound", async (req, res) => {
     // ignore
   }
   res.type("text/xml").send(vr.toString());
+});
+
+function getOutboundAgentName() {
+  return String(process.env.LIVEKIT_OUTBOUND_AGENT_NAME || process.env.LIVEKIT_AGENT_NAME || process.env.LIVEKIT_WEB_AGENT_NAME || "").trim();
+}
+
+async function waitForAgentJoin(roomName, timeoutMs) {
+  const rs = roomService();
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    try {
+      const parts = await rs.listParticipants(roomName);
+      if (Array.isArray(parts) && parts.length >= 2) return true;
+    } catch {
+      // ignore and retry
+    }
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+  return false;
+}
+
+function verifyTwilioWebhook(req) {
+  const authToken = String(process.env.TWILIO_AUTH_TOKEN || "").trim();
+  if (!authToken) return false;
+  const signature = String(req.headers["x-twilio-signature"] || "").trim();
+  if (!signature) return false;
+  const base = getPublicBaseUrl(req);
+  if (!base) return false;
+  const url = `${base}${req.originalUrl}`;
+  return twilio.validateRequest(authToken, signature, url, req.body || {});
+}
+
+// --- Telephony webhook (outbound events) ---
+app.post("/webhooks/telephony", async (req, res) => {
+  if (!verifyTwilioWebhook(req)) {
+    return res.status(401).json({ error: "Invalid telephony signature" });
+  }
+
+  if (!USE_DB) return res.status(200).json({ ok: true });
+  const providerCallId = String(req.body?.CallSid || "").trim();
+  const rawStatus = String(req.body?.CallStatus || "").trim();
+  if (!providerCallId) return res.status(200).json({ ok: true });
+
+  const workspaces = await store.listWorkspaces();
+  let job = null;
+  let workspace = null;
+  for (const ws of workspaces) {
+    const j = await store.getOutboundJobByProviderCallId(ws.id, providerCallId);
+    if (j) {
+      job = j;
+      workspace = ws;
+      break;
+    }
+  }
+  if (!job || !workspace) return res.status(200).json({ ok: true });
+
+  await handleTelephonyEvent({
+    event: { providerCallId, rawStatus },
+    job,
+    workspace,
+    store,
+    startCallEgress,
+    scheduleNextAttempt,
+    hangupCall,
+    logger,
+    dispatchAgent: async (j) => {
+      const agentName = getOutboundAgentName();
+      if (!agentName) return;
+      const dc = agentDispatchService();
+      await dc.createDispatch(j.roomName, agentName, {
+        metadata: JSON.stringify({ source: "outbound", jobId: j.id, callId: j.callId }),
+      });
+    },
+    waitForAgentJoin,
+    metrics: {
+      outboundJobsDialedTotal,
+      outboundCallsAnsweredTotal,
+      outboundTimeToAnswerSeconds,
+      outboundJobsFailedTotal,
+    },
+  });
+  return res.status(200).json({ ok: true });
 });
 
 // --- Start a voice session for an agent profile ---

@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "node src/index.js",
     "start": "node src/index.js",
-    "test": "echo \"(no tests)\"",
+    "test": "node --test",
+    "outbound:worker": "node src/outbound_worker.js",
     "fix:durations:dry": "node src/fix_call_durations.js --dry-run",
     "fix:durations": "node src/fix_call_durations.js --apply",
     "fix:stale:dry": "node src/fix_stale_calls.js --dry-run",
