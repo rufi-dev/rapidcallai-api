@@ -2088,7 +2088,8 @@ app.post("/api/agents/:id/start", requireAuth, async (req, res) => {
   if (!agent) return res.status(404).json({ error: "Agent not found" });
   const promptDraft = agent.promptDraft ?? agent.prompt ?? "";
   const promptPublished = agent.promptPublished ?? "";
-  let promptUsed = (promptDraft && String(promptDraft).trim()) ? promptDraft : promptPublished;
+  const basePrompt = (promptDraft && String(promptDraft).trim()) ? promptDraft : promptPublished;
+  let promptUsed = basePrompt;
   let variantChosen = null;
   if (USE_DB) {
     try {
@@ -2105,13 +2106,15 @@ app.post("/api/agents/:id/start", requireAuth, async (req, res) => {
             break;
           }
         }
-        if (variantChosen?.prompt) promptUsed = variantChosen.prompt;
+        if (variantChosen?.prompt) {
+          promptUsed = `${basePrompt}\n\n# Variant (A/B Test)\n${variantChosen.prompt}`;
+        }
       }
     } catch (e) {
       logger.warn({ requestId: req.requestId, err: String(e?.message || e) }, "variant selection failed");
     }
   }
-  if (!promptUsed || String(promptUsed).trim().length === 0) {
+  if (!basePrompt || String(basePrompt).trim().length === 0) {
     return res.status(400).json({ error: "Agent prompt is empty. Set a prompt before starting a session." });
   }
 
@@ -2153,7 +2156,9 @@ app.post("/api/agents/:id/start", requireAuth, async (req, res) => {
     recording: null, // will be filled if egress is enabled
     metrics: {
       normalized: { source: "web" },
-      abTest: variantChosen ? { variantId: variantChosen.id, variantName: variantChosen.name } : null,
+      abTest: variantChosen
+        ? { variantId: variantChosen.id, variantName: variantChosen.name, promptMode: "base_plus_variant" }
+        : null,
     },
     createdAt: now,
     updatedAt: now,
@@ -2179,6 +2184,8 @@ app.post("/api/agents/:id/start", requireAuth, async (req, res) => {
         id: agent.id,
         name: agent.name,
         prompt: promptUsed,
+        promptBase: basePrompt,
+        promptVariant: variantChosen?.prompt ?? null,
         voice,
         llmModel,
         maxCallSeconds,
