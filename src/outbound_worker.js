@@ -1,8 +1,10 @@
-// Ensure server/.env is loaded for the worker process.
-require("dotenv").config({
-  path: require("path").join(__dirname, "..", ".env"),
-  override: true,
-});
+// When run directly (npm run outbound:worker), load .env for standalone mode.
+if (require.main === module) {
+  require("dotenv").config({
+    path: require("path").join(__dirname, "..", ".env"),
+    override: true,
+  });
+}
 
 const { nanoid } = require("./id");
 const { logger } = require("./logger");
@@ -276,28 +278,53 @@ async function tick() {
   }
 }
 
-async function main() {
-  logger.info({ workerId: WORKER_ID, useDb: USE_DB }, "[outbound.worker] starting");
+// --- Instant trigger: call triggerNow() to run tick immediately (e.g. when a job is created) ---
+let _tickPromise = null;
+
+function triggerNow() {
+  if (_tickPromise) return; // already running
+  _tickPromise = tick()
+    .catch((e) => {
+      logger.error({ workerId: WORKER_ID, err: String(e?.message || e) }, "[outbound.worker] triggered tick failed");
+    })
+    .finally(() => {
+      _tickPromise = null;
+    });
+}
+
+// --- Start the worker loop (call once) ---
+let _started = false;
+
+function start() {
+  if (_started) return;
+  _started = true;
+
+  if (!USE_DB) {
+    logger.warn({ workerId: WORKER_ID }, "[outbound.worker] DATABASE_URL not set; outbound disabled");
+    return;
+  }
+
+  const intervalMs = getPollIntervalMs();
+  logger.info({ workerId: WORKER_ID, intervalMs, maxTotal: getMaxTotal() }, "[outbound.worker] started (embedded)");
+
+  // Run first tick immediately
+  triggerNow();
+
+  setInterval(() => {
+    triggerNow();
+  }, intervalMs);
+}
+
+module.exports = { start, triggerNow };
+
+// --- Standalone mode: npm run outbound:worker ---
+if (require.main === module) {
+  logger.info({ workerId: WORKER_ID, useDb: USE_DB }, "[outbound.worker] starting (standalone)");
 
   if (!USE_DB) {
     logger.error("[outbound.worker] DATABASE_URL not set, exiting");
     process.exit(1);
   }
 
-  const intervalMs = getPollIntervalMs();
-  logger.info({ intervalMs, maxTotal: getMaxTotal() }, "[outbound.worker] polling");
-
-  // Run first tick immediately
-  await tick();
-
-  setInterval(() => {
-    tick().catch((e) => {
-      logger.error({ workerId: WORKER_ID, err: String(e?.message || e) }, "[outbound.worker] tick failed");
-    });
-  }, intervalMs);
+  start();
 }
-
-main().catch((e) => {
-  logger.error({ workerId: WORKER_ID, err: String(e?.message || e) }, "[outbound.worker] fatal");
-  process.exit(1);
-});

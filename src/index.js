@@ -40,6 +40,7 @@ const {
 const { getPool, initSchema } = require("./db");
 const store = require("./store_pg");
 const { roomService, agentDispatchService, createParticipantToken, sipClient } = require("./livekit");
+const outboundWorker = require("./outbound_worker");
 const { startCallEgress, stopEgress, getEgressInfo } = require("./egress");
 const { getObject, headObject } = require("./s3");
 const tw = require("./twilio");
@@ -2091,6 +2092,10 @@ app.post("/api/outbound/jobs", requireAuth, async (req, res) => {
     meta: { agentId: job.agentId, phoneE164: job.phoneE164 },
   });
   outboundJobsQueuedTotal.inc();
+
+  // Trigger the outbound worker immediately so the call starts right away
+  outboundWorker.triggerNow();
+
   return res.status(201).json({ job });
 });
 
@@ -3625,6 +3630,13 @@ async function main() {
     // eslint-disable-next-line no-console
     if (suspiciousKeys.length)
       console.log(`Egress(S3) WARNING: suspicious keys (whitespace): ${suspiciousKeys.join(", ")}`);
+
+    // Auto-start outbound worker inside the main server process
+    if (USE_DB) {
+      outboundWorker.start();
+      // eslint-disable-next-line no-console
+      console.log("Outbound worker started (embedded in server)");
+    }
   });
 }
 
