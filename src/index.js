@@ -39,7 +39,7 @@ const {
 } = require("./storage");
 const { getPool, initSchema } = require("./db");
 const store = require("./store_pg");
-const { roomService, agentDispatchService, createParticipantToken, sipClient } = require("./livekit");
+const { roomService, agentDispatchService, createParticipantToken, sipClient, addNumberToInboundTrunk, addNumberToOutboundTrunk, removeNumberFromInboundTrunk, removeNumberFromOutboundTrunk } = require("./livekit");
 const outboundWorker = require("./outbound_worker");
 const { startCallEgress, stopEgress, getEgressInfo } = require("./egress");
 const { getObject, headObject } = require("./s3");
@@ -1846,17 +1846,77 @@ app.post("/api/workspaces/:id/twilio/buy-number", requireAuth, async (req, res) 
       friendlyName: parsed.data.label || undefined,
     });
 
-    // Save as a phone number record.
+    // Save as a phone number record (initially unconfigured).
+    const inboundTrunkId = String(process.env.SIP_INBOUND_TRUNK_ID || "").trim();
+    const outboundTrunkId = String(process.env.SIP_OUTBOUND_TRUNK_ID || "").trim();
+    const sipEndpoint = String(process.env.LIVEKIT_SIP_ENDPOINT || "").trim();
+
     if (USE_DB) {
-      const phoneNumber = await store.createPhoneNumber({
+      let phoneNumber = await store.createPhoneNumber({
         workspaceId: ws.id,
         e164: purchased.phoneNumber,
         label: parsed.data.label ?? "",
         provider: "twilio",
         status: "unconfigured",
         twilioNumberSid: purchased.sid,
+        livekitInboundTrunkId: inboundTrunkId || null,
+        livekitOutboundTrunkId: outboundTrunkId || null,
         allowedInboundCountries: ["all"],
         allowedOutboundCountries: ["all"],
+      });
+
+      // --- Auto-provision: Twilio voice URL + LiveKit SIP trunks ---
+      const provisionErrors = [];
+
+      // 1) Configure Twilio number to forward inbound calls to our server → LiveKit SIP
+      try {
+        await tw.configureNumberForSip({
+          subaccountSid: ws.twilioSubaccountSid,
+          numberSid: purchased.sid,
+          e164: purchased.phoneNumber,
+          sipEndpoint,
+        });
+        logger.info({ e164: purchased.phoneNumber }, "[buy-number] Twilio voice URL configured");
+      } catch (e) {
+        const msg = String(e?.message || e);
+        logger.warn({ e164: purchased.phoneNumber, err: msg }, "[buy-number] failed to configure Twilio voice URL");
+        provisionErrors.push(`Twilio voice URL: ${msg}`);
+      }
+
+      // 2) Add number to LiveKit inbound trunk
+      if (inboundTrunkId) {
+        try {
+          await addNumberToInboundTrunk(inboundTrunkId, purchased.phoneNumber);
+          logger.info({ e164: purchased.phoneNumber, trunkId: inboundTrunkId }, "[buy-number] added to inbound trunk");
+        } catch (e) {
+          const msg = String(e?.message || e);
+          logger.warn({ e164: purchased.phoneNumber, err: msg }, "[buy-number] failed to add to inbound trunk");
+          provisionErrors.push(`Inbound trunk: ${msg}`);
+        }
+      } else {
+        provisionErrors.push("SIP_INBOUND_TRUNK_ID not set — skipped inbound trunk");
+      }
+
+      // 3) Add number to LiveKit outbound trunk
+      if (outboundTrunkId) {
+        try {
+          await addNumberToOutboundTrunk(outboundTrunkId, purchased.phoneNumber);
+          logger.info({ e164: purchased.phoneNumber, trunkId: outboundTrunkId }, "[buy-number] added to outbound trunk");
+        } catch (e) {
+          const msg = String(e?.message || e);
+          logger.warn({ e164: purchased.phoneNumber, err: msg }, "[buy-number] failed to add to outbound trunk");
+          provisionErrors.push(`Outbound trunk: ${msg}`);
+        }
+      } else {
+        provisionErrors.push("SIP_OUTBOUND_TRUNK_ID not set — skipped outbound trunk");
+      }
+
+      // 4) Update status to active (or partially configured if errors)
+      const newStatus = provisionErrors.length === 0 ? "active" : "partial";
+      phoneNumber = await store.updatePhoneNumber(phoneNumber.id, {
+        status: newStatus,
+        livekitInboundTrunkId: inboundTrunkId || null,
+        livekitOutboundTrunkId: outboundTrunkId || null,
       });
 
       // Keep Stripe phone-number monthly quantity in sync (best-effort).
@@ -1874,7 +1934,13 @@ app.post("/api/workspaces/:id/twilio/buy-number", requireAuth, async (req, res) 
         logger.warn({ requestId: req.requestId, err: String(e?.message || e) }, "[twilio.buy-number] failed to sync stripe quantity");
         sendAlert("stripe_quantity_sync_failed", { requestId: req.requestId, error: String(e?.message || e) });
       }
-      return res.status(201).json({ phoneNumber, purchased });
+
+      return res.status(201).json({
+        phoneNumber,
+        purchased,
+        provisioned: provisionErrors.length === 0,
+        provisionErrors: provisionErrors.length > 0 ? provisionErrors : undefined,
+      });
     }
 
     const rows = readPhoneNumbers();
@@ -1885,8 +1951,10 @@ app.post("/api/workspaces/:id/twilio/buy-number", requireAuth, async (req, res) 
       e164: purchased.phoneNumber,
       label: parsed.data.label ?? "",
       provider: "twilio",
-      status: "unconfigured",
+      status: "active",
       twilioNumberSid: purchased.sid,
+      livekitInboundTrunkId: inboundTrunkId || null,
+      livekitOutboundTrunkId: outboundTrunkId || null,
       inboundAgentId: null,
       outboundAgentId: null,
       allowedInboundCountries: ["all"],
@@ -2046,6 +2114,34 @@ app.delete("/api/phone-numbers/:id", requireAuth, async (req, res) => {
   if (USE_DB) {
     const existing = await store.getPhoneNumber(id);
     if (!existing || existing.workspaceId !== req.workspace.id) return res.status(404).json({ error: "Not found" });
+
+    const e164 = existing.e164;
+    const inTrunk = existing.livekitInboundTrunkId || String(process.env.SIP_INBOUND_TRUNK_ID || "").trim();
+    const outTrunk = existing.livekitOutboundTrunkId || String(process.env.SIP_OUTBOUND_TRUNK_ID || "").trim();
+
+    // Best-effort: remove number from LiveKit SIP trunks
+    if (inTrunk && e164) {
+      try { await removeNumberFromInboundTrunk(inTrunk, e164); } catch (e) {
+        logger.warn({ e164, err: String(e?.message || e) }, "[delete-number] failed to remove from inbound trunk");
+      }
+    }
+    if (outTrunk && e164) {
+      try { await removeNumberFromOutboundTrunk(outTrunk, e164); } catch (e) {
+        logger.warn({ e164, err: String(e?.message || e) }, "[delete-number] failed to remove from outbound trunk");
+      }
+    }
+
+    // Best-effort: release the number on Twilio
+    if (existing.twilioNumberSid && req.workspace.twilioSubaccountSid) {
+      try {
+        const client = tw.getSubaccountClient(req.workspace.twilioSubaccountSid);
+        if (client) await client.incomingPhoneNumbers(existing.twilioNumberSid).remove();
+        logger.info({ e164 }, "[delete-number] released on Twilio");
+      } catch (e) {
+        logger.warn({ e164, err: String(e?.message || e) }, "[delete-number] failed to release on Twilio");
+      }
+    }
+
     await store.deletePhoneNumber(id);
     return res.json({ ok: true });
   }

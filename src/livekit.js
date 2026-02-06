@@ -39,6 +39,61 @@ function sipClient() {
   return new SipClient(apiUrl, apiKey, apiSecret);
 }
 
-module.exports = { roomService, agentDispatchService, createParticipantToken, sipClient };
+/**
+ * Add a phone number to an existing LiveKit SIP inbound trunk.
+ * Uses the updateSipInboundTrunkFields API with ListUpdate to add without replacing.
+ */
+async function addNumberToInboundTrunk(trunkId, phoneE164) {
+  const { ListUpdate } = require("@livekit/protocol");
+  const sip = sipClient();
+  return await sip.updateSipInboundTrunkFields(trunkId, {
+    numbers: new ListUpdate({ add: [phoneE164] }),
+  });
+}
+
+/**
+ * Add a phone number to an existing LiveKit SIP outbound trunk.
+ * Uses the updateSipOutboundTrunkFields API with ListUpdate to add without replacing.
+ */
+async function addNumberToOutboundTrunk(trunkId, phoneE164) {
+  const { ListUpdate } = require("@livekit/protocol");
+  const sip = sipClient();
+  return await sip.updateSipOutboundTrunkFields(trunkId, {
+    numbers: new ListUpdate({ add: [phoneE164] }),
+  });
+}
+
+/**
+ * Remove a phone number from an existing LiveKit SIP inbound trunk.
+ */
+async function removeNumberFromInboundTrunk(trunkId, phoneE164) {
+  const { ListUpdate } = require("@livekit/protocol");
+  const sip = sipClient();
+  return await sip.updateSipInboundTrunkFields(trunkId, {
+    numbers: new ListUpdate({ remove: [phoneE164] }),
+  });
+}
+
+/**
+ * Remove a phone number from an existing LiveKit SIP outbound trunk.
+ */
+async function removeNumberFromOutboundTrunk(trunkId, phoneE164) {
+  const { ListUpdate } = require("@livekit/protocol");
+  const sip = sipClient();
+  return await sip.updateSipOutboundTrunkFields(trunkId, {
+    numbers: new ListUpdate({ remove: [phoneE164] }),
+  });
+}
+
+module.exports = {
+  roomService,
+  agentDispatchService,
+  createParticipantToken,
+  sipClient,
+  addNumberToInboundTrunk,
+  addNumberToOutboundTrunk,
+  removeNumberFromInboundTrunk,
+  removeNumberFromOutboundTrunk,
+};
 
 
