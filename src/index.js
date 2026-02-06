@@ -2160,7 +2160,7 @@ app.post("/api/outbound/jobs", requireAuth, async (req, res) => {
     timezone: z.string().max(60).optional(),
     maxAttempts: z.number().int().min(1).max(10).optional(),
     recordingEnabled: z.boolean().optional(),
-    metadata: z.record(z.any()).optional(),
+    metadata: z.record(z.string(), z.unknown()).optional(),
   });
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "Validation failed", details: parsed.error.flatten() });
