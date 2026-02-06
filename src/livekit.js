@@ -1,4 +1,4 @@
-const { AccessToken, RoomServiceClient, AgentDispatchClient } = require("livekit-server-sdk");
+const { AccessToken, RoomServiceClient, AgentDispatchClient, SipClient } = require("livekit-server-sdk");
 
 function getLiveKitConfig() {
   const url = process.env.LIVEKIT_URL;
@@ -34,6 +34,11 @@ async function createParticipantToken({ roomName, identity, name, metadata }) {
   return await at.toJwt();
 }
 
-module.exports = { roomService, agentDispatchService, createParticipantToken };
+function sipClient() {
+  const { apiUrl, apiKey, apiSecret } = getLiveKitConfig();
+  return new SipClient(apiUrl, apiKey, apiSecret);
+}
+
+module.exports = { roomService, agentDispatchService, createParticipantToken, sipClient };
 
 

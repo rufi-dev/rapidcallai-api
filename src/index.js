@@ -39,10 +39,7 @@ const {
 } = require("./storage");
 const { getPool, initSchema } = require("./db");
 const store = require("./store_pg");
-const { scheduleNextAttempt } = require("./outbound_scheduler");
-const { hangupCall } = require("./telephony/provider_twilio");
-const { handleTelephonyEvent } = require("./outbound_events");
-const { roomService, agentDispatchService, createParticipantToken } = require("./livekit");
+const { roomService, agentDispatchService, createParticipantToken, sipClient } = require("./livekit");
 const { startCallEgress, stopEgress, getEgressInfo } = require("./egress");
 const { getObject, headObject } = require("./s3");
 const tw = require("./twilio");
@@ -354,6 +351,25 @@ app.post("/api/livekit/webhook", express.raw({ type: "application/webhook+json" 
           participants[pid] = { ...p, joinedAtMs: null, lastSeenAtMs: tsMs };
         }
       }
+
+      // Mark outbound job as completed when the room ends
+      if (USE_DB && roomName && roomName.startsWith("out-")) {
+        try {
+          const workspaces = await store.listWorkspaces();
+          for (const ws of workspaces) {
+            const jobs = await store.listOutboundJobs(ws.id, { limit: 1000 });
+            const job = jobs.find((j) => j.roomName === roomName && (j.status === "in_call" || j.status === "dialing"));
+            if (job) {
+              await store.updateOutboundJob(ws.id, job.id, { status: "completed", lastError: "" });
+              await store.addOutboundJobLog(ws.id, job.id, { level: "info", message: "Call completed (room finished)" });
+              logger.info({ jobId: job.id, roomName }, "[outbound] job completed via room_finished");
+              break;
+            }
+          }
+        } catch (e2) {
+          logger.warn({ err: String(e2?.message || e2), roomName }, "[outbound] failed to complete job on room_finished");
+        }
+      }
     }
 
     const participantMinutesBilled = round4(billedSecondsTotal / 60);
@@ -459,8 +475,7 @@ function isWebhookPath(pathname) {
   return (
     pathname === "/api/livekit/webhook" ||
     pathname === "/api/stripe/webhook" ||
-    pathname === "/api/twilio/inbound" ||
-    pathname === "/webhooks/telephony"
+    pathname === "/api/twilio/inbound"
   );
 }
 
@@ -2214,25 +2229,6 @@ app.post("/api/twilio/inbound", async (req, res) => {
   res.type("text/xml").send(vr.toString());
 });
 
-function getOutboundAgentName() {
-  return String(process.env.LIVEKIT_OUTBOUND_AGENT_NAME || process.env.LIVEKIT_AGENT_NAME || process.env.LIVEKIT_WEB_AGENT_NAME || "").trim();
-}
-
-async function waitForAgentJoin(roomName, timeoutMs) {
-  const rs = roomService();
-  const started = Date.now();
-  while (Date.now() - started < timeoutMs) {
-    try {
-      const parts = await rs.listParticipants(roomName);
-      if (Array.isArray(parts) && parts.length >= 2) return true;
-    } catch {
-      // ignore and retry
-    }
-    await new Promise((r) => setTimeout(r, 1000));
-  }
-  return false;
-}
-
 function verifyTwilioWebhook(req) {
   const authToken = String(process.env.TWILIO_AUTH_TOKEN || "").trim();
   if (!authToken) return false;
@@ -2244,57 +2240,8 @@ function verifyTwilioWebhook(req) {
   return twilio.validateRequest(authToken, signature, url, req.body || {});
 }
 
-// --- Telephony webhook (outbound events) ---
-app.post("/webhooks/telephony", async (req, res) => {
-  if (!verifyTwilioWebhook(req)) {
-    return res.status(401).json({ error: "Invalid telephony signature" });
-  }
-
-  if (!USE_DB) return res.status(200).json({ ok: true });
-  const providerCallId = String(req.body?.CallSid || "").trim();
-  const rawStatus = String(req.body?.CallStatus || "").trim();
-  if (!providerCallId) return res.status(200).json({ ok: true });
-
-  const workspaces = await store.listWorkspaces();
-  let job = null;
-  let workspace = null;
-  for (const ws of workspaces) {
-    const j = await store.getOutboundJobByProviderCallId(ws.id, providerCallId);
-    if (j) {
-      job = j;
-      workspace = ws;
-      break;
-    }
-  }
-  if (!job || !workspace) return res.status(200).json({ ok: true });
-
-  await handleTelephonyEvent({
-    event: { providerCallId, rawStatus },
-    job,
-    workspace,
-    store,
-    startCallEgress,
-    scheduleNextAttempt,
-    hangupCall,
-    logger,
-    dispatchAgent: async (j) => {
-      const agentName = getOutboundAgentName();
-      if (!agentName) return;
-      const dc = agentDispatchService();
-      await dc.createDispatch(j.roomName, agentName, {
-        metadata: JSON.stringify({ source: "outbound", jobId: j.id, callId: j.callId }),
-      });
-    },
-    waitForAgentJoin,
-    metrics: {
-      outboundJobsDialedTotal,
-      outboundCallsAnsweredTotal,
-      outboundTimeToAnswerSeconds,
-      outboundJobsFailedTotal,
-    },
-  });
-  return res.status(200).json({ ok: true });
-});
+// NOTE: Old /webhooks/telephony removed. Outbound calls now use LiveKit SIP (CreateSIPParticipant).
+// LiveKit handles call events internally. Outbound worker polls job status.
 
 // --- Start a voice session for an agent profile ---
 app.post("/api/agents/:id/start", requireAuth, async (req, res) => {

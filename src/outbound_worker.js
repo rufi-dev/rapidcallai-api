@@ -7,10 +7,7 @@ require("dotenv").config({
 const { nanoid } = require("./id");
 const { logger } = require("./logger");
 const store = require("./store_pg");
-const { roomService } = require("./livekit");
-const { scheduleNextAttempt } = require("./outbound_scheduler");
-const { computeCapacity } = require("./outbound_queue_logic");
-const { startOutboundCall } = require("./telephony/provider_twilio");
+const { roomService, agentDispatchService, sipClient } = require("./livekit");
 
 const USE_DB = Boolean(process.env.DATABASE_URL);
 const WORKER_ID = `outbound-worker-${nanoid(6)}`;
@@ -23,6 +20,22 @@ function getMaxTotal() {
 function getPollIntervalMs() {
   const v = Number(process.env.OUTBOUND_POLL_INTERVAL_MS || 2000);
   return Number.isFinite(v) && v > 0 ? Math.min(60_000, Math.max(500, v)) : 2000;
+}
+
+function getOutboundTrunkId(phoneRow) {
+  // Priority: phone number config → env var
+  const fromRow = phoneRow?.livekitOutboundTrunkId || null;
+  if (fromRow) return fromRow;
+  return String(process.env.SIP_OUTBOUND_TRUNK_ID || "").trim() || null;
+}
+
+function getAgentName() {
+  return String(
+    process.env.LIVEKIT_OUTBOUND_AGENT_NAME ||
+    process.env.LIVEKIT_WEB_AGENT_NAME ||
+    process.env.LIVEKIT_AGENT_NAME ||
+    ""
+  ).trim();
 }
 
 async function ensureRoomWithMetadata({ roomName, job, agent, callId }) {
@@ -57,17 +70,16 @@ async function ensureRoomWithMetadata({ roomName, job, agent, callId }) {
     await rs.createRoom({
       name: roomName,
       metadata: JSON.stringify(metadata),
-      emptyTimeout: 30,
-      maxParticipants: 2,
+      emptyTimeout: 60,
+      maxParticipants: 3,
     });
   } catch (e) {
-    // If the room already exists, we can continue.
     const msg = String(e?.message || e);
     if (!/already exists/i.test(msg)) throw e;
   }
 }
 
-async function createOrUpdateCall({ workspaceId, job, callId, roomName, agent }) {
+async function createCallRecord({ workspaceId, job, callId, roomName, agent }) {
   const existing = await store.getCallById(callId);
   const now = Date.now();
   if (existing) {
@@ -100,38 +112,41 @@ async function handleJob(workspace, job) {
   const now = Date.now();
   const workspaceId = workspace.id;
 
+  // DNC check
   if (job.dnc) {
     await store.updateOutboundJob(workspaceId, job.id, { status: "canceled", lastError: "DNC enabled" });
     await store.addOutboundJobLog(workspaceId, job.id, {
       level: "warn",
       message: "Job canceled due to DNC",
-      meta: { jobId: job.id },
     });
     return;
   }
 
+  // Resolve agent
   const agent = await store.getAgent(workspaceId, job.agentId);
   if (!agent) {
-    await store.updateOutboundJob(workspaceId, job.id, {
-      status: "failed",
-      lastError: "Agent not found",
-    });
+    await store.updateOutboundJob(workspaceId, job.id, { status: "failed", lastError: "Agent not found" });
     await store.addOutboundJobLog(workspaceId, job.id, { level: "error", message: "Agent not found" });
     return;
   }
 
+  // Resolve outbound phone number + trunk ID
   const phoneNumbers = await store.listPhoneNumbers(workspaceId);
   const phoneRow =
     phoneNumbers.find((p) => p.outboundAgentId === job.agentId) ||
     phoneNumbers.find((p) => p.outboundAgentId) ||
     phoneNumbers[0];
-  const outboundNumber = phoneRow?.e164 || "";
-  if (!phoneRow || !outboundNumber) {
-    await store.updateOutboundJob(workspaceId, job.id, {
-      status: "failed",
-      lastError: "No outbound phone number configured",
-    });
+  const fromNumber = phoneRow?.e164 || "";
+  if (!phoneRow || !fromNumber) {
+    await store.updateOutboundJob(workspaceId, job.id, { status: "failed", lastError: "No outbound phone number configured" });
     await store.addOutboundJobLog(workspaceId, job.id, { level: "error", message: "No outbound phone number configured" });
+    return;
+  }
+
+  const trunkId = getOutboundTrunkId(phoneRow);
+  if (!trunkId) {
+    await store.updateOutboundJob(workspaceId, job.id, { status: "failed", lastError: "No SIP outbound trunk ID configured" });
+    await store.addOutboundJobLog(workspaceId, job.id, { level: "error", message: "No SIP outbound trunk ID. Set it on the phone number or SIP_OUTBOUND_TRUNK_ID env." });
     return;
   }
 
@@ -139,67 +154,103 @@ async function handleJob(workspace, job) {
   const callId = job.callId || `out_${job.id}`;
 
   try {
+    // 1) Create room with agent metadata
     await ensureRoomWithMetadata({ roomName, job, agent, callId });
-    await createOrUpdateCall({ workspaceId, job, callId, roomName, agent });
 
-    await store.updateOutboundJob(workspaceId, job.id, { roomName, callId });
+    // 2) Create call record
+    await createCallRecord({ workspaceId, job, callId, roomName, agent });
 
-    const sipEndpoint = String(process.env.LIVEKIT_SIP_ENDPOINT || "").trim();
-    const statusCallbackUrl = (() => {
-      const base = String(process.env.PUBLIC_API_BASE_URL || "").trim();
-      return base ? `${base.replace(/\/$/, "")}/webhooks/telephony` : null;
-    })();
-    if (!statusCallbackUrl) {
-      logger.warn({ jobId: job.id }, "[outbound.worker] PUBLIC_API_BASE_URL not set; telephony events disabled");
-    }
-
-    const { providerCallId } = await startOutboundCall({
-      job: { ...job, roomName },
-      workspace,
-      fromNumber: outboundNumber,
-      sipEndpoint,
-      sipUser: String(phoneRow.livekitSipUsername || "").trim(),
-      sipPass: String(phoneRow.livekitSipPassword || "").trim(),
-      statusCallbackUrl,
+    // 3) Update job with room/call info (already 'dialing' from claimOutboundJobs)
+    await store.updateOutboundJob(workspaceId, job.id, {
+      roomName,
+      callId,
+      lastError: "",
     });
 
+    // 4) Dispatch agent to room (so it's ready when callee picks up)
+    const agentName = getAgentName();
+    if (agentName) {
+      try {
+        const dc = agentDispatchService();
+        await dc.createDispatch(roomName, agentName, {
+          metadata: JSON.stringify({ source: "outbound", jobId: job.id, callId }),
+        });
+        logger.info({ jobId: job.id, roomName, agentName }, "[outbound] agent dispatched");
+      } catch (e) {
+        logger.warn({ err: String(e?.message || e), jobId: job.id }, "[outbound] agent dispatch failed");
+      }
+    }
+
+    // 5) Dial the phone number via LiveKit SIP (CreateSIPParticipant)
+    await store.addOutboundJobLog(workspaceId, job.id, {
+      level: "info",
+      message: "Dialing via LiveKit SIP",
+      meta: { trunkId, roomName, from: fromNumber, to: job.phoneE164 },
+    });
+
+    const sip = sipClient();
+    const sipParticipant = await sip.createSipParticipant(
+      trunkId,
+      job.phoneE164,
+      roomName,
+      {
+        participantIdentity: `sip-${job.phoneE164}`,
+        participantName: job.leadName || job.phoneE164,
+        fromNumber: fromNumber,
+        waitUntilAnswered: true,
+      }
+    );
+
+    // If we get here, the call was answered
+    logger.info({ jobId: job.id, participantId: sipParticipant?.sipParticipantId }, "[outbound] call answered");
+
     await store.updateOutboundJob(workspaceId, job.id, {
-      status: "dialing",
-      providerCallId,
+      status: "in_call",
+      providerCallId: sipParticipant?.sipParticipantId || null,
       lastError: "",
-      nextAttemptAt: null,
-      lockedAt: now,
-      lockedBy: WORKER_ID,
     });
     await store.addOutboundJobLog(workspaceId, job.id, {
       level: "info",
-      message: "Outbound call started",
-      meta: { providerCallId, roomName, from: outboundNumber, to: job.phoneE164 },
+      message: "Call answered",
+      meta: { sipParticipantId: sipParticipant?.sipParticipantId },
     });
+
   } catch (e) {
     const errMsg = String(e?.message || e);
     const attempts = Number(job.attempts || 0);
     const maxAttempts = Number(job.maxAttempts || 3);
+
+    // Extract SIP status if available (TwirpError from LiveKit)
+    const sipStatus = e?.metadata?.sip_status_code || null;
+    const sipMsg = e?.metadata?.sip_status || null;
+    const fullError = sipStatus ? `SIP ${sipStatus}: ${sipMsg || errMsg}` : errMsg;
+
+    logger.warn({ jobId: job.id, err: fullError, sipStatus }, "[outbound] call failed");
+
     if (attempts >= maxAttempts) {
-      await store.updateOutboundJob(workspaceId, job.id, { status: "failed", lastError: errMsg });
+      await store.updateOutboundJob(workspaceId, job.id, { status: "failed", lastError: fullError });
       await store.addOutboundJobLog(workspaceId, job.id, {
         level: "error",
-        message: "Outbound call failed (max attempts reached)",
-        meta: { error: errMsg },
+        message: "Call failed (max attempts reached)",
+        meta: { error: fullError, sipStatus },
       });
-      return;
+    } else {
+      // Retry with exponential backoff
+      const baseBackoffSec = Math.max(30, Number(process.env.OUTBOUND_BASE_BACKOFF_SEC || 60));
+      const delayMs = baseBackoffSec * Math.pow(2, Math.max(0, attempts - 1)) * 1000;
+      const nextAttemptAt = now + Math.min(delayMs, 24 * 60 * 60 * 1000);
+
+      await store.updateOutboundJob(workspaceId, job.id, {
+        status: "queued",
+        lastError: fullError,
+        nextAttemptAt,
+      });
+      await store.addOutboundJobLog(workspaceId, job.id, {
+        level: "warn",
+        message: "Call failed, will retry",
+        meta: { error: fullError, sipStatus, nextAttemptAt },
+      });
     }
-    const nextAttemptAt = scheduleNextAttempt({ nowMs: now, attempts, timezone: job.timezone });
-    await store.updateOutboundJob(workspaceId, job.id, {
-      status: "queued",
-      lastError: errMsg,
-      nextAttemptAt,
-    });
-    await store.addOutboundJobLog(workspaceId, job.id, {
-      level: "warn",
-      message: "Outbound call failed, will retry",
-      meta: { error: errMsg, nextAttemptAt },
-    });
   }
 }
 
@@ -209,26 +260,36 @@ async function tick() {
     return;
   }
 
-  const workspaces = await store.listWorkspaces();
   const maxTotal = getMaxTotal();
+  const workspaces = await store.listWorkspaces();
 
   for (const ws of workspaces) {
     const activeOutbound = await store.countOutboundActive(ws.id);
     const activeCalls = await store.countInProgressCalls(ws.id);
-    const capacity = computeCapacity(maxTotal, activeOutbound + activeCalls);
+    const capacity = Math.max(0, maxTotal - (activeOutbound + activeCalls));
     if (capacity <= 0) continue;
 
     const jobs = await store.claimOutboundJobs(ws.id, Date.now(), capacity, WORKER_ID);
-    for (const job of jobs) {
-      await handleJob(ws, job);
-    }
+
+    // Process jobs concurrently (each is independent)
+    await Promise.allSettled(jobs.map((job) => handleJob(ws, job)));
   }
 }
 
 async function main() {
-  logger.info({ workerId: WORKER_ID }, "[outbound.worker] starting");
+  logger.info({ workerId: WORKER_ID, useDb: USE_DB }, "[outbound.worker] starting");
+
+  if (!USE_DB) {
+    logger.error("[outbound.worker] DATABASE_URL not set, exiting");
+    process.exit(1);
+  }
+
   const intervalMs = getPollIntervalMs();
+  logger.info({ intervalMs, maxTotal: getMaxTotal() }, "[outbound.worker] polling");
+
+  // Run first tick immediately
   await tick();
+
   setInterval(() => {
     tick().catch((e) => {
       logger.error({ workerId: WORKER_ID, err: String(e?.message || e) }, "[outbound.worker] tick failed");
