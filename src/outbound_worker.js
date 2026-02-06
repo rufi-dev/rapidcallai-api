@@ -133,13 +133,16 @@ async function handleJob(workspace, job) {
   }
 
   // Resolve outbound phone number + trunk ID
+  // Priority: metadata.fromNumber (user chose in UI) → agent-assigned number → first available
+  const metaFromNumber = String(job.metadata?.fromNumber || "").trim();
   const phoneNumbers = await store.listPhoneNumbers(workspaceId);
-  const phoneRow =
-    phoneNumbers.find((p) => p.outboundAgentId === job.agentId) ||
-    phoneNumbers.find((p) => p.outboundAgentId) ||
-    phoneNumbers[0];
-  const fromNumber = phoneRow?.e164 || "";
-  if (!phoneRow || !fromNumber) {
+  const phoneRow = metaFromNumber
+    ? phoneNumbers.find((p) => p.e164 === metaFromNumber) || phoneNumbers[0]
+    : phoneNumbers.find((p) => p.outboundAgentId === job.agentId) ||
+      phoneNumbers.find((p) => p.outboundAgentId) ||
+      phoneNumbers[0];
+  const fromNumber = metaFromNumber || phoneRow?.e164 || "";
+  if (!fromNumber) {
     await store.updateOutboundJob(workspaceId, job.id, { status: "failed", lastError: "No outbound phone number configured" });
     await store.addOutboundJobLog(workspaceId, job.id, { level: "error", message: "No outbound phone number configured" });
     return;
