@@ -74,6 +74,17 @@ async function ensureWorkspaceOutboundTrunk(workspace, phoneRow) {
     }
   }
 
+  // 3b) Ensure Origination URI → LiveKit SIP endpoint (required for inbound calls).
+  const sipEndpoint = String(process.env.LIVEKIT_SIP_ENDPOINT || "").trim();
+  if (sipEndpoint) {
+    try {
+      await tw.ensureSipTrunkOriginationUri({ subaccountSid: subSid, trunkSid, sipEndpoint });
+      logger.info({ wsId, trunkSid, sipEndpoint }, "[outbound] step 3b done: origination URI ensured");
+    } catch (e) {
+      logger.warn({ err: String(e?.message || e) }, "[outbound] step 3b: origination URI failed (best-effort)");
+    }
+  }
+
   // 4) Create or reuse LiveKit outbound trunk.
   let lkTrunkId = workspace.livekitOutboundTrunkId;
   if (!lkTrunkId) {

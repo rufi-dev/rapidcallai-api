@@ -136,8 +136,8 @@ async function configureNumberForSip({ subaccountSid, numberSid, e164, sipEndpoi
 
 /**
  * Ensure a Twilio Elastic SIP Trunk exists on the subaccount.
- * Creates the trunk + termination credentials + associates them if needed.
- * Returns { trunkSid, domainName, credUsername, credPassword }.
+ * Creates the trunk with Secure Trunking (SRTP+TLS) and Call Transfer (SIP REFER) enabled.
+ * Returns { trunkSid, domainName }.
  */
 async function ensureSipTrunk({ subaccountSid, existingTrunkSid, workspaceId }) {
   if (!subaccountSid) throw new Error("Workspace has no Twilio subaccount yet");
@@ -148,6 +148,20 @@ async function ensureSipTrunk({ subaccountSid, existingTrunkSid, workspaceId }) 
   if (existingTrunkSid) {
     try {
       const trunk = await client.trunking.v1.trunks(existingTrunkSid).fetch();
+
+      // Ensure secure trunking + call transfer are enabled on existing trunk.
+      const needsUpdate = !trunk.secure || trunk.transferMode !== "enable-all";
+      if (needsUpdate) {
+        try {
+          await client.trunking.v1.trunks(existingTrunkSid).update({
+            secure: true,
+            transferMode: "enable-all",
+          });
+        } catch {
+          // Best-effort; don't fail the entire flow.
+        }
+      }
+
       return {
         trunkSid: trunk.sid,
         domainName: trunk.domainName || null,
@@ -162,14 +176,57 @@ async function ensureSipTrunk({ subaccountSid, existingTrunkSid, workspaceId }) 
   const domainName = `${slug}.pstn.twilio.com`;
 
   const trunk = await client.trunking.v1.trunks.create({
-    friendlyName: `RapidCall AI outbound (${workspaceId || "default"})`,
+    friendlyName: `RapidCall AI (${workspaceId || "default"})`,
     domainName,
+    // Secure Trunking: SRTP for media + TLS for signaling.
+    secure: true,
+    // Call Transfer: enable SIP REFER so agents can do cold/warm transfers.
+    transferMode: "enable-all",
   });
 
   return {
     trunkSid: trunk.sid,
     domainName: trunk.domainName,
   };
+}
+
+/**
+ * Ensure the Twilio SIP trunk has an Origination URI pointing to the LiveKit SIP endpoint.
+ * This is REQUIRED for inbound calls: PSTN → Twilio → Elastic SIP Trunk → Origination URI → LiveKit.
+ *
+ * Without this, inbound calls to numbers associated with the trunk get no audio because
+ * the trunk has nowhere to forward the call.
+ */
+async function ensureSipTrunkOriginationUri({ subaccountSid, trunkSid, sipEndpoint }) {
+  if (!subaccountSid) throw new Error("Workspace has no Twilio subaccount yet");
+  if (!trunkSid) throw new Error("Trunk SID is required");
+  if (!sipEndpoint) throw new Error("LIVEKIT_SIP_ENDPOINT is required for origination URI");
+
+  const client = await getSubaccountDirectClient(subaccountSid);
+
+  // Build the origination SIP URL. Use TLS transport for secure trunking.
+  const sipUrl = `sip:${sipEndpoint};transport=tls`;
+
+  // Check if an origination URI already exists for this endpoint.
+  const existing = await client.trunking.v1.trunks(trunkSid).originationUrls.list({ limit: 50 });
+  const alreadyExists = existing.some((o) => {
+    const normalized = String(o.sipUrl || "").replace(/;transport=tls$/i, "");
+    return normalized === `sip:${sipEndpoint}` || o.sipUrl === sipUrl;
+  });
+
+  if (alreadyExists) {
+    return { created: false };
+  }
+
+  await client.trunking.v1.trunks(trunkSid).originationUrls.create({
+    friendlyName: "LiveKit SIP",
+    sipUrl,
+    weight: 10,
+    priority: 10,
+    enabled: true,
+  });
+
+  return { created: true };
 }
 
 /**
@@ -234,6 +291,7 @@ module.exports = {
   configureNumberForSip,
   ensureSipTrunk,
   ensureSipTrunkTerminationCreds,
+  ensureSipTrunkOriginationUri,
   associateNumberWithSipTrunk,
 };
 

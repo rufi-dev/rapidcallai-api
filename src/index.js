@@ -1943,6 +1943,23 @@ app.post("/api/workspaces/:id/twilio/buy-number", requireAuth, async (req, res) 
           }
         }
 
+        // 3c2) Ensure Origination URI → LiveKit SIP endpoint exists on the trunk.
+        //      REQUIRED for inbound calls: PSTN → Twilio trunk → Origination URI → LiveKit.
+        try {
+          const origResult = await tw.ensureSipTrunkOriginationUri({
+            subaccountSid: ws.twilioSubaccountSid,
+            trunkSid,
+            sipEndpoint,
+          });
+          if (origResult.created) {
+            logger.info({ trunkSid, sipEndpoint }, "[buy-number] origination URI added to Twilio trunk");
+          }
+        } catch (origErr) {
+          const msg = String(origErr?.message || origErr);
+          logger.warn({ trunkSid, err: msg }, "[buy-number] failed to add origination URI");
+          provisionErrors.push(`Origination URI: ${msg}`);
+        }
+
         // 3d) Create or update the LiveKit outbound trunk for this workspace.
         if (!ws.livekitOutboundTrunkId) {
           const { trunkId: lkTrunkId } = await createOutboundTrunkForWorkspace({
@@ -2225,7 +2242,7 @@ app.delete("/api/phone-numbers/:id", requireAuth, async (req, res) => {
   return res.json({ ok: true });
 });
 
-// --- Reprovision outbound SIP trunk for a phone number (fixes Caller ID 403 errors) ---
+// --- Reprovision SIP trunk for a phone number (fixes Caller ID 403 + inbound no-audio) ---
 app.post("/api/phone-numbers/:id/reprovision-outbound", requireAuth, async (req, res) => {
   if (!USE_DB) return res.status(400).json({ error: "Requires Postgres mode" });
   const phoneNumber = await store.getPhoneNumber(req.params.id);
@@ -2237,9 +2254,10 @@ app.post("/api/phone-numbers/:id/reprovision-outbound", requireAuth, async (req,
     return res.status(400).json({ error: "Workspace has no Twilio subaccount" });
   }
 
+  const sipEndpoint = String(process.env.LIVEKIT_SIP_ENDPOINT || "").trim();
   const provisionErrors = [];
   try {
-    // 1) Ensure Twilio SIP trunk.
+    // 1) Ensure Twilio SIP trunk (with secure trunking + call transfer).
     const { trunkSid, domainName } = await tw.ensureSipTrunk({
       subaccountSid: ws.twilioSubaccountSid,
       existingTrunkSid: ws.twilioSipTrunkSid,
@@ -2264,6 +2282,19 @@ app.post("/api/phone-numbers/:id/reprovision-outbound", requireAuth, async (req,
     } catch (e) {
       if (!String(e?.message || "").includes("already associated")) {
         provisionErrors.push(`Associate number: ${e?.message || e}`);
+      }
+    }
+
+    // 3b) Ensure Origination URI → LiveKit SIP endpoint (required for inbound calls).
+    if (sipEndpoint) {
+      try {
+        await tw.ensureSipTrunkOriginationUri({
+          subaccountSid: ws.twilioSubaccountSid,
+          trunkSid,
+          sipEndpoint,
+        });
+      } catch (e) {
+        provisionErrors.push(`Origination URI: ${e?.message || e}`);
       }
     }
 
