@@ -172,7 +172,11 @@ async function ensureSipTrunkTerminationCreds({ subaccountSid, trunkSid, existin
 
   const username = `rc_${Date.now().toString(36)}`;
   const crypto = require("crypto");
-  const password = crypto.randomBytes(16).toString("hex");
+  // Twilio requires: min 12 chars, at least one uppercase, one lowercase, one number.
+  // crypto.randomBytes hex is only lowercase+digits, so we build a proper password.
+  const raw = crypto.randomBytes(24).toString("base64url").slice(0, 28);
+  // Guarantee at least one of each required character class.
+  const password = "Rc1" + raw;
 
   // Create credential list on the subaccount.
   const credList = await client.sip.credentialLists.create({
