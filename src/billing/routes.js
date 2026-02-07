@@ -340,6 +340,93 @@ function createBillingRouter({ store, stripeBilling }) {
     }
   });
 
+  // Client-side verification: when the user returns from Stripe checkout to ?upgrade=success,
+  // the frontend calls this to verify & complete the upgrade directly — without relying on the
+  // webhook (which may be delayed, misconfigured, or failing silently).
+  r.post("/verify-upgrade", async (req, res) => {
+    if (!store) return res.status(400).json({ error: "Billing requires Postgres mode" });
+    const ws = req.workspace;
+
+    // Already paid? Nothing to do.
+    if (ws.isPaid && ws.hasPaymentMethod) {
+      return res.json({ ok: true, status: "already_paid" });
+    }
+
+    const stripe = stripeBilling.getStripe();
+    if (!stripe) return res.status(400).json({ error: "Stripe not configured" });
+
+    const customerId = ws.stripeCustomerId;
+    if (!customerId) {
+      return res.status(400).json({ error: "No Stripe customer linked to this workspace" });
+    }
+
+    try {
+      // Find the most recent completed checkout session for this customer in setup mode.
+      const sessions = await stripe.checkout.sessions.list({
+        customer: customerId,
+        limit: 5,
+      });
+
+      const completedSession = sessions.data.find(
+        (s) =>
+          s.status === "complete" &&
+          s.mode === "setup" &&
+          String(s.metadata?.workspace_id || "") === ws.id
+      );
+
+      if (!completedSession) {
+        return res.json({ ok: false, status: "no_completed_session" });
+      }
+
+      // Retrieve and verify the SetupIntent.
+      const setupIntentId = String(completedSession.setup_intent || "").trim();
+      if (setupIntentId) {
+        const si = await stripe.setupIntents.retrieve(setupIntentId);
+        if (si.status === "succeeded") {
+          const pm = typeof si.payment_method === "string" ? si.payment_method : si.payment_method?.id;
+          if (pm) {
+            await stripe.customers.update(customerId, {
+              invoice_settings: { default_payment_method: pm },
+            });
+          }
+        }
+      }
+
+      // Mark workspace as paid (same logic as webhook handler).
+      await store.updateWorkspace(ws.id, {
+        stripeCustomerId: customerId,
+        hasPaymentMethod: true,
+        isPaid: true,
+        isTrial: false,
+        telephonyEnabled: true,
+      });
+
+      // Create subscription if needed.
+      const ws2 = await store.getWorkspace(ws.id);
+      if (ws2 && !ws2.stripeSubscriptionId) {
+        try {
+          const phoneNumbers = await store.listPhoneNumbers(ws.id);
+          const sub = await stripeBilling.createSubscriptionForWorkspace({
+            workspaceId: ws.id,
+            customerId,
+            phoneNumbersCount: phoneNumbers.length,
+          });
+          await store.updateWorkspace(ws.id, {
+            stripeSubscriptionId: sub.subscriptionId,
+            stripePhoneNumbersItemId: sub.phoneNumbersItemId,
+          });
+        } catch (subErr) {
+          console.warn("[billing.verify-upgrade] subscription creation failed", subErr?.message || subErr);
+        }
+      }
+
+      return res.json({ ok: true, status: "upgraded" });
+    } catch (e) {
+      console.warn("[billing.verify-upgrade] failed", e?.message || e);
+      return res.status(500).json({ error: e instanceof Error ? e.message : "Verification failed" });
+    }
+  });
+
   r.get("/upcoming-invoice", async (req, res) => {
     if (!store) return res.status(400).json({ error: "Billing requires Postgres mode" });
     const ws = req.workspace;
