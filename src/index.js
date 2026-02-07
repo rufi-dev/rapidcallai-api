@@ -442,6 +442,14 @@ const WelcomeConfigSchema = z
   })
   .optional();
 
+const BackgroundAudioConfigSchema = z
+  .object({
+    preset: z.enum(["none", "office", "keyboard"]).optional(),
+    ambientVolume: z.number().min(0).max(1).optional(),
+    thinkingVolume: z.number().min(0).max(1).optional(),
+  })
+  .optional();
+
 const VoiceConfigSchema = z
   .object({
     provider: z.enum(["elevenlabs", "cartesia"]).optional(),
@@ -1168,7 +1176,7 @@ app.post("/api/internal/telephony/inbound/start", requireAgentSecret, async (req
     agent: { id: agent.id, name: agent.name },
     prompt: promptUsed,
     welcome: agent.welcome ?? {},
-    voice: agent.voice ?? {},
+    voice: { ...(agent.voice ?? {}), backgroundAudio: agent.backgroundAudio ?? {} },
     llmModel: String(agent.llmModel || ""),
     maxCallSeconds: Number(agent.maxCallSeconds || 0),
     knowledgeFolderIds: Array.isArray(agent.knowledgeFolderIds) ? agent.knowledgeFolderIds : [],
@@ -1646,6 +1654,7 @@ app.put("/api/agents/:id", requireAuth, async (req, res) => {
     publish: z.boolean().optional(),
     welcome: WelcomeConfigSchema,
     voice: VoiceConfigSchema,
+    backgroundAudio: BackgroundAudioConfigSchema,
     llmModel: LlmModelSchema,
     autoEvalEnabled: z.boolean().optional(),
     knowledgeFolderIds: KnowledgeFolderIdsSchema,
@@ -1687,6 +1696,7 @@ app.put("/api/agents/:id", requireAuth, async (req, res) => {
     publishedAt: shouldPublish ? Date.now() : (current.publishedAt ?? null),
     welcome: parsed.data.welcome ? { ...(current.welcome ?? {}), ...parsed.data.welcome } : current.welcome,
     voice: parsed.data.voice ? { ...(current.voice ?? {}), ...parsed.data.voice } : current.voice,
+    backgroundAudio: parsed.data.backgroundAudio ? { ...(current.backgroundAudio ?? {}), ...parsed.data.backgroundAudio } : (current.backgroundAudio ?? {}),
     llmModel: parsed.data.llmModel ?? (current.llmModel ?? ""),
     autoEvalEnabled: parsed.data.autoEvalEnabled == null ? (current.autoEvalEnabled ?? false) : Boolean(parsed.data.autoEvalEnabled),
     knowledgeFolderIds: parsed.data.knowledgeFolderIds ?? (current.knowledgeFolderIds ?? []),
@@ -2407,6 +2417,7 @@ app.post("/api/agents/:id/start", requireAuth, async (req, res) => {
     aiDelaySeconds: startParsed?.data?.welcome?.aiDelaySeconds ?? agent.welcome?.aiDelaySeconds ?? 0,
   };
   const voice = agent.voice ?? {};
+  const backgroundAudio = agent.backgroundAudio ?? {};
   const llmModel = String(agent.llmModel || "").trim() || getBillingConfig().defaultLlmModel;
   const maxCallSeconds = Number(agent.maxCallSeconds || 0);
 
@@ -2469,6 +2480,7 @@ app.post("/api/agents/:id/start", requireAuth, async (req, res) => {
         promptBase: basePrompt,
         promptVariant: variantChosen?.prompt ?? null,
         voice,
+        backgroundAudio,
         llmModel,
         maxCallSeconds,
         knowledgeFolderIds: Array.isArray(agent.knowledgeFolderIds) ? agent.knowledgeFolderIds : [],

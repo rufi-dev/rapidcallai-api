@@ -12,6 +12,9 @@ function rowToUser(r) {
 }
 
 function rowToAgent(r) {
+  const voiceRaw = r.voice ?? {};
+  // backgroundAudio is stored inside the voice JSONB column to avoid a DB migration.
+  const { backgroundAudio, ...voiceFields } = voiceRaw;
   return {
     id: r.id,
     workspaceId: r.workspace_id ?? null,
@@ -20,7 +23,8 @@ function rowToAgent(r) {
     promptPublished: r.prompt_published ?? "",
     publishedAt: r.published_at ?? null,
     welcome: r.welcome ?? {},
-    voice: r.voice ?? {},
+    voice: voiceFields,
+    backgroundAudio: backgroundAudio ?? {},
     llmModel: r.llm_model ?? "",
     autoEvalEnabled: Boolean(r.auto_eval_enabled),
     knowledgeFolderIds: Array.isArray(r.knowledge_folder_ids) ? r.knowledge_folder_ids : (r.knowledge_folder_ids ?? []),
@@ -511,6 +515,7 @@ async function createAgent({
     provider: v.provider ?? null,
     model: v.model ?? null,
     voiceId: v.voiceId ?? null,
+    backgroundAudio: {},
   };
 
   const { rows } = await p.query(
@@ -548,7 +553,7 @@ async function getAgent(workspaceId, id) {
 async function updateAgent(
   workspaceId,
   id,
-  { name, promptDraft, publish, welcome, voice, llmModel, autoEvalEnabled, knowledgeFolderIds, maxCallSeconds }
+  { name, promptDraft, publish, welcome, voice, backgroundAudio, llmModel, autoEvalEnabled, knowledgeFolderIds, maxCallSeconds }
 ) {
   const p = getPool();
   const current = await getAgent(workspaceId, id);
@@ -568,10 +573,13 @@ async function updateAgent(
   };
 
   const v = voice ? { ...(current.voice ?? {}), ...voice } : current.voice ?? {};
+  // Merge backgroundAudio into the voice JSONB column to avoid a DB migration.
+  const ba = backgroundAudio ? { ...(current.backgroundAudio ?? {}), ...backgroundAudio } : (current.backgroundAudio ?? {});
   const voiceNorm = {
     provider: v.provider ?? null,
     model: v.model ?? null,
     voiceId: v.voiceId ?? null,
+    backgroundAudio: ba,
   };
 
   const llmTrim = llmModel == null ? null : String(llmModel || "").trim();
