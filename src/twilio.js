@@ -205,7 +205,8 @@ async function ensureSipTrunkTerminationCreds({ subaccountSid, trunkSid, existin
   });
 
   // Associate credential list with the trunk for termination auth.
-  await client.trunking.v1.trunks(trunkSid).credentialLists.create({
+  // NOTE: Twilio SDK v5 renamed this property to "credentialsLists" (plural 's').
+  await client.trunking.v1.trunks(trunkSid).credentialsLists.create({
     credentialListSid: credList.sid,
   });
 
