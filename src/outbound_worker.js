@@ -36,48 +36,60 @@ async function ensureWorkspaceOutboundTrunk(workspace, phoneRow) {
   if (!phoneRow?.twilioNumberSid) return null;
 
   const subSid = workspace.twilioSubaccountSid;
+  const wsId = workspace.id;
 
   // 1) Ensure Twilio SIP trunk on the subaccount.
+  logger.info({ wsId, subSid, existingTrunkSid: workspace.twilioSipTrunkSid }, "[outbound] step 1: ensuring Twilio SIP trunk");
   const { trunkSid, domainName } = await tw.ensureSipTrunk({
     subaccountSid: subSid,
     existingTrunkSid: workspace.twilioSipTrunkSid,
-    workspaceId: workspace.id,
+    workspaceId: wsId,
   });
+  logger.info({ wsId, trunkSid, domainName }, "[outbound] step 1 done: Twilio SIP trunk ready");
 
   // 2) Ensure termination credentials.
+  logger.info({ wsId, trunkSid, hasExistingCreds: Boolean(workspace.twilioSipCredUsername) }, "[outbound] step 2: ensuring SIP credentials");
   const { credUsername, credPassword } = await tw.ensureSipTrunkTerminationCreds({
     subaccountSid: subSid,
     trunkSid,
     existingUsername: workspace.twilioSipCredUsername,
     existingPassword: workspace.twilioSipCredPassword,
   });
+  logger.info({ wsId, trunkSid, credUsername }, "[outbound] step 2 done: SIP credentials ready");
 
   // 3) Associate the phone number with the Twilio trunk (idempotent).
+  logger.info({ wsId, trunkSid, numberSid: phoneRow.twilioNumberSid, e164: phoneRow.e164 }, "[outbound] step 3: associating number with Twilio trunk");
   try {
     await tw.associateNumberWithSipTrunk({
       subaccountSid: subSid,
       trunkSid,
       numberSid: phoneRow.twilioNumberSid,
     });
+    logger.info({ wsId, trunkSid, e164: phoneRow.e164 }, "[outbound] step 3 done: number associated");
   } catch (e) {
     if (!String(e?.message || "").includes("already associated")) {
-      logger.warn({ err: String(e?.message || e) }, "[outbound] associate number failed");
+      logger.warn({ err: String(e?.message || e) }, "[outbound] step 3: associate number failed");
+    } else {
+      logger.info({ wsId, e164: phoneRow.e164 }, "[outbound] step 3: number already associated (ok)");
     }
   }
 
   // 4) Create or reuse LiveKit outbound trunk.
   let lkTrunkId = workspace.livekitOutboundTrunkId;
   if (!lkTrunkId) {
+    logger.info({ wsId, domainName, e164: phoneRow.e164 }, "[outbound] step 4: creating LiveKit outbound trunk");
     const result = await createOutboundTrunkForWorkspace({
-      workspaceId: workspace.id,
+      workspaceId: wsId,
       twilioSipDomainName: domainName,
       credUsername,
       credPassword,
       numbers: [phoneRow.e164],
     });
     lkTrunkId = result.trunkId;
+    logger.info({ wsId, lkTrunkId, domainName }, "[outbound] step 4 done: LiveKit outbound trunk created");
   } else {
     // Ensure the number is on the existing trunk.
+    logger.info({ wsId, lkTrunkId, e164: phoneRow.e164 }, "[outbound] step 4: adding number to existing LiveKit outbound trunk");
     try {
       await addNumberToOutboundTrunk(lkTrunkId, phoneRow.e164);
     } catch {
@@ -86,7 +98,7 @@ async function ensureWorkspaceOutboundTrunk(workspace, phoneRow) {
   }
 
   // 5) Persist everything.
-  await store.updateWorkspace(workspace.id, {
+  await store.updateWorkspace(wsId, {
     twilioSipTrunkSid: trunkSid,
     twilioSipDomainName: domainName,
     twilioSipCredUsername: credUsername,
@@ -101,6 +113,7 @@ async function ensureWorkspaceOutboundTrunk(workspace, phoneRow) {
     });
   }
 
+  logger.info({ wsId, trunkSid, lkTrunkId, domainName, e164: phoneRow.e164 }, "[outbound] all steps done: outbound fully provisioned");
   return lkTrunkId;
 }
 

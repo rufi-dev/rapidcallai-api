@@ -17,7 +17,22 @@ function getSubaccountClient(subaccountSid) {
   const creds = getMasterCreds();
   if (!creds) return null;
   // Twilio helper lib supports acting on a subaccount by setting `accountSid` option.
+  // NOTE: This works for main-API resources (numbers, SIP credential lists, etc.)
+  // but NOT for Elastic SIP Trunking API — use getSubaccountDirectClient() for trunking.
   return twilio(creds.accountSid, creds.authToken, { accountSid: subaccountSid });
+}
+
+/**
+ * Authenticate directly AS the subaccount (using its own Auth Token).
+ * Required for APIs hosted on separate domains (e.g. trunking.twilio.com)
+ * which ignore the `accountSid` constructor option and scope resources
+ * to whichever account the credentials belong to.
+ */
+async function getSubaccountDirectClient(subaccountSid) {
+  const masterClient = getMasterClient();
+  if (!masterClient) throw new Error("Twilio is not configured (missing master credentials)");
+  const subaccount = await masterClient.api.accounts(subaccountSid).fetch();
+  return twilio(subaccountSid, subaccount.authToken);
 }
 
 async function ensureSubaccount({ friendlyName, existingSid }) {
@@ -126,8 +141,8 @@ async function configureNumberForSip({ subaccountSid, numberSid, e164, sipEndpoi
  */
 async function ensureSipTrunk({ subaccountSid, existingTrunkSid, workspaceId }) {
   if (!subaccountSid) throw new Error("Workspace has no Twilio subaccount yet");
-  const client = getSubaccountClient(subaccountSid);
-  if (!client) throw new Error("Twilio is not configured");
+  // MUST use direct subaccount auth — trunking.twilio.com scopes by credentials, not accountSid.
+  const client = await getSubaccountDirectClient(subaccountSid);
 
   // Re-use existing trunk if we have one.
   if (existingTrunkSid) {
@@ -138,7 +153,7 @@ async function ensureSipTrunk({ subaccountSid, existingTrunkSid, workspaceId }) 
         domainName: trunk.domainName || null,
       };
     } catch {
-      // Trunk may have been deleted; fall through to create a new one.
+      // Trunk may have been deleted or was on the wrong account; fall through to create a new one.
     }
   }
 
@@ -167,8 +182,8 @@ async function ensureSipTrunkTerminationCreds({ subaccountSid, trunkSid, existin
     return { credUsername: existingUsername, credPassword: existingPassword };
   }
 
-  const client = getSubaccountClient(subaccountSid);
-  if (!client) throw new Error("Twilio is not configured");
+  // MUST use direct subaccount auth for trunking API (credential list association).
+  const client = await getSubaccountDirectClient(subaccountSid);
 
   const username = `rc_${Date.now().toString(36)}`;
   const crypto = require("crypto");
@@ -201,8 +216,8 @@ async function ensureSipTrunkTerminationCreds({ subaccountSid, trunkSid, existin
  * Associate a phone number with a Twilio SIP trunk (required for outbound Caller ID).
  */
 async function associateNumberWithSipTrunk({ subaccountSid, trunkSid, numberSid }) {
-  const client = getSubaccountClient(subaccountSid);
-  if (!client) throw new Error("Twilio is not configured");
+  // MUST use direct subaccount auth — trunking API is account-scoped by credentials.
+  const client = await getSubaccountDirectClient(subaccountSid);
 
   await client.trunking.v1.trunks(trunkSid).phoneNumbers.create({
     phoneNumberSid: numberSid,
