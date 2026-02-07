@@ -119,6 +119,92 @@ async function configureNumberForSip({ subaccountSid, numberSid, e164, sipEndpoi
   return { voiceUrl };
 }
 
+/**
+ * Ensure a Twilio Elastic SIP Trunk exists on the subaccount.
+ * Creates the trunk + termination credentials + associates them if needed.
+ * Returns { trunkSid, domainName, credUsername, credPassword }.
+ */
+async function ensureSipTrunk({ subaccountSid, existingTrunkSid, workspaceId }) {
+  if (!subaccountSid) throw new Error("Workspace has no Twilio subaccount yet");
+  const client = getSubaccountClient(subaccountSid);
+  if (!client) throw new Error("Twilio is not configured");
+
+  // Re-use existing trunk if we have one.
+  if (existingTrunkSid) {
+    try {
+      const trunk = await client.trunking.v1.trunks(existingTrunkSid).fetch();
+      return {
+        trunkSid: trunk.sid,
+        domainName: trunk.domainName || null,
+      };
+    } catch {
+      // Trunk may have been deleted; fall through to create a new one.
+    }
+  }
+
+  // Generate a unique domain name (must end in .pstn.twilio.com).
+  const slug = `rc-${(workspaceId || "ws").replace(/[^a-z0-9]/gi, "").slice(0, 16)}-${Date.now().toString(36)}`;
+  const domainName = `${slug}.pstn.twilio.com`;
+
+  const trunk = await client.trunking.v1.trunks.create({
+    friendlyName: `RapidCall AI outbound (${workspaceId || "default"})`,
+    domainName,
+  });
+
+  return {
+    trunkSid: trunk.sid,
+    domainName: trunk.domainName,
+  };
+}
+
+/**
+ * Ensure termination credentials exist on the Twilio SIP trunk.
+ * Creates a credential list + credential and associates it with the trunk.
+ * Returns { credUsername, credPassword }.
+ */
+async function ensureSipTrunkTerminationCreds({ subaccountSid, trunkSid, existingUsername, existingPassword }) {
+  if (existingUsername && existingPassword) {
+    return { credUsername: existingUsername, credPassword: existingPassword };
+  }
+
+  const client = getSubaccountClient(subaccountSid);
+  if (!client) throw new Error("Twilio is not configured");
+
+  const username = `rc_${Date.now().toString(36)}`;
+  const crypto = require("crypto");
+  const password = crypto.randomBytes(16).toString("hex");
+
+  // Create credential list on the subaccount.
+  const credList = await client.sip.credentialLists.create({
+    friendlyName: `RapidCall AI SIP creds (${trunkSid})`,
+  });
+
+  // Add credential to the list.
+  await client.sip.credentialLists(credList.sid).credentials.create({
+    username,
+    password,
+  });
+
+  // Associate credential list with the trunk for termination auth.
+  await client.trunking.v1.trunks(trunkSid).credentialLists.create({
+    credentialListSid: credList.sid,
+  });
+
+  return { credUsername: username, credPassword: password };
+}
+
+/**
+ * Associate a phone number with a Twilio SIP trunk (required for outbound Caller ID).
+ */
+async function associateNumberWithSipTrunk({ subaccountSid, trunkSid, numberSid }) {
+  const client = getSubaccountClient(subaccountSid);
+  if (!client) throw new Error("Twilio is not configured");
+
+  await client.trunking.v1.trunks(trunkSid).phoneNumbers.create({
+    phoneNumberSid: numberSid,
+  });
+}
+
 module.exports = {
   getMasterCreds,
   getSubaccountClient,
@@ -126,6 +212,9 @@ module.exports = {
   searchAvailableNumbers,
   buyNumber,
   configureNumberForSip,
+  ensureSipTrunk,
+  ensureSipTrunkTerminationCreds,
+  associateNumberWithSipTrunk,
 };
 
 

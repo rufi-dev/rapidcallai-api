@@ -87,6 +87,11 @@ async function initSchema() {
   await p.query(`ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS has_payment_method BOOLEAN NOT NULL DEFAULT false;`);
   await p.query(`ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS is_paid BOOLEAN NOT NULL DEFAULT false;`);
   await p.query(`ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS telephony_enabled BOOLEAN NOT NULL DEFAULT false;`);
+  await p.query(`ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS twilio_sip_trunk_sid TEXT NULL;`);
+  await p.query(`ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS twilio_sip_domain_name TEXT NULL;`);
+  await p.query(`ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS twilio_sip_cred_username TEXT NULL;`);
+  await p.query(`ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS twilio_sip_cred_password TEXT NULL;`);
+  await p.query(`ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS livekit_outbound_trunk_id TEXT NULL;`);
 
   await p.query(`
     CREATE TABLE IF NOT EXISTS agents (

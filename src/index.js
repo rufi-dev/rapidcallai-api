@@ -39,7 +39,7 @@ const {
 } = require("./storage");
 const { getPool, initSchema } = require("./db");
 const store = require("./store_pg");
-const { roomService, agentDispatchService, createParticipantToken, sipClient, addNumberToInboundTrunk, addNumberToOutboundTrunk, removeNumberFromInboundTrunk, removeNumberFromOutboundTrunk } = require("./livekit");
+const { roomService, agentDispatchService, createParticipantToken, sipClient, addNumberToInboundTrunk, addNumberToOutboundTrunk, removeNumberFromInboundTrunk, removeNumberFromOutboundTrunk, createOutboundTrunkForWorkspace } = require("./livekit");
 const outboundWorker = require("./outbound_worker");
 const { startCallEgress, stopEgress, getEgressInfo } = require("./egress");
 const { getObject, headObject } = require("./s3");
@@ -1906,18 +1906,84 @@ app.post("/api/workspaces/:id/twilio/buy-number", requireAuth, async (req, res) 
         provisionErrors.push("SIP_INBOUND_TRUNK_ID not set — skipped inbound trunk");
       }
 
-      // 3) Add number to LiveKit outbound trunk
-      if (outboundTrunkId) {
+      // 3) Auto-provision Twilio SIP trunk + LiveKit outbound trunk for the workspace.
+      //    This ensures the Caller ID is recognized by Twilio (number belongs to same
+      //    subaccount as the SIP trunk). Falls back to env SIP_OUTBOUND_TRUNK_ID if set.
+      let effectiveOutboundTrunkId = ws.livekitOutboundTrunkId || outboundTrunkId;
+      try {
+        // 3a) Ensure a Twilio Elastic SIP Trunk exists on the subaccount.
+        const { trunkSid, domainName } = await tw.ensureSipTrunk({
+          subaccountSid: ws.twilioSubaccountSid,
+          existingTrunkSid: ws.twilioSipTrunkSid,
+          workspaceId: ws.id,
+        });
+        logger.info({ trunkSid, domainName }, "[buy-number] Twilio SIP trunk ensured");
+
+        // 3b) Ensure termination credentials exist on the trunk.
+        const { credUsername, credPassword } = await tw.ensureSipTrunkTerminationCreds({
+          subaccountSid: ws.twilioSubaccountSid,
+          trunkSid,
+          existingUsername: ws.twilioSipCredUsername,
+          existingPassword: ws.twilioSipCredPassword,
+        });
+        logger.info({ trunkSid }, "[buy-number] Twilio SIP trunk creds ensured");
+
+        // 3c) Associate the purchased phone number with the Twilio SIP trunk.
         try {
-          await addNumberToOutboundTrunk(outboundTrunkId, purchased.phoneNumber);
-          logger.info({ e164: purchased.phoneNumber, trunkId: outboundTrunkId }, "[buy-number] added to outbound trunk");
-        } catch (e) {
-          const msg = String(e?.message || e);
-          logger.warn({ e164: purchased.phoneNumber, err: msg }, "[buy-number] failed to add to outbound trunk");
-          provisionErrors.push(`Outbound trunk: ${msg}`);
+          await tw.associateNumberWithSipTrunk({
+            subaccountSid: ws.twilioSubaccountSid,
+            trunkSid,
+            numberSid: purchased.sid,
+          });
+          logger.info({ e164: purchased.phoneNumber, trunkSid }, "[buy-number] number associated with Twilio SIP trunk");
+        } catch (assocErr) {
+          // May fail if already associated — that's fine.
+          if (!String(assocErr?.message || "").includes("already associated")) {
+            throw assocErr;
+          }
         }
-      } else {
-        provisionErrors.push("SIP_OUTBOUND_TRUNK_ID not set — skipped outbound trunk");
+
+        // 3d) Create or update the LiveKit outbound trunk for this workspace.
+        if (!ws.livekitOutboundTrunkId) {
+          const { trunkId: lkTrunkId } = await createOutboundTrunkForWorkspace({
+            workspaceId: ws.id,
+            twilioSipDomainName: domainName,
+            credUsername,
+            credPassword,
+            numbers: [purchased.phoneNumber],
+          });
+          effectiveOutboundTrunkId = lkTrunkId;
+          logger.info({ lkTrunkId, domainName }, "[buy-number] LiveKit outbound trunk created");
+        } else {
+          // Trunk already exists — just add the number to it.
+          effectiveOutboundTrunkId = ws.livekitOutboundTrunkId;
+          await addNumberToOutboundTrunk(effectiveOutboundTrunkId, purchased.phoneNumber);
+          logger.info({ e164: purchased.phoneNumber, trunkId: effectiveOutboundTrunkId }, "[buy-number] added to existing LiveKit outbound trunk");
+        }
+
+        // 3e) Persist trunk IDs on the workspace.
+        await store.updateWorkspace(ws.id, {
+          twilioSipTrunkSid: trunkSid,
+          twilioSipDomainName: domainName,
+          twilioSipCredUsername: credUsername,
+          twilioSipCredPassword: credPassword,
+          livekitOutboundTrunkId: effectiveOutboundTrunkId,
+        });
+      } catch (e) {
+        const msg = String(e?.message || e);
+        logger.warn({ e164: purchased.phoneNumber, err: msg }, "[buy-number] outbound trunk auto-provision failed");
+        provisionErrors.push(`Outbound trunk: ${msg}`);
+
+        // Fallback: try the env-based trunk ID.
+        if (outboundTrunkId && outboundTrunkId !== effectiveOutboundTrunkId) {
+          try {
+            await addNumberToOutboundTrunk(outboundTrunkId, purchased.phoneNumber);
+            effectiveOutboundTrunkId = outboundTrunkId;
+            logger.info({ e164: purchased.phoneNumber, trunkId: outboundTrunkId }, "[buy-number] added to fallback outbound trunk");
+          } catch (fallbackErr) {
+            logger.warn({ err: String(fallbackErr?.message || fallbackErr) }, "[buy-number] fallback outbound trunk also failed");
+          }
+        }
       }
 
       // 4) Update status to active (or partially configured if errors)
@@ -1925,7 +1991,7 @@ app.post("/api/workspaces/:id/twilio/buy-number", requireAuth, async (req, res) 
       phoneNumber = await store.updatePhoneNumber(phoneNumber.id, {
         status: newStatus,
         livekitInboundTrunkId: inboundTrunkId || null,
-        livekitOutboundTrunkId: outboundTrunkId || null,
+        livekitOutboundTrunkId: effectiveOutboundTrunkId || outboundTrunkId || null,
       });
 
       // Keep Stripe phone-number monthly quantity in sync (best-effort).

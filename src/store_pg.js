@@ -112,6 +112,11 @@ function rowToWorkspace(r) {
     hasPaymentMethod: Boolean(r.has_payment_method),
     isPaid: Boolean(r.is_paid),
     telephonyEnabled: Boolean(r.telephony_enabled),
+    twilioSipTrunkSid: r.twilio_sip_trunk_sid ?? null,
+    twilioSipDomainName: r.twilio_sip_domain_name ?? null,
+    twilioSipCredUsername: r.twilio_sip_cred_username ?? null,
+    twilioSipCredPassword: r.twilio_sip_cred_password ?? null,
+    livekitOutboundTrunkId: r.livekit_outbound_trunk_id ?? null,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   };
@@ -210,6 +215,11 @@ async function updateWorkspace(id, patch) {
         has_payment_method=COALESCE($14,has_payment_method),
         is_paid=COALESCE($15,is_paid),
         telephony_enabled=COALESCE($16,telephony_enabled),
+        twilio_sip_trunk_sid=COALESCE($18,twilio_sip_trunk_sid),
+        twilio_sip_domain_name=COALESCE($19,twilio_sip_domain_name),
+        twilio_sip_cred_username=COALESCE($20,twilio_sip_cred_username),
+        twilio_sip_cred_password=COALESCE($21,twilio_sip_cred_password),
+        livekit_outbound_trunk_id=COALESCE($22,livekit_outbound_trunk_id),
         updated_at=$17
     WHERE id=$1
     RETURNING *
@@ -232,6 +242,11 @@ async function updateWorkspace(id, patch) {
       typeof next.isPaid === "boolean" ? next.isPaid : null,
       typeof next.telephonyEnabled === "boolean" ? next.telephonyEnabled : null,
       next.updatedAt,
+      next.twilioSipTrunkSid ?? null,
+      next.twilioSipDomainName ?? null,
+      next.twilioSipCredUsername ?? null,
+      next.twilioSipCredPassword ?? null,
+      next.livekitOutboundTrunkId ?? null,
     ]
   );
   return rows[0] ? rowToWorkspace(rows[0]) : null;

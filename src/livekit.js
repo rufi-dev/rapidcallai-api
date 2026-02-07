@@ -85,6 +85,25 @@ async function removeNumberFromOutboundTrunk(trunkId, phoneE164) {
   });
 }
 
+/**
+ * Create a new LiveKit SIP outbound trunk pointing to a Twilio SIP trunk.
+ * Uses the subaccount's termination credentials so Caller ID is recognized.
+ */
+async function createOutboundTrunkForWorkspace({ workspaceId, twilioSipDomainName, credUsername, credPassword, numbers }) {
+  const sip = sipClient();
+  const address = `${twilioSipDomainName}`;
+  const trunk = await sip.createSipOutboundTrunk(
+    `RapidCall AI outbound (${workspaceId || "default"})`,
+    address,
+    numbers || [],
+    {
+      authUsername: credUsername,
+      authPassword: credPassword,
+    }
+  );
+  return { trunkId: trunk.sipTrunkId };
+}
+
 module.exports = {
   roomService,
   agentDispatchService,
@@ -94,6 +113,7 @@ module.exports = {
   addNumberToOutboundTrunk,
   removeNumberFromInboundTrunk,
   removeNumberFromOutboundTrunk,
+  createOutboundTrunkForWorkspace,
 };
 
 
