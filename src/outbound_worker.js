@@ -9,7 +9,8 @@ if (require.main === module) {
 const { nanoid } = require("./id");
 const { logger } = require("./logger");
 const store = require("./store_pg");
-const { roomService, agentDispatchService, sipClient } = require("./livekit");
+const { roomService, agentDispatchService, sipClient, addNumberToOutboundTrunk, createOutboundTrunkForWorkspace } = require("./livekit");
+const tw = require("./twilio");
 
 const USE_DB = Boolean(process.env.DATABASE_URL);
 const WORKER_ID = `outbound-worker-${nanoid(6)}`;
@@ -22,6 +23,85 @@ function getMaxTotal() {
 function getPollIntervalMs() {
   const v = Number(process.env.OUTBOUND_POLL_INTERVAL_MS || 2000);
   return Number.isFinite(v) && v > 0 ? Math.min(60_000, Math.max(500, v)) : 2000;
+}
+
+/**
+ * Ensure the workspace has a fully provisioned outbound SIP trunk.
+ * Creates the Twilio SIP trunk, termination credentials, associates the phone number,
+ * and creates a LiveKit outbound trunk — all automatically.
+ * Returns the LiveKit outbound trunk ID, or null if provisioning failed.
+ */
+async function ensureWorkspaceOutboundTrunk(workspace, phoneRow) {
+  if (!workspace.twilioSubaccountSid) return null;
+  if (!phoneRow?.twilioNumberSid) return null;
+
+  const subSid = workspace.twilioSubaccountSid;
+
+  // 1) Ensure Twilio SIP trunk on the subaccount.
+  const { trunkSid, domainName } = await tw.ensureSipTrunk({
+    subaccountSid: subSid,
+    existingTrunkSid: workspace.twilioSipTrunkSid,
+    workspaceId: workspace.id,
+  });
+
+  // 2) Ensure termination credentials.
+  const { credUsername, credPassword } = await tw.ensureSipTrunkTerminationCreds({
+    subaccountSid: subSid,
+    trunkSid,
+    existingUsername: workspace.twilioSipCredUsername,
+    existingPassword: workspace.twilioSipCredPassword,
+  });
+
+  // 3) Associate the phone number with the Twilio trunk (idempotent).
+  try {
+    await tw.associateNumberWithSipTrunk({
+      subaccountSid: subSid,
+      trunkSid,
+      numberSid: phoneRow.twilioNumberSid,
+    });
+  } catch (e) {
+    if (!String(e?.message || "").includes("already associated")) {
+      logger.warn({ err: String(e?.message || e) }, "[outbound] associate number failed");
+    }
+  }
+
+  // 4) Create or reuse LiveKit outbound trunk.
+  let lkTrunkId = workspace.livekitOutboundTrunkId;
+  if (!lkTrunkId) {
+    const result = await createOutboundTrunkForWorkspace({
+      workspaceId: workspace.id,
+      twilioSipDomainName: domainName,
+      credUsername,
+      credPassword,
+      numbers: [phoneRow.e164],
+    });
+    lkTrunkId = result.trunkId;
+  } else {
+    // Ensure the number is on the existing trunk.
+    try {
+      await addNumberToOutboundTrunk(lkTrunkId, phoneRow.e164);
+    } catch {
+      // May already be there.
+    }
+  }
+
+  // 5) Persist everything.
+  await store.updateWorkspace(workspace.id, {
+    twilioSipTrunkSid: trunkSid,
+    twilioSipDomainName: domainName,
+    twilioSipCredUsername: credUsername,
+    twilioSipCredPassword: credPassword,
+    livekitOutboundTrunkId: lkTrunkId,
+  });
+
+  // Update the phone number record too.
+  if (phoneRow.id) {
+    await store.updatePhoneNumber(phoneRow.id, {
+      livekitOutboundTrunkId: lkTrunkId,
+    });
+  }
+
+  return lkTrunkId;
 }
 
 function getOutboundTrunkId(phoneRow) {
@@ -148,7 +228,21 @@ async function handleJob(workspace, job) {
     return;
   }
 
-  const trunkId = getOutboundTrunkId(phoneRow);
+  // Auto-provision: if workspace doesn't have a dedicated outbound trunk yet, create one now.
+  // This repairs existing numbers that were bought before the auto-provisioning was added.
+  let trunkId = getOutboundTrunkId(phoneRow);
+  if (!trunkId || !workspace.livekitOutboundTrunkId) {
+    try {
+      const repaired = await ensureWorkspaceOutboundTrunk(workspace, phoneRow);
+      if (repaired) {
+        trunkId = repaired;
+        logger.info({ workspaceId, trunkId }, "[outbound] auto-provisioned outbound trunk");
+      }
+    } catch (e) {
+      logger.warn({ workspaceId, err: String(e?.message || e) }, "[outbound] auto-provision failed");
+    }
+  }
+
   if (!trunkId) {
     await store.updateOutboundJob(workspaceId, job.id, { status: "failed", lastError: "No SIP outbound trunk ID configured" });
     await store.addOutboundJobLog(workspaceId, job.id, { level: "error", message: "No SIP outbound trunk ID. Set it on the phone number or SIP_OUTBOUND_TRUNK_ID env." });

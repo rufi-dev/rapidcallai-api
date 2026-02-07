@@ -2225,6 +2225,90 @@ app.delete("/api/phone-numbers/:id", requireAuth, async (req, res) => {
   return res.json({ ok: true });
 });
 
+// --- Reprovision outbound SIP trunk for a phone number (fixes Caller ID 403 errors) ---
+app.post("/api/phone-numbers/:id/reprovision-outbound", requireAuth, async (req, res) => {
+  if (!USE_DB) return res.status(400).json({ error: "Requires Postgres mode" });
+  const phoneNumber = await store.getPhoneNumber(req.params.id);
+  if (!phoneNumber || phoneNumber.workspaceId !== req.workspace.id) {
+    return res.status(404).json({ error: "Phone number not found" });
+  }
+  const ws = req.workspace;
+  if (!ws.twilioSubaccountSid) {
+    return res.status(400).json({ error: "Workspace has no Twilio subaccount" });
+  }
+
+  const provisionErrors = [];
+  try {
+    // 1) Ensure Twilio SIP trunk.
+    const { trunkSid, domainName } = await tw.ensureSipTrunk({
+      subaccountSid: ws.twilioSubaccountSid,
+      existingTrunkSid: ws.twilioSipTrunkSid,
+      workspaceId: ws.id,
+    });
+
+    // 2) Ensure termination credentials.
+    const { credUsername, credPassword } = await tw.ensureSipTrunkTerminationCreds({
+      subaccountSid: ws.twilioSubaccountSid,
+      trunkSid,
+      existingUsername: ws.twilioSipCredUsername,
+      existingPassword: ws.twilioSipCredPassword,
+    });
+
+    // 3) Associate the phone number with the Twilio trunk.
+    try {
+      await tw.associateNumberWithSipTrunk({
+        subaccountSid: ws.twilioSubaccountSid,
+        trunkSid,
+        numberSid: phoneNumber.twilioNumberSid,
+      });
+    } catch (e) {
+      if (!String(e?.message || "").includes("already associated")) {
+        provisionErrors.push(`Associate number: ${e?.message || e}`);
+      }
+    }
+
+    // 4) Create or reuse LiveKit outbound trunk.
+    let lkTrunkId = ws.livekitOutboundTrunkId;
+    if (!lkTrunkId) {
+      const result = await createOutboundTrunkForWorkspace({
+        workspaceId: ws.id,
+        twilioSipDomainName: domainName,
+        credUsername,
+        credPassword,
+        numbers: [phoneNumber.e164],
+      });
+      lkTrunkId = result.trunkId;
+    } else {
+      try {
+        await addNumberToOutboundTrunk(lkTrunkId, phoneNumber.e164);
+      } catch { /* may already be there */ }
+    }
+
+    // 5) Persist.
+    await store.updateWorkspace(ws.id, {
+      twilioSipTrunkSid: trunkSid,
+      twilioSipDomainName: domainName,
+      twilioSipCredUsername: credUsername,
+      twilioSipCredPassword: credPassword,
+      livekitOutboundTrunkId: lkTrunkId,
+    });
+    await store.updatePhoneNumber(phoneNumber.id, {
+      livekitOutboundTrunkId: lkTrunkId,
+    });
+
+    return res.json({
+      ok: true,
+      trunkId: lkTrunkId,
+      twilioTrunkSid: trunkSid,
+      domainName,
+      errors: provisionErrors.length ? provisionErrors : undefined,
+    });
+  } catch (e) {
+    logger.warn({ err: String(e?.message || e) }, "[reprovision-outbound] failed");
+    return res.status(500).json({ error: e instanceof Error ? e.message : "Reprovisioning failed" });
+  }
+});
+
 // --- Outbound Jobs (MVP) ---
 app.post("/api/outbound/jobs", requireAuth, async (req, res) => {
   if (!USE_DB) return res.status(400).json({ error: "Outbound jobs require Postgres mode" });
