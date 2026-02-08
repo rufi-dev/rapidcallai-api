@@ -2667,21 +2667,80 @@ app.post("/api/phone-numbers/:id/reprovision-outbound", requireAuth, async (req,
       } catch { /* may already be there */ }
     }
 
-    // 5) Persist.
-    await store.updateWorkspace(ws.id, {
+    // 5) Ensure LiveKit inbound trunk exists (needed for receiving inbound calls)
+    const inboundTrunkId = process.env.SIP_INBOUND_TRUNK_ID || null;
+    let effectiveInboundTrunkId = inboundTrunkId || ws.livekitInboundTrunkId;
+    if (!effectiveInboundTrunkId) {
+      try {
+        console.log(`[reprovision-outbound] Auto-creating LiveKit inbound trunk for workspace ${ws.id}`);
+        const inboundResult = await createInboundTrunkForWorkspace({
+          workspaceId: ws.id,
+          numbers: [phoneNumber.e164],
+        });
+        effectiveInboundTrunkId = inboundResult.trunkId;
+        console.log(`[reprovision-outbound] ✓ Created inbound trunk ${effectiveInboundTrunkId}`);
+      } catch (e) {
+        console.warn(`[reprovision-outbound] Failed to create inbound trunk: ${e?.message || e}`);
+        provisionErrors.push(`Inbound trunk creation: ${e?.message || e}`);
+      }
+    } else {
+      // Ensure the phone number is registered on the existing inbound trunk
+      try {
+        await addNumberToInboundTrunk(effectiveInboundTrunkId, phoneNumber.e164);
+        console.log(`[reprovision-outbound] ✓ Added ${phoneNumber.e164} to inbound trunk ${effectiveInboundTrunkId}`);
+      } catch (e) {
+        // May already be there, or trunk may not exist
+        const msg = String(e?.message || e);
+        if (!msg.includes("already") && !msg.includes("duplicate")) {
+          console.warn(`[reprovision-outbound] Failed to add number to inbound trunk: ${msg}`);
+          provisionErrors.push(`Inbound trunk: ${msg}`);
+        }
+      }
+    }
+
+    // 6) Configure Twilio voice URL for inbound calls (TwiML webhook)
+    if (sipEndpoint && phoneNumber.twilioNumberSid) {
+      try {
+        await tw.configureNumberForSip({
+          subaccountSid: ws.twilioSubaccountSid,
+          numberSid: phoneNumber.twilioNumberSid,
+          e164: phoneNumber.e164,
+          sipEndpoint,
+        });
+        console.log(`[reprovision-outbound] ✓ Configured Twilio voice URL for ${phoneNumber.e164}`);
+      } catch (e) {
+        console.warn(`[reprovision-outbound] Failed to configure voice URL: ${e?.message || e}`);
+        provisionErrors.push(`Voice URL: ${e?.message || e}`);
+      }
+    }
+
+    // 7) Persist.
+    const updateData = {
       twilioSipTrunkSid: trunkSid,
       twilioSipDomainName: domainName,
       twilioSipCredUsername: credUsername,
       twilioSipCredPassword: credPassword,
       livekitOutboundTrunkId: lkTrunkId,
-    });
+    };
+    if (effectiveInboundTrunkId) {
+      updateData.livekitInboundTrunkId = effectiveInboundTrunkId;
+    }
+    await store.updateWorkspace(ws.id, updateData);
+
+    // Update phone number status: "active" if no errors, keep "partial" if some steps failed
+    const newStatus = provisionErrors.length === 0 ? "active" : "partial";
     await store.updatePhoneNumber(phoneNumber.id, {
       livekitOutboundTrunkId: lkTrunkId,
+      livekitInboundTrunkId: effectiveInboundTrunkId || undefined,
+      status: newStatus,
     });
+    console.log(`[reprovision-outbound] ✓ Phone number ${phoneNumber.e164} status → ${newStatus}`);
 
     return res.json({
       ok: true,
+      status: newStatus,
       trunkId: lkTrunkId,
+      inboundTrunkId: effectiveInboundTrunkId || null,
       twilioTrunkSid: trunkSid,
       domainName,
       errors: provisionErrors.length ? provisionErrors : undefined,
