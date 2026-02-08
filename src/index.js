@@ -1975,8 +1975,26 @@ app.post("/api/workspaces/:id/twilio/buy-number", requireAuth, async (req, res) 
           logger.info({ e164: purchased.phoneNumber, trunkId: effectiveInboundTrunkId }, "[buy-number] added to inbound trunk");
         } catch (e) {
           const msg = String(e?.message || e);
-          logger.warn({ e164: purchased.phoneNumber, err: msg }, "[buy-number] failed to add to inbound trunk");
-          provisionErrors.push(`Inbound trunk: ${msg}`);
+          if (isTrunkNotFoundError(e) || e?.code === "TRUNK_NOT_FOUND") {
+            // Inbound trunk no longer exists — create a new one
+            logger.warn({ workspaceId: ws.id, e164: purchased.phoneNumber, oldTrunkId: effectiveInboundTrunkId }, "[buy-number] inbound trunk not found in LiveKit, creating new one");
+            try {
+              const inboundResult = await createInboundTrunkForWorkspace({
+                workspaceId: ws.id,
+                numbers: [purchased.phoneNumber],
+              });
+              effectiveInboundTrunkId = inboundResult.trunkId;
+              await store.updateWorkspace(ws.id, { livekitInboundTrunkId: effectiveInboundTrunkId });
+              logger.info({ workspaceId: ws.id, trunkId: effectiveInboundTrunkId, e164: purchased.phoneNumber }, "[buy-number] created new inbound trunk");
+            } catch (createErr) {
+              const createMsg = String(createErr?.message || createErr);
+              logger.warn({ workspaceId: ws.id, e164: purchased.phoneNumber, err: createMsg }, "[buy-number] failed to create inbound trunk");
+              provisionErrors.push(`Inbound trunk creation: ${createMsg}`);
+            }
+          } else {
+            logger.warn({ e164: purchased.phoneNumber, err: msg }, "[buy-number] failed to add to inbound trunk");
+            provisionErrors.push(`Inbound trunk: ${msg}`);
+          }
         }
       }
 
@@ -2689,9 +2707,25 @@ app.post("/api/phone-numbers/:id/reprovision-outbound", requireAuth, async (req,
         await addNumberToInboundTrunk(effectiveInboundTrunkId, phoneNumber.e164);
         console.log(`[reprovision-outbound] ✓ Added ${phoneNumber.e164} to inbound trunk ${effectiveInboundTrunkId}`);
       } catch (e) {
-        // May already be there, or trunk may not exist
         const msg = String(e?.message || e);
-        if (!msg.includes("already") && !msg.includes("duplicate")) {
+        if (msg.includes("already") || msg.includes("duplicate")) {
+          // Number already on trunk — ok
+        } else if (isTrunkNotFoundError(e) || e?.code === "TRUNK_NOT_FOUND") {
+          // Inbound trunk no longer exists in LiveKit — create a new one
+          console.warn(`[reprovision-outbound] Inbound trunk ${effectiveInboundTrunkId} not found in LiveKit, creating new one`);
+          effectiveInboundTrunkId = null;
+          try {
+            const inboundResult = await createInboundTrunkForWorkspace({
+              workspaceId: ws.id,
+              numbers: [phoneNumber.e164],
+            });
+            effectiveInboundTrunkId = inboundResult.trunkId;
+            console.log(`[reprovision-outbound] ✓ Created new inbound trunk ${effectiveInboundTrunkId}`);
+          } catch (createErr) {
+            console.warn(`[reprovision-outbound] Failed to create inbound trunk: ${createErr?.message || createErr}`);
+            provisionErrors.push(`Inbound trunk creation: ${createErr?.message || createErr}`);
+          }
+        } else {
           console.warn(`[reprovision-outbound] Failed to add number to inbound trunk: ${msg}`);
           provisionErrors.push(`Inbound trunk: ${msg}`);
         }
