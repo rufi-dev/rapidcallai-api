@@ -174,10 +174,23 @@ async function getIpAddressesFromRecentCalls({ trunkSid, subaccountSid, limit = 
 }
 
 async function ensureSubaccount({ friendlyName, existingSid }) {
-  if (existingSid) return { sid: existingSid, created: false };
   const client = getMasterClient();
   if (!client) throw new Error("Twilio is not configured (missing TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN)");
+
+  // If we have an existing subaccount, verify it's accessible from the current master account.
+  // This handles the case where the user changed TWILIO_ACCOUNT_SID to a new master account.
+  if (existingSid) {
+    try {
+      await client.api.accounts(existingSid).fetch();
+      return { sid: existingSid, created: false };
+    } catch (e) {
+      console.warn(`[ensureSubaccount] Existing subaccount ${existingSid} is not accessible from current master account (${e?.message || e}). Will create a new one — old trunk/credential references will be stale.`);
+      // Fall through to create a new subaccount under the current master
+    }
+  }
+
   const acct = await client.api.accounts.create({ friendlyName: friendlyName || "rapidcallai workspace" });
+  console.log(`[ensureSubaccount] Created new subaccount ${acct.sid} under master ${getMasterCreds()?.accountSid}`);
   return { sid: acct.sid, created: true };
 }
 

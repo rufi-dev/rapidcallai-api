@@ -1791,6 +1791,21 @@ app.post("/api/workspaces/:id/twilio/subaccount", requireAuth, async (req, res) 
     });
 
     if (USE_DB) {
+      // If a NEW subaccount was created (old one was from a different master), clear stale Twilio data
+      if (created && ws.twilioSubaccountSid) {
+        console.log(`[ensure-subaccount] Twilio master account changed — old subaccount ${ws.twilioSubaccountSid} replaced with ${sid}. Clearing stale trunk/credential references.`);
+        const p = getPool();
+        await p.query(`
+          UPDATE workspaces SET
+            twilio_sip_trunk_sid = NULL,
+            twilio_sip_domain_name = NULL,
+            twilio_sip_cred_username = NULL,
+            twilio_sip_cred_password = NULL,
+            livekit_outbound_trunk_id = NULL,
+            livekit_inbound_trunk_id = NULL
+          WHERE id = $1
+        `, [id]);
+      }
       const updated = await store.updateWorkspace(id, { twilioSubaccountSid: sid });
       return res.json({ workspace: updated, created });
     }
@@ -1850,11 +1865,33 @@ app.post("/api/workspaces/:id/twilio/buy-number", requireAuth, async (req, res) 
 
   try {
     // Ensure we have a subaccount first.
-    const { sid: subSid } = await tw.ensureSubaccount({
+    const { sid: subSid, created: subCreated } = await tw.ensureSubaccount({
       friendlyName: `rapidcallai:${ws.name || ws.id}`,
       existingSid: ws.twilioSubaccountSid ?? null,
     });
-    if (!ws.twilioSubaccountSid) {
+    // If subaccount changed (old one was from a different master), clear stale data
+    if (subCreated && ws.twilioSubaccountSid && USE_DB) {
+      console.log(`[buy-number] Twilio master account changed — clearing stale trunk/credential references for workspace ${ws.id}`);
+      const p = getPool();
+      await p.query(`
+        UPDATE workspaces SET
+          twilio_subaccount_sid = $2,
+          twilio_sip_trunk_sid = NULL,
+          twilio_sip_domain_name = NULL,
+          twilio_sip_cred_username = NULL,
+          twilio_sip_cred_password = NULL,
+          livekit_outbound_trunk_id = NULL,
+          livekit_inbound_trunk_id = NULL
+        WHERE id = $1
+      `, [id, subSid]);
+      ws.twilioSubaccountSid = subSid;
+      ws.twilioSipTrunkSid = null;
+      ws.twilioSipDomainName = null;
+      ws.twilioSipCredUsername = null;
+      ws.twilioSipCredPassword = null;
+      ws.livekitOutboundTrunkId = null;
+      ws.livekitInboundTrunkId = null;
+    } else if (!ws.twilioSubaccountSid) {
       if (USE_DB) await store.updateWorkspace(id, { twilioSubaccountSid: subSid });
       else {
         const rows = readWorkspaces();
@@ -2362,6 +2399,42 @@ app.delete("/api/phone-numbers/:id", requireAuth, async (req, res) => {
   const rows = readPhoneNumbers().filter((p) => p.id !== id);
   writePhoneNumbers(rows);
   return res.json({ ok: true });
+});
+
+// --- Reset workspace Twilio data (needed when switching Twilio accounts) ---
+app.post("/api/workspaces/:id/reset-twilio", requireAuth, async (req, res) => {
+  if (!USE_DB) return res.status(400).json({ error: "Requires Postgres mode" });
+  const ws = req.workspace;
+  if (!ws || ws.id !== req.params.id) {
+    return res.status(404).json({ error: "Workspace not found" });
+  }
+  try {
+    const p = getPool();
+    await p.query(`
+      UPDATE workspaces SET
+        twilio_subaccount_sid = NULL,
+        twilio_sip_trunk_sid = NULL,
+        twilio_sip_domain_name = NULL,
+        twilio_sip_cred_username = NULL,
+        twilio_sip_cred_password = NULL,
+        livekit_outbound_trunk_id = NULL,
+        livekit_inbound_trunk_id = NULL,
+        updated_at = $2
+      WHERE id = $1
+    `, [ws.id, Date.now()]);
+    // Also clear the phone numbers' trunk references
+    await p.query(`
+      UPDATE phone_numbers SET
+        livekit_outbound_trunk_id = NULL,
+        livekit_inbound_trunk_id = NULL
+      WHERE workspace_id = $1
+    `, [ws.id]);
+    console.log(`[reset-twilio] ✓ Cleared all Twilio/LiveKit references for workspace ${ws.id}`);
+    return res.json({ ok: true, message: "Twilio data cleared. Reprovision your phone numbers to set up the new account." });
+  } catch (e) {
+    console.error(`[reset-twilio] Failed: ${e?.message || e}`);
+    return res.status(500).json({ error: e?.message || "Failed to reset Twilio data" });
+  }
 });
 
 // --- Reprovision SIP trunk for a phone number (fixes Caller ID 403 + inbound no-audio) ---
