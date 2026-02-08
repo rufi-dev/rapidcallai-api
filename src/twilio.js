@@ -601,6 +601,68 @@ async function twilioTrunkingRequest({ subaccountSid, method, path, data }) {
   return responseData;
 }
 
+/**
+ * Make a REST API request to Twilio SIP API (for IP ACL creation/management)
+ * IP ACLs are created via SIP API, then associated with trunks via Trunking API
+ */
+async function twilioSipRequest({ subaccountSid, method, path, data }) {
+  // Get the subaccount's auth token
+  const masterCreds = getMasterCreds();
+  if (!masterCreds) throw new Error("Twilio master credentials not configured");
+  
+  const masterClient = twilio(masterCreds.accountSid, masterCreds.authToken);
+  const subaccount = await masterClient.api.accounts(subaccountSid).fetch();
+  if (!subaccount || !subaccount.authToken) {
+    throw new Error(`Subaccount ${subaccountSid} auth token not available`);
+  }
+  
+  const authToken = subaccount.authToken;
+  const accountSid = subaccountSid;
+  
+  const baseUrl = `https://api.twilio.com/2010-04-01/Accounts/${accountSid}`;
+  const url = `${baseUrl}${path}`;
+  
+  const auth = Buffer.from(`${accountSid}:${authToken}`).toString("base64");
+  const headers = {
+    "Authorization": `Basic ${auth}`,
+    "Content-Type": "application/x-www-form-urlencoded",
+  };
+  
+  let body = null;
+  if (data && (method === "POST" || method === "PUT")) {
+    body = new URLSearchParams();
+    for (const [key, value] of Object.entries(data)) {
+      if (value !== undefined && value !== null) {
+        body.append(key, String(value));
+      }
+    }
+    body = body.toString();
+  }
+  
+  const response = await fetch(url, {
+    method,
+    headers,
+    body,
+  });
+  
+  const responseText = await response.text();
+  let responseData;
+  try {
+    responseData = JSON.parse(responseText);
+  } catch {
+    responseData = { message: responseText };
+  }
+  
+  if (!response.ok) {
+    const error = new Error(responseData.message || `HTTP ${response.status}`);
+    error.status = response.status;
+    error.code = responseData.code;
+    throw error;
+  }
+  
+  return responseData;
+}
+
 async function ensureSipTrunkIpAcl({ subaccountSid, trunkSid, ipAddresses }) {
   if (!subaccountSid) throw new Error("Workspace has no Twilio subaccount yet");
   if (!trunkSid) throw new Error("Trunk SID is required");
@@ -653,14 +715,15 @@ async function ensureSipTrunkIpAcl({ subaccountSid, trunkSid, ipAddresses }) {
   }
 
   // If no ACL is associated, try to find or create one
+  // NOTE: IP ACLs are created via SIP API, not Trunking API
   if (!ipAclList) {
     try {
-      // Try to find an existing ACL by name on the account
+      // Try to find an existing ACL by name on the account using SIP API
       console.log(`[ensureSipTrunkIpAcl] Listing all ACLs on account to find or create one`);
-      const allAclsResponse = await twilioTrunkingRequest({
+      const allAclsResponse = await twilioSipRequest({
         subaccountSid,
         method: "GET",
-        path: "/IpAccessControlLists",
+        path: "/SIP/IpAccessControlLists.json",
       });
       
       const allAcls = allAclsResponse.ip_access_control_lists || [];
@@ -669,12 +732,12 @@ async function ensureSipTrunkIpAcl({ subaccountSid, trunkSid, ipAddresses }) {
       ipAclList = allAcls.find((acl) => acl.friendly_name === aclFriendlyName);
       
       if (!ipAclList) {
-        // Create a new IP ACL resource on the account
+        // Create a new IP ACL resource on the account using SIP API
         console.log(`[ensureSipTrunkIpAcl] Creating new IP ACL with name: ${aclFriendlyName}`);
-        const createResponse = await twilioTrunkingRequest({
+        const createResponse = await twilioSipRequest({
           subaccountSid,
           method: "POST",
-          path: "/IpAccessControlLists",
+          path: "/SIP/IpAccessControlLists.json",
           data: {
             FriendlyName: aclFriendlyName,
           },
@@ -695,7 +758,7 @@ async function ensureSipTrunkIpAcl({ subaccountSid, trunkSid, ipAddresses }) {
         throw new Error(`Twilio API authorization failed for IP ACL operations. Check your subaccount credentials. Error: ${errorMsg}`);
       }
       if (status === "404") {
-        throw new Error(`IP ACL API endpoint not found (404). Your Twilio account may not have Elastic SIP Trunking API access enabled. Please contact Twilio support to enable it. Error: ${errorMsg}`);
+        throw new Error(`IP ACL API endpoint not found (404). Your Twilio account may not have SIP API access enabled. Please contact Twilio support. Error: ${errorMsg}`);
       }
       
       throw new Error(`Failed to create or find IP ACL: ${errorMsg} (status: ${status}, code: ${code})`);
@@ -726,14 +789,14 @@ async function ensureSipTrunkIpAcl({ subaccountSid, trunkSid, ipAddresses }) {
   }
 
   // Add IP addresses or CIDR ranges to the ACL
-  // Fetch existing IPs to avoid duplicates
+  // Fetch existing IPs to avoid duplicates (using SIP API)
   let existingIps = [];
   try {
     console.log(`[ensureSipTrunkIpAcl] Fetching existing IPs from ACL ${ipAclList.sid}`);
-    const ipsResponse = await twilioTrunkingRequest({
+    const ipsResponse = await twilioSipRequest({
       subaccountSid,
       method: "GET",
-      path: `/IpAccessControlLists/${ipAclList.sid}/IpAddresses`,
+      path: `/SIP/IpAccessControlLists/${ipAclList.sid}/IpAddresses.json`,
     });
     existingIps = ipsResponse.ip_addresses || [];
     console.log(`[ensureSipTrunkIpAcl] Found ${existingIps.length} existing IPs in ACL`);
@@ -821,15 +884,15 @@ async function ensureSipTrunkIpAcl({ subaccountSid, trunkSid, ipAddresses }) {
       continue;
     }
 
-    // Attempt to add the IP/CIDR using REST API
+    // Attempt to add the IP/CIDR using SIP API
     try {
-      // Twilio API accepts CIDR notation directly in IpAddress field
+      // Twilio SIP API accepts CIDR notation directly in IpAddress field
       // Format: "x.x.x.x/prefix" or "x.x.x.x" for single IP
       console.log(`[ensureSipTrunkIpAcl] Adding ${isCidr ? 'CIDR range' : 'IP'} ${trimmed} to ACL ${ipAclList.sid}`);
-      await twilioTrunkingRequest({
+      await twilioSipRequest({
         subaccountSid,
         method: "POST",
-        path: `/IpAccessControlLists/${ipAclList.sid}/IpAddresses`,
+        path: `/SIP/IpAccessControlLists/${ipAclList.sid}/IpAddresses.json`,
         data: {
           FriendlyName: `LiveKit SIP ${trimmed}`,
           IpAddress: trimmed, // Twilio accepts CIDR notation directly
@@ -867,13 +930,13 @@ async function ensureSipTrunkIpAcl({ subaccountSid, trunkSid, ipAddresses }) {
     console.warn(`[ensureSipTrunkIpAcl] Failed IPs:`, failedIps);
   }
 
-  // Fetch final count
+  // Fetch final count (using SIP API)
   let finalIps = [];
   try {
-    const finalResponse = await twilioTrunkingRequest({
+    const finalResponse = await twilioSipRequest({
       subaccountSid,
       method: "GET",
-      path: `/IpAccessControlLists/${ipAclList.sid}/IpAddresses`,
+      path: `/SIP/IpAccessControlLists/${ipAclList.sid}/IpAddresses.json`,
     });
     finalIps = finalResponse.ip_addresses || [];
   } catch (e) {
