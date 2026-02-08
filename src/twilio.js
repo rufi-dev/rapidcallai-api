@@ -458,69 +458,64 @@ async function ensureSipTrunkTerminationCreds({ subaccountSid, trunkSid, existin
     throw new Error(`Failed to verify trunk exists: ${errorMsg}`);
   }
 
-  // If we have existing credentials, verify they're associated with the trunk
-  if (existingUsername && existingPassword) {
-    console.log(`[ensureSipTrunkTerminationCreds] Found existing credentials for trunk ${trunkSid}, verifying association...`);
+  // ALWAYS check if a credential list is associated with the trunk
+  // This is the #1 cause of SIP 500 errors — credentials exist but aren't associated
+  try {
+    const associatedCredLists = await client.trunking.v1.trunks(trunkSid).credentialsLists.list();
+    console.log(`[ensureSipTrunkTerminationCreds] Found ${associatedCredLists.length} credential list(s) associated with trunk ${trunkSid}`);
     
-    // Check if any credential list is associated with this trunk
-    try {
-      const associatedCredLists = await client.trunking.v1.trunks(trunkSid).credentialsLists.list();
-      console.log(`[ensureSipTrunkTerminationCreds] Found ${associatedCredLists.length} credential list(s) associated with trunk ${trunkSid}`);
+    if (associatedCredLists.length > 0 && existingUsername && existingPassword) {
+      // At least one credential list is associated and we have existing credentials
+      console.log(`[ensureSipTrunkTerminationCreds] ✓ Credential list(s) already associated with trunk ${trunkSid}, using existing credentials`);
+      return { credUsername: existingUsername, credPassword: existingPassword };
+    }
+    
+    // No credential list associated with this trunk — MUST fix this
+    if (associatedCredLists.length === 0) {
+      console.log(`[ensureSipTrunkTerminationCreds] ⚠ No credential list associated with trunk ${trunkSid} — this causes SIP 500 errors!`);
       
-      if (associatedCredLists.length > 0) {
-        // At least one credential list is associated - credentials should work
-        console.log(`[ensureSipTrunkTerminationCreds] ✓ Credential list(s) already associated with trunk ${trunkSid}`);
-        return { credUsername: existingUsername, credPassword: existingPassword };
-      } else {
-        // No credential list associated - we need to find or create one with these credentials
-        console.log(`[ensureSipTrunkTerminationCreds] No credential list associated with trunk ${trunkSid}, searching for existing credential list...`);
-        
-        // List all credential lists on the account
+      if (existingUsername) {
+        // Try to find and re-associate the existing credential list
+        console.log(`[ensureSipTrunkTerminationCreds] Searching for credential list containing username ${existingUsername}...`);
         const allCredLists = await client.sip.credentialLists.list();
         let foundCredList = null;
         
-        // Search for a credential list that contains the username
         for (const credList of allCredLists) {
           try {
             const creds = await client.sip.credentialLists(credList.sid).credentials.list();
-            const matchingCred = creds.find(c => c.username === existingUsername);
-            if (matchingCred) {
+            if (creds.find(c => c.username === existingUsername)) {
               foundCredList = credList;
               console.log(`[ensureSipTrunkTerminationCreds] ✓ Found credential list ${credList.sid} containing username ${existingUsername}`);
               break;
             }
           } catch (e) {
-            // Skip this credential list if we can't read it
             continue;
           }
         }
         
         if (foundCredList) {
-          // Associate the existing credential list with the trunk
-          console.log(`[ensureSipTrunkTerminationCreds] Associating existing credential list ${foundCredList.sid} with trunk ${trunkSid}`);
           try {
             await client.trunking.v1.trunks(trunkSid).credentialsLists.create({
               credentialListSid: foundCredList.sid,
             });
-            console.log(`[ensureSipTrunkTerminationCreds] ✓ Associated credential list ${foundCredList.sid} with trunk ${trunkSid}`);
+            console.log(`[ensureSipTrunkTerminationCreds] ✓ Re-associated credential list ${foundCredList.sid} with trunk ${trunkSid}`);
             return { credUsername: existingUsername, credPassword: existingPassword };
           } catch (e) {
             if (String(e?.message || "").includes("already associated") || String(e?.message || "").includes("already exists")) {
               console.log(`[ensureSipTrunkTerminationCreds] Credential list already associated (ok)`);
               return { credUsername: existingUsername, credPassword: existingPassword };
             }
-            console.warn(`[ensureSipTrunkTerminationCreds] Failed to associate existing credential list: ${e?.message || e}`);
-            // Fall through to create new credentials
+            console.warn(`[ensureSipTrunkTerminationCreds] Failed to re-associate credential list: ${e?.message || e}. Will create new credentials.`);
           }
         } else {
-          console.log(`[ensureSipTrunkTerminationCreds] No credential list found with username ${existingUsername}, will create new credentials`);
-          // Fall through to create new credentials
+          console.log(`[ensureSipTrunkTerminationCreds] No credential list found for username ${existingUsername}. Creating new credentials...`);
         }
       }
-    } catch (e) {
-      console.warn(`[ensureSipTrunkTerminationCreds] Failed to verify credential association: ${e?.message || e}. Will create new credentials.`);
-      // Fall through to create new credentials
+      // Fall through to create new credentials AND associate them
     }
+  } catch (e) {
+    console.warn(`[ensureSipTrunkTerminationCreds] Failed to check credential association: ${e?.message || e}. Will create new credentials.`);
+    // Fall through to create new credentials
   }
 
   // Create new credentials (either no existing credentials, or existing ones aren't properly associated)

@@ -256,24 +256,29 @@ async function ensureOutboundTrunkTransport(trunkId, secure) {
     const currentTransport = current?.transport ?? null;
     
     // Log what we found
-    console.log(`[ensureOutboundTrunkTransport] Trunk ${trunkId} current transport: ${currentTransport} (0=UDP, 1=TCP, 2=TLS), target: ${targetTransport} (${targetName}), secure: ${secure}`);
+    const currentName = currentTransport === 1 ? 'TCP' : currentTransport === 0 ? 'UDP' : currentTransport === 2 ? 'TLS' : 'unknown';
+    console.log(`[ensureOutboundTrunkTransport] Trunk ${trunkId} current transport: ${currentTransport} (${currentName}), target: ${targetTransport} (${targetName}), secure: ${secure}`);
+    
+    // Skip update if transport already matches — avoids unnecessary 3s delay on every call
+    if (currentTransport === targetTransport) {
+      console.log(`[ensureOutboundTrunkTransport] ✓ Trunk ${trunkId} already uses ${targetName} transport (${targetTransport}), no update needed`);
+      return { updated: false, previousTransport: currentTransport, newTransport: targetTransport };
+    }
     
     // Update to target transport
-    const currentName = currentTransport === 1 ? 'TCP' : currentTransport === 0 ? 'UDP' : currentTransport === 2 ? 'TLS' : 'unknown';
-    console.log(`[ensureOutboundTrunkTransport] Updating trunk ${trunkId} to ${targetName} (${targetTransport}) - current: ${currentTransport} (${currentName})`);
+    console.log(`[ensureOutboundTrunkTransport] Updating trunk ${trunkId} from ${currentName} (${currentTransport}) to ${targetName} (${targetTransport})`);
     
     // CRITICAL: Use numeric enum (not string) - strings fail to encode
-    console.log(`[ensureOutboundTrunkTransport] Calling updateSipOutboundTrunkFields with transport: ${targetTransport}`);
     await sip.updateSipOutboundTrunkFields(trunkId, {
       transport: targetTransport, // Numeric enum: 2 = TLS, 1 = TCP
     });
     console.log(`[ensureOutboundTrunkTransport] Update call succeeded with transport=${targetTransport}`);
 
-    // Wait longer for the change to propagate (LiveKit may need time to apply)
+    // Wait for the change to propagate (LiveKit may need time to apply)
     console.log(`[ensureOutboundTrunkTransport] Waiting 3 seconds for change to propagate...`);
     await new Promise((resolve) => setTimeout(resolve, 3000));
 
-    // Verify the update worked (if we can retrieve trunk info)
+    // Verify the update worked
     console.log(`[ensureOutboundTrunkTransport] Verifying transport update...`);
     const updated = await getOutboundTrunkInfo(trunkId);
     if (updated) {

@@ -2378,13 +2378,19 @@ app.post("/api/phone-numbers/:id/reprovision-outbound", requireAuth, async (req,
       });
       const isSecure = Boolean(secure);
 
-      // 2) Ensure termination credentials.
+      // 2) Ensure termination credentials (and ensure they're associated with the Twilio trunk).
       const { credUsername, credPassword } = await tw.ensureSipTrunkTerminationCreds({
         subaccountSid: ws.twilioSubaccountSid,
         trunkSid,
         existingUsername: ws.twilioSipCredUsername,
         existingPassword: ws.twilioSipCredPassword,
       });
+      
+      // If credentials changed, LiveKit trunk must be recreated with new credentials
+      const credentialsChanged = credUsername !== ws.twilioSipCredUsername || credPassword !== ws.twilioSipCredPassword;
+      if (credentialsChanged) {
+        console.log(`[reprovision-outbound] Credentials changed (old: ${ws.twilioSipCredUsername}, new: ${credUsername}) — LiveKit trunk will be recreated`);
+      }
 
       // 3) Associate the phone number with the Twilio trunk.
       try {
@@ -2508,6 +2514,12 @@ app.post("/api/phone-numbers/:id/reprovision-outbound", requireAuth, async (req,
         }
         needsRecreate = true;
       }
+    }
+    
+    // Force recreate if credentials changed
+    if (credentialsChanged && !needsRecreate) {
+      console.log(`[reprovision-outbound] Forcing trunk recreation due to credential change`);
+      needsRecreate = true;
     }
     
     if (!lkTrunkId || needsRecreate) {
