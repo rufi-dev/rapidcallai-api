@@ -433,11 +433,27 @@ async function ensureSipTrunkOriginationUri({ subaccountSid, trunkSid, sipEndpoi
  */
 async function ensureSipTrunkTerminationCreds({ subaccountSid, trunkSid, existingUsername, existingPassword }) {
   if (existingUsername && existingPassword) {
+    console.log(`[ensureSipTrunkTerminationCreds] Using existing credentials for trunk ${trunkSid}`);
     return { credUsername: existingUsername, credPassword: existingPassword };
   }
 
   // MUST use direct subaccount auth for trunking API (credential list association).
   const client = await getSubaccountDirectClient(subaccountSid);
+  console.log(`[ensureSipTrunkTerminationCreds] Using client for subaccount ${subaccountSid}, trunk ${trunkSid}`);
+
+  // Verify trunk exists first
+  try {
+    const trunk = await client.trunking.v1.trunks(trunkSid).fetch();
+    console.log(`[ensureSipTrunkTerminationCreds] ✓ Verified trunk ${trunkSid} exists on account ${trunk.accountSid}`);
+  } catch (e) {
+    const errorMsg = String(e?.message || e);
+    const status = String(e?.status || "");
+    console.error(`[ensureSipTrunkTerminationCreds] ✗ Failed to verify trunk: ${errorMsg} (status: ${status})`);
+    if (errorMsg.includes("not found") || status === "404") {
+      throw new Error(`Trunk ${trunkSid} does not exist. Please ensure the trunk is created first.`);
+    }
+    throw new Error(`Failed to verify trunk exists: ${errorMsg}`);
+  }
 
   const username = `rc_${Date.now().toString(36)}`;
   const crypto = require("crypto");
@@ -448,21 +464,37 @@ async function ensureSipTrunkTerminationCreds({ subaccountSid, trunkSid, existin
   const password = "Rc1" + raw;
 
   // Create credential list on the subaccount.
+  console.log(`[ensureSipTrunkTerminationCreds] Creating credential list for trunk ${trunkSid}`);
   const credList = await client.sip.credentialLists.create({
     friendlyName: `RapidCall AI SIP creds (${trunkSid})`,
   });
+  console.log(`[ensureSipTrunkTerminationCreds] ✓ Created credential list ${credList.sid}`);
 
   // Add credential to the list.
+  console.log(`[ensureSipTrunkTerminationCreds] Adding credential to list ${credList.sid}`);
   await client.sip.credentialLists(credList.sid).credentials.create({
     username,
     password,
   });
+  console.log(`[ensureSipTrunkTerminationCreds] ✓ Added credential ${username} to list ${credList.sid}`);
 
   // Associate credential list with the trunk for termination auth.
   // NOTE: Twilio SDK v5 renamed this property to "credentialsLists" (plural 's').
-  await client.trunking.v1.trunks(trunkSid).credentialsLists.create({
-    credentialListSid: credList.sid,
-  });
+  console.log(`[ensureSipTrunkTerminationCreds] Associating credential list ${credList.sid} with trunk ${trunkSid}`);
+  try {
+    await client.trunking.v1.trunks(trunkSid).credentialsLists.create({
+      credentialListSid: credList.sid,
+    });
+    console.log(`[ensureSipTrunkTerminationCreds] ✓ Associated credential list ${credList.sid} with trunk ${trunkSid}`);
+  } catch (e) {
+    // May already be associated (race condition) - that's fine
+    if (!String(e?.message || "").includes("already associated") && !String(e?.message || "").includes("already exists")) {
+      console.warn(`[ensureSipTrunkTerminationCreds] Could not associate credential list: ${e?.message || e}`);
+      throw e;
+    } else {
+      console.log(`[ensureSipTrunkTerminationCreds] Credential list already associated (ok)`);
+    }
+  }
 
   return { credUsername: username, credPassword: password };
 }
@@ -533,14 +565,22 @@ async function ensureSipTrunkIpAcl({ subaccountSid, trunkSid, ipAddresses }) {
     throw new Error(`Failed to verify trunk exists: ${errorMsg}`);
   }
 
-  // Try to access IP ACL API - don't check existence, just try to use it
-  // The API might be available even if the property check fails
-  let ipAclApiAvailable = false;
+  // Verify IP ACL API is available - check the property path exists
+  if (!client.trunking || !client.trunking.v1) {
+    console.error(`[ensureSipTrunkIpAcl] client.trunking.v1 is not available. client.trunking: ${!!client.trunking}`);
+    throw new Error("Twilio Trunking API (v1) is not available. Check your Twilio SDK version and credentials.");
+  }
+  
+  // Check if ipAccessControlLists property exists
+  if (!client.trunking.v1.ipAccessControlLists) {
+    console.error(`[ensureSipTrunkIpAcl] client.trunking.v1.ipAccessControlLists is undefined. Available properties: ${Object.keys(client.trunking.v1).join(', ')}`);
+    throw new Error("Twilio Trunking API (IP Access Control Lists) is not available. This may indicate your Twilio SDK version doesn't support this API or your account doesn't have Elastic SIP Trunking enabled. Please check your Twilio SDK version and account permissions.");
+  }
+  
+  // Test if we can actually use the API
   try {
-    // Test if we can list ACLs - this will fail if API is not available
     await client.trunking.v1.ipAccessControlLists.list({ limit: 1 });
-    ipAclApiAvailable = true;
-    console.log(`[ensureSipTrunkIpAcl] ✓ IP ACL API is available`);
+    console.log(`[ensureSipTrunkIpAcl] ✓ IP ACL API is available and accessible`);
   } catch (e) {
     const errorMsg = String(e?.message || e);
     const status = String(e?.status || "");
@@ -551,7 +591,7 @@ async function ensureSipTrunkIpAcl({ subaccountSid, trunkSid, ipAddresses }) {
       throw new Error(`Twilio API authorization failed for IP ACL. Check your subaccount credentials. Error: ${errorMsg}`);
     }
     if (status === "404") {
-      throw new Error(`IP ACL API endpoint not found. This may indicate your Twilio account doesn't have Trunking API access enabled. Error: ${errorMsg}`);
+      throw new Error(`IP ACL API endpoint not found (404). Your Twilio account may not have Elastic SIP Trunking API access enabled. Please contact Twilio support to enable it. Error: ${errorMsg}`);
     }
     
     // If it's not a clear auth/404 error, still try to proceed - might be a different issue
