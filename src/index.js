@@ -2001,8 +2001,9 @@ app.post("/api/workspaces/:id/twilio/buy-number", requireAuth, async (req, res) 
           provisionErrors.push(`Origination URI: ${msg}`);
         }
 
-        // 3c3) Ensure IP Access Control List is configured (required when IP restrictions are enabled).
-        //      This prevents "SIP 500: Service Unavailable" errors from Twilio rejecting SIP INVITEs.
+        // 3c3) IP Access Control List — only if LIVEKIT_SIP_IP_ADDRESSES is set.
+        // If NOT set, remove any existing ACLs to avoid blocking LiveKit's dynamic IPs.
+        // Authentication is handled by termination credentials, so IP ACL is optional.
         const sipIpAddresses = String(process.env.LIVEKIT_SIP_IP_ADDRESSES || "").trim();
         if (sipIpAddresses) {
           try {
@@ -2021,7 +2022,13 @@ app.post("/api/workspaces/:id/twilio/buy-number", requireAuth, async (req, res) 
             provisionErrors.push(`IP ACL: ${msg}`);
           }
         } else {
-          logger.warn({ trunkSid }, "[buy-number] LIVEKIT_SIP_IP_ADDRESSES not set - IP ACL not configured. If IP restrictions are enabled on Twilio trunk, calls may fail with SIP 500.");
+          // No IP list → remove any existing ACLs so they don't block calls
+          logger.info({ trunkSid }, "[buy-number] LIVEKIT_SIP_IP_ADDRESSES not set — removing IP ACL restrictions (credentials handle auth)");
+          try {
+            await tw.removeAllSipTrunkIpAcls({ subaccountSid: ws.twilioSubaccountSid, trunkSid });
+          } catch (aclErr) {
+            logger.warn({ trunkSid, err: String(aclErr?.message || aclErr) }, "[buy-number] failed to remove IP ACLs (best-effort)");
+          }
         }
 
         // 3d) Create or update the LiveKit outbound trunk for this workspace.
@@ -2423,8 +2430,9 @@ app.post("/api/phone-numbers/:id/reprovision-outbound", requireAuth, async (req,
       }
     }
 
-    // 3c) Ensure IP Access Control List is configured (required when IP restrictions are enabled).
-    // This prevents "SIP 500: Service Unavailable" errors from Twilio rejecting SIP INVITEs.
+    // 3c) IP Access Control List — only if LIVEKIT_SIP_IP_ADDRESSES is set.
+    // If NOT set, remove any existing ACLs to avoid blocking LiveKit's dynamic IPs.
+    // Authentication is handled by termination credentials, so IP ACL is optional.
     const sipIpAddresses = String(process.env.LIVEKIT_SIP_IP_ADDRESSES || "").trim();
     if (sipIpAddresses) {
       try {
@@ -2442,7 +2450,13 @@ app.post("/api/phone-numbers/:id/reprovision-outbound", requireAuth, async (req,
         provisionErrors.push(`IP ACL: ${e?.message || e}`);
       }
     } else {
-      console.warn(`[reprovision-outbound] LIVEKIT_SIP_IP_ADDRESSES not set - IP ACL not configured. If IP restrictions are enabled on Twilio trunk, calls may fail with SIP 500.`);
+      // No IP list → remove any existing ACLs so they don't block calls
+      console.log(`[reprovision-outbound] LIVEKIT_SIP_IP_ADDRESSES not set — removing IP ACL restrictions (credentials handle auth)`);
+      try {
+        await tw.removeAllSipTrunkIpAcls({ subaccountSid: ws.twilioSubaccountSid, trunkSid });
+      } catch (e) {
+        console.warn(`[reprovision-outbound] Failed to remove IP ACLs (best-effort): ${e?.message || e}`);
+      }
     }
 
     // 4) Create or reuse LiveKit outbound trunk.

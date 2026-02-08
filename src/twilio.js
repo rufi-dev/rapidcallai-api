@@ -1047,6 +1047,48 @@ async function ensureSipTrunkIpAcl({ subaccountSid, trunkSid, ipAddresses }) {
   };
 }
 
+/**
+ * Remove all IP Access Control Lists associated with a Twilio SIP trunk.
+ * This is used when IP ACL restrictions are no longer wanted (e.g., relying on credentials only).
+ */
+async function removeAllSipTrunkIpAcls({ subaccountSid, trunkSid }) {
+  if (!subaccountSid) throw new Error("Workspace has no Twilio subaccount yet");
+  if (!trunkSid) throw new Error("Trunk SID is required");
+
+  let removedCount = 0;
+  try {
+    console.log(`[removeAllSipTrunkIpAcls] Listing ACLs on trunk ${trunkSid}`);
+    const trunkAclsResponse = await twilioTrunkingRequest({
+      subaccountSid,
+      method: "GET",
+      path: `/Trunks/${trunkSid}/IpAccessControlLists`,
+    });
+
+    const acls = trunkAclsResponse.ip_access_control_lists || [];
+    console.log(`[removeAllSipTrunkIpAcls] Found ${acls.length} ACLs associated with trunk`);
+
+    for (const acl of acls) {
+      try {
+        console.log(`[removeAllSipTrunkIpAcls] Disassociating ACL ${acl.sid} from trunk ${trunkSid}`);
+        await twilioTrunkingRequest({
+          subaccountSid,
+          method: "DELETE",
+          path: `/Trunks/${trunkSid}/IpAccessControlLists/${acl.sid}`,
+        });
+        removedCount++;
+        console.log(`[removeAllSipTrunkIpAcls] ✓ Disassociated ACL ${acl.sid}`);
+      } catch (e) {
+        console.warn(`[removeAllSipTrunkIpAcls] Failed to disassociate ACL ${acl.sid}: ${e?.message || e}`);
+      }
+    }
+  } catch (e) {
+    console.warn(`[removeAllSipTrunkIpAcls] Could not list/remove ACLs: ${e?.message || e}`);
+  }
+
+  console.log(`[removeAllSipTrunkIpAcls] Done — removed ${removedCount} ACL associations`);
+  return { removedCount };
+}
+
 module.exports = {
   getMasterCreds,
   getSubaccountClient,
@@ -1060,6 +1102,7 @@ module.exports = {
   ensureSipTrunkOriginationUri,
   associateNumberWithSipTrunk,
   ensureSipTrunkIpAcl,
+  removeAllSipTrunkIpAcls,
   getCallIpAddresses,
   getIpAddressesFromRecentCalls,
 };
