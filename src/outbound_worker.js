@@ -97,7 +97,14 @@ async function ensureWorkspaceOutboundTrunk(workspace, phoneRow) {
       numbers: [phoneRow.e164],
     });
     lkTrunkId = result.trunkId;
-    logger.info({ wsId, lkTrunkId, domainName }, "[outbound] step 4 done: LiveKit outbound trunk created");
+    // Explicitly ensure TLS is set (createOutboundTrunkForWorkspace should set it, but double-check)
+    try {
+      await ensureOutboundTrunkUsesTls(lkTrunkId);
+      logger.info({ wsId, lkTrunkId }, "[outbound] step 4a: ensured TLS transport on new trunk");
+    } catch (e) {
+      logger.warn({ wsId, lkTrunkId, err: String(e?.message || e) }, "[outbound] step 4a: failed to ensure TLS on new trunk (best-effort)");
+    }
+    logger.info({ wsId, lkTrunkId, domainName }, "[outbound] step 4 done: LiveKit outbound trunk created with TLS");
   } else {
     // Ensure existing trunk uses TLS transport (required for secure Twilio trunks)
     try {
@@ -278,6 +285,14 @@ async function handleJob(workspace, job) {
     await store.updateOutboundJob(workspaceId, job.id, { status: "failed", lastError: "No SIP outbound trunk ID configured" });
     await store.addOutboundJobLog(workspaceId, job.id, { level: "error", message: "No SIP outbound trunk ID. Set it on the phone number or SIP_OUTBOUND_TRUNK_ID env." });
     return;
+  }
+
+  // Safety check: ensure TLS is set on the trunk before dialing (required for secure Twilio trunks)
+  try {
+    await ensureOutboundTrunkUsesTls(trunkId);
+    logger.info({ workspaceId, trunkId, jobId: job.id }, "[outbound] ensured TLS transport before dialing");
+  } catch (e) {
+    logger.warn({ workspaceId, trunkId, jobId: job.id, err: String(e?.message || e) }, "[outbound] failed to ensure TLS before dialing (best-effort, may fail)");
   }
 
   const roomName = job.roomName || `out-${job.id}`;
