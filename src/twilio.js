@@ -261,13 +261,35 @@ async function configureNumberForSip({ subaccountSid, numberSid, e164, sipEndpoi
  */
 async function ensureSipTrunk({ subaccountSid, existingTrunkSid, workspaceId }) {
   if (!subaccountSid) throw new Error("Workspace has no Twilio subaccount yet");
+  
+  console.log(`[ensureSipTrunk] Starting trunk provisioning for workspace ${workspaceId}, subaccount ${subaccountSid}, existingTrunkSid: ${existingTrunkSid || 'none'}`);
+  
   // MUST use direct subaccount auth — trunking.twilio.com scopes by credentials, not accountSid.
-  const client = await getSubaccountDirectClient(subaccountSid);
+  let client;
+  try {
+    client = await getSubaccountDirectClient(subaccountSid);
+    if (!client) {
+      throw new Error("Failed to create Twilio client for subaccount");
+    }
+    console.log(`[ensureSipTrunk] Twilio client created successfully`);
+  } catch (e) {
+    const errorMsg = String(e?.message || e);
+    console.error(`[ensureSipTrunk] Failed to create Twilio client: ${errorMsg}`);
+    throw new Error(`Failed to initialize Twilio client: ${errorMsg}`);
+  }
+
+  // Verify trunking API is available
+  if (!client.trunking || !client.trunking.v1 || !client.trunking.v1.trunks) {
+    console.error(`[ensureSipTrunk] Twilio Trunking API is not available. client.trunking: ${!!client.trunking}, client.trunking.v1: ${!!client.trunking?.v1}, client.trunking.v1.trunks: ${!!client.trunking?.v1?.trunks}`);
+    throw new Error("Twilio Trunking API is not available. Check your Twilio credentials and ensure trunking API access is enabled.");
+  }
 
   // Re-use existing trunk if we have one.
   if (existingTrunkSid) {
+    console.log(`[ensureSipTrunk] Attempting to fetch existing trunk ${existingTrunkSid}`);
     try {
       const trunk = await client.trunking.v1.trunks(existingTrunkSid).fetch();
+      console.log(`[ensureSipTrunk] ✓ Found existing trunk ${trunk.sid}, domain: ${trunk.domainName}, secure: ${trunk.secure}`);
 
       // Don't force enable secure trunking - respect user's choice
       // Only ensure call transfer is enabled
@@ -277,8 +299,9 @@ async function ensureSipTrunk({ subaccountSid, existingTrunkSid, workspaceId }) 
           await client.trunking.v1.trunks(existingTrunkSid).update({
             transferMode: "enable-all",
           });
-        } catch {
-          // Best-effort; don't fail the entire flow.
+          console.log(`[ensureSipTrunk] Updated trunk ${trunk.sid} transfer mode to enable-all`);
+        } catch (e) {
+          console.warn(`[ensureSipTrunk] Failed to update trunk transfer mode (best-effort): ${e?.message || e}`);
         }
       }
 
@@ -287,7 +310,10 @@ async function ensureSipTrunk({ subaccountSid, existingTrunkSid, workspaceId }) 
         domainName: trunk.domainName || null,
         secure: Boolean(trunk.secure), // Return actual secure status
       };
-    } catch {
+    } catch (e) {
+      const errorMsg = String(e?.message || e);
+      const status = String(e?.status || "");
+      console.warn(`[ensureSipTrunk] Existing trunk ${existingTrunkSid} not found or inaccessible (${status}): ${errorMsg}. Will create a new one.`);
       // Trunk may have been deleted or was on the wrong account; fall through to create a new one.
     }
   }
@@ -296,15 +322,44 @@ async function ensureSipTrunk({ subaccountSid, existingTrunkSid, workspaceId }) 
   const slug = `rc-${(workspaceId || "ws").replace(/[^a-z0-9]/gi, "").slice(0, 16)}-${Date.now().toString(36)}`;
   const domainName = `${slug}.pstn.twilio.com`;
 
+  console.log(`[ensureSipTrunk] Creating new trunk with domain: ${domainName}`);
+
   // Default to secure: false (user can enable it manually in Twilio console)
-  const trunk = await client.trunking.v1.trunks.create({
-    friendlyName: `RapidCall AI (${workspaceId || "default"})`,
-    domainName,
-    // Secure Trunking: disabled by default (user can enable in Twilio console)
-    secure: false,
-    // Call Transfer: enable SIP REFER so agents can do cold/warm transfers.
-    transferMode: "enable-all",
-  });
+  let trunk;
+  try {
+    trunk = await client.trunking.v1.trunks.create({
+      friendlyName: `RapidCall AI (${workspaceId || "default"})`,
+      domainName,
+      // Secure Trunking: disabled by default (user can enable in Twilio console)
+      secure: false,
+      // Call Transfer: enable SIP REFER so agents can do cold/warm transfers.
+      transferMode: "enable-all",
+    });
+    console.log(`[ensureSipTrunk] ✓ Successfully created trunk ${trunk.sid}, domain: ${trunk.domainName}, secure: ${trunk.secure}`);
+  } catch (e) {
+    const errorMsg = String(e?.message || e);
+    const status = String(e?.status || "");
+    const code = String(e?.code || "");
+    console.error(`[ensureSipTrunk] ✗ Failed to create trunk: ${errorMsg} (status: ${status}, code: ${code})`);
+    
+    // Provide more specific error messages
+    if (errorMsg.includes("not authorized") || status === "401" || status === "403") {
+      throw new Error(`Twilio API authorization failed. Check your TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN credentials. Error: ${errorMsg}`);
+    }
+    if (errorMsg.includes("not found") || status === "404") {
+      throw new Error(`Twilio subaccount ${subaccountSid} not found. Verify the subaccount exists and credentials are correct. Error: ${errorMsg}`);
+    }
+    if (errorMsg.includes("domain") || errorMsg.includes("Domain")) {
+      throw new Error(`Invalid domain name for trunk: ${domainName}. Error: ${errorMsg}`);
+    }
+    
+    throw new Error(`Failed to create Twilio SIP trunk: ${errorMsg} (status: ${status}, code: ${code})`);
+  }
+
+  if (!trunk || !trunk.sid) {
+    console.error(`[ensureSipTrunk] ✗ Trunk creation returned invalid response:`, trunk);
+    throw new Error("Trunk creation succeeded but returned invalid trunk SID");
+  }
 
   return {
     trunkSid: trunk.sid,
