@@ -39,7 +39,7 @@ const {
 } = require("./storage");
 const { getPool, initSchema } = require("./db");
 const store = require("./store_pg");
-const { roomService, agentDispatchService, createParticipantToken, sipClient, addNumberToInboundTrunk, addNumberToOutboundTrunk, removeNumberFromInboundTrunk, removeNumberFromOutboundTrunk, createOutboundTrunkForWorkspace, ensureOutboundTrunkUsesTls, ensureOutboundTrunkTransport, ensureOutboundTrunkAddress, deleteOutboundTrunk, getOutboundTrunkInfo } = require("./livekit");
+const { roomService, agentDispatchService, createParticipantToken, sipClient, addNumberToInboundTrunk, addNumberToOutboundTrunk, removeNumberFromInboundTrunk, removeNumberFromOutboundTrunk, createInboundTrunkForWorkspace, createOutboundTrunkForWorkspace, ensureOutboundTrunkUsesTls, ensureOutboundTrunkTransport, ensureOutboundTrunkAddress, deleteOutboundTrunk, getOutboundTrunkInfo, isTrunkNotFoundError } = require("./livekit");
 const outboundWorker = require("./outbound_worker");
 const { startCallEgress, stopEgress, getEgressInfo } = require("./egress");
 const { getObject, headObject } = require("./s3");
@@ -1908,18 +1908,39 @@ app.post("/api/workspaces/:id/twilio/buy-number", requireAuth, async (req, res) 
         provisionErrors.push(`Twilio voice URL: ${msg}`);
       }
 
-      // 2) Add number to LiveKit inbound trunk
-      if (inboundTrunkId) {
+      // 2) Auto-provision LiveKit inbound trunk for the workspace (if not using env trunk)
+      let effectiveInboundTrunkId = inboundTrunkId || ws.livekitInboundTrunkId;
+      if (!effectiveInboundTrunkId) {
+        // Auto-create inbound trunk for this workspace
         try {
-          await addNumberToInboundTrunk(inboundTrunkId, purchased.phoneNumber);
-          logger.info({ e164: purchased.phoneNumber, trunkId: inboundTrunkId }, "[buy-number] added to inbound trunk");
+          logger.info({ workspaceId: ws.id, e164: purchased.phoneNumber }, "[buy-number] auto-creating LiveKit inbound trunk");
+          const inboundResult = await createInboundTrunkForWorkspace({
+            workspaceId: ws.id,
+            numbers: [purchased.phoneNumber],
+          });
+          effectiveInboundTrunkId = inboundResult.trunkId;
+          
+          // Persist the inbound trunk ID on the workspace
+          await store.updateWorkspace(ws.id, {
+            livekitInboundTrunkId: effectiveInboundTrunkId,
+          });
+          
+          logger.info({ workspaceId: ws.id, trunkId: effectiveInboundTrunkId, e164: purchased.phoneNumber }, "[buy-number] auto-created LiveKit inbound trunk");
+        } catch (e) {
+          const msg = String(e?.message || e);
+          logger.warn({ workspaceId: ws.id, e164: purchased.phoneNumber, err: msg }, "[buy-number] failed to auto-create inbound trunk");
+          provisionErrors.push(`Inbound trunk creation: ${msg}`);
+        }
+      } else {
+        // Add number to existing inbound trunk
+        try {
+          await addNumberToInboundTrunk(effectiveInboundTrunkId, purchased.phoneNumber);
+          logger.info({ e164: purchased.phoneNumber, trunkId: effectiveInboundTrunkId }, "[buy-number] added to inbound trunk");
         } catch (e) {
           const msg = String(e?.message || e);
           logger.warn({ e164: purchased.phoneNumber, err: msg }, "[buy-number] failed to add to inbound trunk");
           provisionErrors.push(`Inbound trunk: ${msg}`);
         }
-      } else {
-        provisionErrors.push("SIP_INBOUND_TRUNK_ID not set — skipped inbound trunk");
       }
 
       // 3) Auto-provision Twilio SIP trunk + LiveKit outbound trunk for the workspace.
@@ -2025,10 +2046,49 @@ app.post("/api/workspaces/:id/twilio/buy-number", requireAuth, async (req, res) 
           try {
             await ensureOutboundTrunkTransport(effectiveOutboundTrunkId, isSecure);
           } catch (e) {
-            logger.warn({ trunkId: effectiveOutboundTrunkId, err: String(e?.message || e) }, "[buy-number] failed to update trunk transport (best-effort)");
+            // If trunk doesn't exist, recreate it
+            if (isTrunkNotFoundError(e) || e?.code === "TRUNK_NOT_FOUND") {
+              logger.warn({ trunkId: effectiveOutboundTrunkId, err: String(e?.message || e) }, "[buy-number] trunk doesn't exist, recreating...");
+              // Recreate the trunk
+              const result = await createOutboundTrunkForWorkspace({
+                workspaceId: ws.id,
+                twilioSipDomainName: domainName,
+                credUsername,
+                credPassword,
+                numbers: [purchased.phoneNumber],
+                secure: isSecure,
+              });
+              effectiveOutboundTrunkId = result.trunkId;
+              logger.info({ e164: purchased.phoneNumber, trunkId: effectiveOutboundTrunkId }, "[buy-number] recreated LiveKit outbound trunk");
+            } else {
+              logger.warn({ trunkId: effectiveOutboundTrunkId, err: String(e?.message || e) }, "[buy-number] failed to update trunk transport (best-effort)");
+            }
           }
-          await addNumberToOutboundTrunk(effectiveOutboundTrunkId, purchased.phoneNumber);
-          logger.info({ e164: purchased.phoneNumber, trunkId: effectiveOutboundTrunkId }, "[buy-number] added to existing LiveKit outbound trunk");
+          
+          // Add number to trunk (if it still exists)
+          if (effectiveOutboundTrunkId) {
+            try {
+              await addNumberToOutboundTrunk(effectiveOutboundTrunkId, purchased.phoneNumber);
+              logger.info({ e164: purchased.phoneNumber, trunkId: effectiveOutboundTrunkId }, "[buy-number] added to LiveKit outbound trunk");
+            } catch (e) {
+              // If trunk doesn't exist when adding number, recreate it
+              if (isTrunkNotFoundError(e)) {
+                logger.warn({ trunkId: effectiveOutboundTrunkId, err: String(e?.message || e) }, "[buy-number] trunk doesn't exist when adding number, recreating...");
+                const result = await createOutboundTrunkForWorkspace({
+                  workspaceId: ws.id,
+                  twilioSipDomainName: domainName,
+                  credUsername,
+                  credPassword,
+                  numbers: [purchased.phoneNumber],
+                  secure: isSecure,
+                });
+                effectiveOutboundTrunkId = result.trunkId;
+                logger.info({ e164: purchased.phoneNumber, trunkId: effectiveOutboundTrunkId }, "[buy-number] recreated LiveKit outbound trunk after addNumber failed");
+              } else {
+                logger.warn({ trunkId: effectiveOutboundTrunkId, err: String(e?.message || e) }, "[buy-number] failed to add number to trunk (may already be there)");
+              }
+            }
+          }
         }
 
         // 3e) Persist trunk IDs on the workspace.
@@ -2060,7 +2120,7 @@ app.post("/api/workspaces/:id/twilio/buy-number", requireAuth, async (req, res) 
       const newStatus = provisionErrors.length === 0 ? "active" : "partial";
       phoneNumber = await store.updatePhoneNumber(phoneNumber.id, {
         status: newStatus,
-        livekitInboundTrunkId: inboundTrunkId || null,
+        livekitInboundTrunkId: effectiveInboundTrunkId || null,
         livekitOutboundTrunkId: effectiveOutboundTrunkId || outboundTrunkId || null,
       });
 
@@ -2400,7 +2460,11 @@ app.post("/api/phone-numbers/:id/reprovision-outbound", requireAuth, async (req,
             await ensureOutboundTrunkAddress(lkTrunkId, domainName);
             console.log(`[reprovision-outbound] ✓ Successfully updated trunk ${lkTrunkId} address to match Twilio termination URI`);
           } catch (e) {
-            console.warn(`[reprovision-outbound] Failed to update trunk address: ${e?.message || e}. Will recreate trunk...`);
+            if (isTrunkNotFoundError(e) || e?.code === "TRUNK_NOT_FOUND") {
+              console.warn(`[reprovision-outbound] Trunk ${lkTrunkId} doesn't exist in LiveKit: ${e?.message || e}. Will recreate...`);
+            } else {
+              console.warn(`[reprovision-outbound] Failed to update trunk address: ${e?.message || e}. Will recreate trunk...`);
+            }
             needsRecreate = true;
           }
         } else if (!currentAddress) {
@@ -2427,12 +2491,21 @@ app.post("/api/phone-numbers/:id/reprovision-outbound", requireAuth, async (req,
               needsRecreate = true;
             }
           } catch (e) {
-            console.warn(`[reprovision-outbound] Failed to update trunk: ${e?.message || e}. Recreating...`);
+            if (isTrunkNotFoundError(e) || e?.code === "TRUNK_NOT_FOUND") {
+              console.warn(`[reprovision-outbound] Trunk ${lkTrunkId} doesn't exist in LiveKit: ${e?.message || e}. Will recreate...`);
+            } else {
+              console.warn(`[reprovision-outbound] Failed to update trunk: ${e?.message || e}. Recreating...`);
+            }
             needsRecreate = true;
           }
         }
       } catch (e) {
-        console.warn(`[reprovision-outbound] Could not check trunk ${lkTrunkId} state: ${e?.message || e}. Recreating...`);
+        // Check if this is a "trunk not found" error
+        if (isTrunkNotFoundError(e) || e?.code === "TRUNK_NOT_FOUND") {
+          console.warn(`[reprovision-outbound] Trunk ${lkTrunkId} doesn't exist in LiveKit: ${e?.message || e}. Will recreate...`);
+        } else {
+          console.warn(`[reprovision-outbound] Could not check trunk ${lkTrunkId} state: ${e?.message || e}. Recreating...`);
+        }
         needsRecreate = true;
       }
     }

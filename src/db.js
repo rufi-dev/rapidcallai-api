@@ -92,6 +92,7 @@ async function initSchema() {
   await p.query(`ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS twilio_sip_cred_username TEXT NULL;`);
   await p.query(`ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS twilio_sip_cred_password TEXT NULL;`);
   await p.query(`ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS livekit_outbound_trunk_id TEXT NULL;`);
+  await p.query(`ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS livekit_inbound_trunk_id TEXT NULL;`);
 
   await p.query(`
     CREATE TABLE IF NOT EXISTS agents (

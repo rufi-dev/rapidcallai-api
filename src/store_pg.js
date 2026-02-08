@@ -118,6 +118,7 @@ function rowToWorkspace(r) {
     twilioSipCredUsername: r.twilio_sip_cred_username ?? null,
     twilioSipCredPassword: r.twilio_sip_cred_password ?? null,
     livekitOutboundTrunkId: r.livekit_outbound_trunk_id ?? null,
+    livekitInboundTrunkId: r.livekit_inbound_trunk_id ?? null,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   };
@@ -221,6 +222,7 @@ async function updateWorkspace(id, patch) {
         twilio_sip_cred_username=COALESCE($20,twilio_sip_cred_username),
         twilio_sip_cred_password=COALESCE($21,twilio_sip_cred_password),
         livekit_outbound_trunk_id=COALESCE($22,livekit_outbound_trunk_id),
+        livekit_inbound_trunk_id=COALESCE($23,livekit_inbound_trunk_id),
         updated_at=$17
     WHERE id=$1
     RETURNING *
@@ -248,6 +250,7 @@ async function updateWorkspace(id, patch) {
       next.twilioSipCredUsername ?? null,
       next.twilioSipCredPassword ?? null,
       next.livekitOutboundTrunkId ?? null,
+      next.livekitInboundTrunkId ?? null,
     ]
   );
   return rows[0] ? rowToWorkspace(rows[0]) : null;

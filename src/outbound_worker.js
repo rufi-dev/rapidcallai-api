@@ -9,7 +9,7 @@ if (require.main === module) {
 const { nanoid } = require("./id");
 const { logger } = require("./logger");
 const store = require("./store_pg");
-const { roomService, agentDispatchService, sipClient, addNumberToOutboundTrunk, createOutboundTrunkForWorkspace, ensureOutboundTrunkUsesTls, ensureOutboundTrunkTransport, ensureOutboundTrunkAddress } = require("./livekit");
+const { roomService, agentDispatchService, sipClient, addNumberToOutboundTrunk, createOutboundTrunkForWorkspace, ensureOutboundTrunkUsesTls, ensureOutboundTrunkTransport, ensureOutboundTrunkAddress, isTrunkNotFoundError } = require("./livekit");
 const tw = require("./twilio");
 
 const USE_DB = Boolean(process.env.DATABASE_URL);
@@ -135,14 +135,53 @@ async function ensureWorkspaceOutboundTrunk(workspace, phoneRow) {
       await ensureOutboundTrunkTransport(lkTrunkId, isSecure);
       logger.info({ wsId, lkTrunkId, domainName, secure: isSecure }, "[outbound] step 4a: ensured address and transport on existing trunk");
     } catch (e) {
-      logger.warn({ wsId, lkTrunkId, err: String(e?.message || e) }, "[outbound] step 4a: failed to update trunk address/transport (best-effort)");
+      // Check if trunk doesn't exist - if so, recreate it
+      if (isTrunkNotFoundError(e) || e?.code === "TRUNK_NOT_FOUND") {
+        logger.warn({ wsId, lkTrunkId, err: String(e?.message || e) }, "[outbound] step 4a: trunk doesn't exist in LiveKit, will recreate");
+        // Clear the trunk ID so we recreate it below
+        lkTrunkId = null;
+      } else {
+        logger.warn({ wsId, lkTrunkId, err: String(e?.message || e) }, "[outbound] step 4a: failed to update trunk address/transport (best-effort)");
+      }
     }
-    // Ensure the number is on the existing trunk.
-    logger.info({ wsId, lkTrunkId, e164: phoneRow.e164 }, "[outbound] step 4: adding number to existing LiveKit outbound trunk");
-    try {
-      await addNumberToOutboundTrunk(lkTrunkId, phoneRow.e164);
-    } catch {
-      // May already be there.
+    
+    // If trunk was cleared due to not found error, recreate it
+    if (!lkTrunkId) {
+      logger.info({ wsId, domainName, e164: phoneRow.e164, secure: isSecure }, "[outbound] step 4: recreating LiveKit outbound trunk (previous one didn't exist)");
+      const result = await createOutboundTrunkForWorkspace({
+        workspaceId: wsId,
+        twilioSipDomainName: domainName,
+        credUsername,
+        credPassword,
+        numbers: [phoneRow.e164],
+        secure: isSecure,
+      });
+      lkTrunkId = result.trunkId;
+      logger.info({ wsId, lkTrunkId, domainName, secure: isSecure }, "[outbound] step 4 done: LiveKit outbound trunk recreated");
+    } else {
+      // Ensure the number is on the existing trunk.
+      logger.info({ wsId, lkTrunkId, e164: phoneRow.e164 }, "[outbound] step 4: adding number to existing LiveKit outbound trunk");
+      try {
+        await addNumberToOutboundTrunk(lkTrunkId, phoneRow.e164);
+      } catch (e) {
+        // If trunk doesn't exist when adding number, recreate it
+        if (isTrunkNotFoundError(e)) {
+          logger.warn({ wsId, lkTrunkId, err: String(e?.message || e) }, "[outbound] step 4: trunk doesn't exist when adding number, will recreate");
+          lkTrunkId = null;
+          // Recreate the trunk
+          const result = await createOutboundTrunkForWorkspace({
+            workspaceId: wsId,
+            twilioSipDomainName: domainName,
+            credUsername,
+            credPassword,
+            numbers: [phoneRow.e164],
+            secure: isSecure,
+          });
+          lkTrunkId = result.trunkId;
+          logger.info({ wsId, lkTrunkId, domainName, secure: isSecure }, "[outbound] step 4 done: LiveKit outbound trunk recreated after addNumber failed");
+        }
+        // May already be there or other error - continue
+      }
     }
   }
 
@@ -327,7 +366,34 @@ async function handleJob(workspace, job) {
     await ensureOutboundTrunkTransport(trunkId, isSecure);
     logger.info({ workspaceId, trunkId, jobId: job.id, secure: isSecure }, "[outbound] ensured transport before dialing");
   } catch (e) {
-    logger.warn({ workspaceId, trunkId, jobId: job.id, err: String(e?.message || e) }, "[outbound] failed to ensure transport before dialing (best-effort, may fail)");
+    // If trunk doesn't exist, try to auto-provision it
+    if (isTrunkNotFoundError(e) || e?.code === "TRUNK_NOT_FOUND") {
+      logger.warn({ workspaceId, trunkId, jobId: job.id, err: String(e?.message || e) }, "[outbound] trunk doesn't exist, attempting auto-provision");
+      try {
+        const repaired = await ensureWorkspaceOutboundTrunk(workspace, phoneRow);
+        if (repaired) {
+          trunkId = repaired;
+          logger.info({ workspaceId, trunkId, jobId: job.id }, "[outbound] auto-provisioned outbound trunk after not found error");
+          // Retry transport check
+          try {
+            await ensureOutboundTrunkTransport(trunkId, isSecure);
+            logger.info({ workspaceId, trunkId, jobId: job.id, secure: isSecure }, "[outbound] ensured transport on recreated trunk");
+          } catch (retryErr) {
+            logger.warn({ workspaceId, trunkId, jobId: job.id, err: String(retryErr?.message || retryErr) }, "[outbound] failed to ensure transport on recreated trunk (best-effort)");
+          }
+        } else {
+          logger.error({ workspaceId, jobId: job.id }, "[outbound] auto-provision failed after trunk not found error");
+          await store.updateOutboundJob(workspaceId, job.id, { status: "failed", lastError: `Outbound trunk not found and auto-provision failed: ${e?.message || e}` });
+          return;
+        }
+      } catch (provisionErr) {
+        logger.error({ workspaceId, jobId: job.id, err: String(provisionErr?.message || provisionErr) }, "[outbound] auto-provision exception after trunk not found");
+        await store.updateOutboundJob(workspaceId, job.id, { status: "failed", lastError: `Outbound trunk not found and auto-provision exception: ${provisionErr?.message || provisionErr}` });
+        return;
+      }
+    } else {
+      logger.warn({ workspaceId, trunkId, jobId: job.id, err: String(e?.message || e) }, "[outbound] failed to ensure transport before dialing (best-effort, may fail)");
+    }
   }
 
   const roomName = job.roomName || `out-${job.id}`;

@@ -86,8 +86,26 @@ async function removeNumberFromOutboundTrunk(trunkId, phoneE164) {
 }
 
 /**
+ * Check if an error indicates the trunk doesn't exist in LiveKit.
+ * @param {Error|string} error - The error to check
+ * @returns {boolean} - True if the error indicates the trunk doesn't exist
+ */
+function isTrunkNotFoundError(error) {
+  const errorMsg = String(error?.message || error || "").toLowerCase();
+  return (
+    errorMsg.includes("object cannot be found") ||
+    errorMsg.includes("not found") ||
+    errorMsg.includes("does not exist") ||
+    errorMsg.includes("twirp error") && errorMsg.includes("not found") ||
+    errorMsg.includes("404") ||
+    errorMsg.includes("no such")
+  );
+}
+
+/**
  * Get the current state of a LiveKit SIP outbound trunk.
  * Note: This may not be available in all SDK versions - falls back to listing all trunks.
+ * Throws a specific error if the trunk doesn't exist (so callers can recreate it).
  */
 async function getOutboundTrunkInfo(trunkId) {
   const sip = sipClient();
@@ -102,11 +120,23 @@ async function getOutboundTrunkInfo(trunkId) {
       const trunks = await sip.listSipOutboundTrunk();
       const trunk = trunks.find((t) => t.sipTrunkId === trunkId);
       if (trunk) return trunk;
+      // Trunk not found in list - it doesn't exist
+      const error = new Error(`Trunk ${trunkId} not found in LiveKit`);
+      error.code = "TRUNK_NOT_FOUND";
+      throw error;
     }
     // If we can't get the trunk info, return null (caller should handle)
     console.warn(`[getOutboundTrunkInfo] Cannot retrieve trunk ${trunkId} info - SDK method may not be available`);
     return null;
   } catch (e) {
+    // Check if this is a "trunk not found" error
+    if (isTrunkNotFoundError(e)) {
+      const error = new Error(`LiveKit outbound trunk ${trunkId} does not exist: ${e?.message || e}`);
+      error.code = "TRUNK_NOT_FOUND";
+      error.originalError = e;
+      console.warn(`[getOutboundTrunkInfo] Trunk ${trunkId} not found in LiveKit: ${e?.message || e}`);
+      throw error;
+    }
     console.warn(`[getOutboundTrunkInfo] Failed to get trunk ${trunkId} info: ${e?.message || e}`);
     return null;
   }
@@ -136,10 +166,12 @@ async function deleteOutboundTrunk(trunkId) {
 /**
  * Ensure an existing LiveKit SIP outbound trunk address matches the Twilio termination URI.
  * If the address doesn't match, updates it to match Twilio's domain name.
+ * If the trunk doesn't exist, throws an error with code "TRUNK_NOT_FOUND" so callers can recreate it.
  * 
  * @param {string} trunkId - LiveKit outbound trunk ID
  * @param {string} twilioTerminationUri - Twilio termination URI (domain name) that should match
  * @returns {Promise<{updated: boolean, previousAddress?: string, newAddress?: string}>}
+ * @throws {Error} If trunk doesn't exist (error.code === "TRUNK_NOT_FOUND")
  */
 async function ensureOutboundTrunkAddress(trunkId, twilioTerminationUri) {
   const sip = sipClient();
@@ -209,6 +241,8 @@ async function ensureOutboundTrunkAddress(trunkId, twilioTerminationUri) {
  * - 2 = TLS
  * 
  * String values fail with encoding errors.
+ * 
+ * @throws {Error} If trunk doesn't exist (error.code === "TRUNK_NOT_FOUND")
  */
 async function ensureOutboundTrunkTransport(trunkId, secure) {
   const sip = sipClient();
@@ -218,6 +252,7 @@ async function ensureOutboundTrunkTransport(trunkId, secure) {
   try {
     // First, check current state (if possible)
     const current = await getOutboundTrunkInfo(trunkId);
+    // If getOutboundTrunkInfo throws TRUNK_NOT_FOUND, it will propagate up
     const currentTransport = current?.transport ?? null;
     
     // Log what we found
@@ -270,6 +305,23 @@ async function ensureOutboundTrunkUsesTls(trunkId) {
 }
 
 /**
+ * Create a new LiveKit SIP inbound trunk for a workspace.
+ * Inbound trunks receive calls from Twilio and route them to LiveKit rooms.
+ */
+async function createInboundTrunkForWorkspace({ workspaceId, numbers }) {
+  const sip = sipClient();
+  
+  // Create inbound trunk - no address needed (Twilio calls LiveKit, not the other way around)
+  // Inbound trunks are identified by the phone numbers they accept
+  const trunk = await sip.createSipInboundTrunk(
+    `RapidCall AI inbound (${workspaceId || "default"})`,
+    numbers || []
+  );
+  console.log(`[createInboundTrunkForWorkspace] Created inbound trunk ${trunk.sipTrunkId} for workspace ${workspaceId}`);
+  return { trunkId: trunk.sipTrunkId };
+}
+
+/**
  * Create a new LiveKit SIP outbound trunk pointing to a Twilio SIP trunk.
  * Uses the subaccount's termination credentials so Caller ID is recognized.
  * Configures transport based on Twilio secure trunking setting (TLS if secure, TCP if not).
@@ -308,12 +360,14 @@ module.exports = {
   addNumberToOutboundTrunk,
   removeNumberFromInboundTrunk,
   removeNumberFromOutboundTrunk,
+  createInboundTrunkForWorkspace,
   createOutboundTrunkForWorkspace,
   ensureOutboundTrunkUsesTls,
   ensureOutboundTrunkTransport,
   ensureOutboundTrunkAddress,
   getOutboundTrunkInfo,
   deleteOutboundTrunk,
+  isTrunkNotFoundError,
 };
 
 
