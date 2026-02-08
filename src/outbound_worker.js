@@ -86,6 +86,26 @@ async function ensureWorkspaceOutboundTrunk(workspace, phoneRow) {
     }
   }
 
+  // 3c) Ensure IP Access Control List is configured (required when IP restrictions are enabled).
+  const sipIpAddresses = String(process.env.LIVEKIT_SIP_IP_ADDRESSES || "").trim();
+  if (sipIpAddresses) {
+    try {
+      const ipList = sipIpAddresses.split(",").map((ip) => ip.trim()).filter(Boolean);
+      if (ipList.length > 0) {
+        const aclResult = await tw.ensureSipTrunkIpAcl({
+          subaccountSid: subSid,
+          trunkSid,
+          ipAddresses: ipList,
+        });
+        logger.info({ wsId, trunkSid, aclSid: aclResult.aclSid, ipsAdded: aclResult.ipAddressesAdded, totalIps: aclResult.totalIps }, "[outbound] step 3c done: IP ACL ensured");
+      }
+    } catch (e) {
+      logger.warn({ err: String(e?.message || e) }, "[outbound] step 3c: IP ACL failed (best-effort)");
+    }
+  } else {
+    logger.warn({ wsId, trunkSid }, "[outbound] step 3c: LIVEKIT_SIP_IP_ADDRESSES not set - IP ACL not configured. If IP restrictions are enabled on Twilio trunk, calls may fail with SIP 500.");
+  }
+
   // 4) Create or reuse LiveKit outbound trunk.
   let lkTrunkId = workspace.livekitOutboundTrunkId;
   if (!lkTrunkId) {

@@ -471,7 +471,7 @@ const MaxCallSecondsSchema = z.number().int().min(0).max(24 * 60 * 60).optional(
 const KnowledgeFolderIdsSchema = z.array(z.string().min(1).max(40)).max(50).optional();
 
 // Allow one or many origins. Use comma-separated list in CLIENT_ORIGIN, e.g.:
-// CLIENT_ORIGIN=https://dashboard.rapidcallai.com,http://localhost:5173
+// CLIENT_ORIGIN=https://dashboard.rapidcall.ai,http://localhost:5173
 // Use "*" to allow any origin (not recommended for production).
 const clientOrigins = String(process.env.CLIENT_ORIGIN || "http://localhost:5173")
   .split(",")
@@ -1978,6 +1978,29 @@ app.post("/api/workspaces/:id/twilio/buy-number", requireAuth, async (req, res) 
           provisionErrors.push(`Origination URI: ${msg}`);
         }
 
+        // 3c3) Ensure IP Access Control List is configured (required when IP restrictions are enabled).
+        //      This prevents "SIP 500: Service Unavailable" errors from Twilio rejecting SIP INVITEs.
+        const sipIpAddresses = String(process.env.LIVEKIT_SIP_IP_ADDRESSES || "").trim();
+        if (sipIpAddresses) {
+          try {
+            const ipList = sipIpAddresses.split(",").map((ip) => ip.trim()).filter(Boolean);
+            if (ipList.length > 0) {
+              const aclResult = await tw.ensureSipTrunkIpAcl({
+                subaccountSid: ws.twilioSubaccountSid,
+                trunkSid,
+                ipAddresses: ipList,
+              });
+              logger.info({ trunkSid, aclSid: aclResult.aclSid, ipsAdded: aclResult.ipAddressesAdded, totalIps: aclResult.totalIps }, "[buy-number] IP ACL configured");
+            }
+          } catch (aclErr) {
+            const msg = String(aclErr?.message || aclErr);
+            logger.warn({ trunkSid, err: msg }, "[buy-number] failed to configure IP ACL");
+            provisionErrors.push(`IP ACL: ${msg}`);
+          }
+        } else {
+          logger.warn({ trunkSid }, "[buy-number] LIVEKIT_SIP_IP_ADDRESSES not set - IP ACL not configured. If IP restrictions are enabled on Twilio trunk, calls may fail with SIP 500.");
+        }
+
         // 3d) Create or update the LiveKit outbound trunk for this workspace.
         if (!ws.livekitOutboundTrunkId) {
           const { trunkId: lkTrunkId } = await createOutboundTrunkForWorkspace({
@@ -2316,19 +2339,41 @@ app.post("/api/phone-numbers/:id/reprovision-outbound", requireAuth, async (req,
         }
       }
 
-      // 3b) Ensure Origination URI → LiveKit SIP endpoint (required for inbound calls).
-      if (sipEndpoint) {
-        try {
-          await tw.ensureSipTrunkOriginationUri({
+    // 3b) Ensure Origination URI → LiveKit SIP endpoint (required for inbound calls).
+    if (sipEndpoint) {
+      try {
+        await tw.ensureSipTrunkOriginationUri({
+          subaccountSid: ws.twilioSubaccountSid,
+          trunkSid,
+          sipEndpoint,
+          secure: isSecure,
+        });
+      } catch (e) {
+        provisionErrors.push(`Origination URI: ${e?.message || e}`);
+      }
+    }
+
+    // 3c) Ensure IP Access Control List is configured (required when IP restrictions are enabled).
+    // This prevents "SIP 500: Service Unavailable" errors from Twilio rejecting SIP INVITEs.
+    const sipIpAddresses = String(process.env.LIVEKIT_SIP_IP_ADDRESSES || "").trim();
+    if (sipIpAddresses) {
+      try {
+        const ipList = sipIpAddresses.split(",").map((ip) => ip.trim()).filter(Boolean);
+        if (ipList.length > 0) {
+          const aclResult = await tw.ensureSipTrunkIpAcl({
             subaccountSid: ws.twilioSubaccountSid,
             trunkSid,
-            sipEndpoint,
-            secure: isSecure,
+            ipAddresses: ipList,
           });
-        } catch (e) {
-          provisionErrors.push(`Origination URI: ${e?.message || e}`);
+          console.log(`[reprovision-outbound] IP ACL configured: ${aclResult.aclSid}, ${aclResult.ipAddressesAdded} IPs added, ${aclResult.totalIps} total`);
         }
+      } catch (e) {
+        console.warn(`[reprovision-outbound] Failed to configure IP ACL: ${e?.message || e}`);
+        provisionErrors.push(`IP ACL: ${e?.message || e}`);
       }
+    } else {
+      console.warn(`[reprovision-outbound] LIVEKIT_SIP_IP_ADDRESSES not set - IP ACL not configured. If IP restrictions are enabled on Twilio trunk, calls may fail with SIP 500.`);
+    }
 
     // 4) Create or reuse LiveKit outbound trunk.
     // CRITICAL: Check transport and match it to Twilio secure trunking setting.
@@ -2439,6 +2484,54 @@ app.post("/api/phone-numbers/:id/reprovision-outbound", requireAuth, async (req,
   } catch (e) {
     logger.warn({ err: String(e?.message || e) }, "[reprovision-outbound] failed");
     return res.status(500).json({ error: e instanceof Error ? e.message : "Reprovisioning failed" });
+  }
+});
+
+// --- Check IP addresses from Twilio calls (for debugging SIP ACL issues) ---
+app.get("/api/twilio/calls/:callSid/ips", requireAuth, async (req, res) => {
+  const { callSid } = req.params;
+  if (!callSid || !callSid.startsWith("CA")) {
+    return res.status(400).json({ error: "Invalid Twilio Call SID" });
+  }
+  
+  try {
+    const ws = req.workspace;
+    const ipInfo = await tw.getCallIpAddresses({
+      callSid,
+      subaccountSid: ws.twilioSubaccountSid || undefined,
+    });
+    
+    return res.json(ipInfo);
+  } catch (e) {
+    return res.status(500).json({ error: e?.message || "Failed to fetch IP addresses" });
+  }
+});
+
+app.get("/api/twilio/workspaces/:id/recent-call-ips", requireAuth, async (req, res) => {
+  if (!USE_DB) return res.status(400).json({ error: "Requires Postgres mode" });
+  
+  const workspaceId = req.params.id;
+  if (workspaceId !== req.workspace.id) {
+    return res.status(403).json({ error: "Access denied" });
+  }
+  
+  const ws = req.workspace;
+  if (!ws.twilioSipTrunkSid) {
+    return res.status(400).json({ error: "Workspace has no Twilio SIP trunk" });
+  }
+  
+  const limit = req.query.limit ? Number(req.query.limit) : 10;
+  
+  try {
+    const result = await tw.getIpAddressesFromRecentCalls({
+      trunkSid: ws.twilioSipTrunkSid,
+      subaccountSid: ws.twilioSubaccountSid || undefined,
+      limit: Math.min(limit, 50),
+    });
+    
+    return res.json(result);
+  } catch (e) {
+    return res.status(500).json({ error: e?.message || "Failed to fetch IP addresses" });
   }
 });
 

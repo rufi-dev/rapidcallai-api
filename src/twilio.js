@@ -29,10 +29,130 @@ function getSubaccountClient(subaccountSid) {
  * to whichever account the credentials belong to.
  */
 async function getSubaccountDirectClient(subaccountSid) {
-  const masterClient = getMasterClient();
-  if (!masterClient) throw new Error("Twilio is not configured (missing master credentials)");
-  const subaccount = await masterClient.api.accounts(subaccountSid).fetch();
-  return twilio(subaccountSid, subaccount.authToken);
+  const creds = getMasterCreds();
+  if (!creds) throw new Error("Twilio master credentials not configured");
+  // For trunking API, we must use the master account credentials but scope by subaccountSid in requests.
+  // The trunking API doesn't support subaccount auth tokens directly.
+  return twilio(creds.accountSid, creds.authToken);
+}
+
+/**
+ * Get IP addresses used for a specific call from Twilio call logs.
+ * Returns signaling and media IPs that Twilio saw for the call.
+ * 
+ * @param {Object} opts
+ * @param {string} opts.callSid - Twilio Call SID (e.g., "CAe70feb37773d7276dad342d6d12324f6")
+ * @param {string} [opts.subaccountSid] - Optional subaccount SID (uses master account if not provided)
+ * @returns {Promise<{signalingIp: string|null, mediaIp: string|null, error: string|null}>}
+ */
+async function getCallIpAddresses({ callSid, subaccountSid }) {
+  try {
+    const client = subaccountSid ? getSubaccountClient(subaccountSid) : getMasterClient();
+    if (!client) throw new Error("Twilio client not available");
+
+    // Fetch call details - this includes IP information in the Insights API
+    const call = await client.calls(callSid).fetch();
+    
+    // Try to get detailed insights (requires Insights API)
+    let signalingIp = null;
+    let mediaIp = null;
+    
+    try {
+      // Use the Insights API to get detailed call information
+      const insights = await client.insights.v1.calls(callSid).fetch();
+      
+      // Extract IP addresses from insights
+      // Note: The exact structure may vary - check Twilio Insights API docs
+      if (insights.clientMetrics) {
+        signalingIp = insights.clientMetrics?.clientEdge?.ipAddress || null;
+      }
+      if (insights.edgeMetrics) {
+        // Media IPs might be in edgeMetrics
+        const edge = insights.edgeMetrics?.find((e) => e.edge === "sip_edge");
+        if (edge) {
+          mediaIp = edge.ipAddress || null;
+        }
+      }
+    } catch (insightsErr) {
+      // Insights API might not be available or call might be too recent
+      console.warn(`[getCallIpAddresses] Could not fetch insights: ${insightsErr?.message || insightsErr}`);
+    }
+
+    return {
+      callSid,
+      signalingIp,
+      mediaIp,
+      from: call.from,
+      to: call.to,
+      status: call.status,
+      direction: call.direction,
+    };
+  } catch (e) {
+    return {
+      callSid,
+      signalingIp: null,
+      mediaIp: null,
+      error: e?.message || String(e),
+    };
+  }
+}
+
+/**
+ * Get IP addresses from recent failed calls to help identify which IPs need to be whitelisted.
+ * 
+ * @param {Object} opts
+ * @param {string} opts.trunkSid - Twilio SIP Trunk SID
+ * @param {string} [opts.subaccountSid] - Optional subaccount SID
+ * @param {number} [opts.limit] - Number of recent calls to check (default: 10)
+ * @returns {Promise<{ips: string[], calls: Array}>}
+ */
+async function getIpAddressesFromRecentCalls({ trunkSid, subaccountSid, limit = 10 }) {
+  try {
+    const client = subaccountSid ? getSubaccountClient(subaccountSid) : getMasterClient();
+    if (!client) throw new Error("Twilio client not available");
+
+    // Fetch recent calls for this trunk
+    const calls = await client.calls.list({
+      limit: limit,
+      // Filter by trunk if possible (may need to use different filter)
+    });
+
+    const ipSet = new Set();
+    const callDetails = [];
+
+    for (const call of calls) {
+      // Only check calls that used this trunk (check direction and other filters)
+      if (call.direction === "outbound-api" || call.direction === "outbound-dial") {
+        try {
+          const ipInfo = await getCallIpAddresses({ callSid: call.sid, subaccountSid });
+          if (ipInfo.signalingIp) ipSet.add(ipInfo.signalingIp);
+          if (ipInfo.mediaIp) ipSet.add(ipInfo.mediaIp);
+          callDetails.push({
+            callSid: call.sid,
+            from: call.from,
+            to: call.to,
+            status: call.status,
+            dateCreated: call.dateCreated,
+            signalingIp: ipInfo.signalingIp,
+            mediaIp: ipInfo.mediaIp,
+          });
+        } catch (e) {
+          console.warn(`[getIpAddressesFromRecentCalls] Failed to get IPs for call ${call.sid}: ${e?.message || e}`);
+        }
+      }
+    }
+
+    return {
+      ips: Array.from(ipSet).sort(),
+      calls: callDetails,
+    };
+  } catch (e) {
+    return {
+      ips: [],
+      calls: [],
+      error: e?.message || String(e),
+    };
+  }
 }
 
 async function ensureSubaccount({ friendlyName, existingSid }) {
@@ -137,7 +257,7 @@ async function configureNumberForSip({ subaccountSid, numberSid, e164, sipEndpoi
 /**
  * Ensure a Twilio Elastic SIP Trunk exists on the subaccount.
  * Creates the trunk with Secure Trunking (SRTP+TLS) and Call Transfer (SIP REFER) enabled.
- * Returns { trunkSid, domainName }.
+ * Returns { trunkSid, domainName, secure }.
  */
 async function ensureSipTrunk({ subaccountSid, existingTrunkSid, workspaceId }) {
   if (!subaccountSid) throw new Error("Workspace has no Twilio subaccount yet");
@@ -286,6 +406,113 @@ async function associateNumberWithSipTrunk({ subaccountSid, trunkSid, numberSid 
   });
 }
 
+/**
+ * Ensure IP Access Control List is configured on the Twilio SIP trunk.
+ * This is REQUIRED when IP restrictions are enabled - Twilio will reject SIP INVITEs
+ * from IPs not in the ACL, causing "SIP 500: Service Unavailable" errors.
+ * 
+ * @param {Object} opts
+ * @param {string} opts.subaccountSid - Twilio subaccount SID
+ * @param {string} opts.trunkSid - Twilio SIP trunk SID
+ * @param {string[]} opts.ipAddresses - Array of IP addresses to whitelist (e.g., ["143.223.92.68", "168.86.137.235"])
+ */
+async function ensureSipTrunkIpAcl({ subaccountSid, trunkSid, ipAddresses }) {
+  if (!subaccountSid) throw new Error("Workspace has no Twilio subaccount yet");
+  if (!trunkSid) throw new Error("Trunk SID is required");
+  if (!ipAddresses || !Array.isArray(ipAddresses) || ipAddresses.length === 0) {
+    throw new Error("IP addresses array is required");
+  }
+
+  const client = await getSubaccountDirectClient(subaccountSid);
+
+  // Create or find an IP Access Control List for this trunk
+  const aclFriendlyName = `RapidCall AI SIP ACL (${trunkSid.slice(-8)})`;
+  
+  // First, check if an ACL is already associated with this trunk
+  let ipAclList = null;
+  try {
+    const trunkAcls = await client.trunking.v1.trunks(trunkSid).ipAccessControlLists.list({ limit: 50 });
+    if (trunkAcls.length > 0) {
+      // Use the first ACL already associated with the trunk
+      ipAclList = trunkAcls[0];
+      console.log(`[ensureSipTrunkIpAcl] Found existing ACL ${ipAclList.sid} already associated with trunk`);
+    }
+  } catch (e) {
+    console.warn(`[ensureSipTrunkIpAcl] Could not list trunk ACLs: ${e?.message || e}`);
+  }
+
+  // If no ACL is associated, try to find or create one
+  if (!ipAclList) {
+    try {
+      // Try to find an existing ACL by name on the account
+      const allAcls = await client.trunking.v1.ipAccessControlLists.list({ limit: 100 });
+      ipAclList = allAcls.find((acl) => acl.friendlyName === aclFriendlyName);
+      
+      if (!ipAclList) {
+        // Create a new IP ACL resource on the account
+        ipAclList = await client.trunking.v1.ipAccessControlLists.create({
+          friendlyName: aclFriendlyName,
+        });
+        console.log(`[ensureSipTrunkIpAcl] Created new IP ACL ${ipAclList.sid}`);
+      } else {
+        console.log(`[ensureSipTrunkIpAcl] Found existing IP ACL ${ipAclList.sid} by name`);
+      }
+    } catch (e) {
+      throw new Error(`Failed to create or find IP ACL: ${e?.message || e}`);
+    }
+
+    // Associate the IP ACL with the trunk
+    try {
+      await client.trunking.v1.trunks(trunkSid).ipAccessControlLists.create({
+        ipAccessControlListSid: ipAclList.sid,
+      });
+      console.log(`[ensureSipTrunkIpAcl] Associated IP ACL ${ipAclList.sid} with trunk ${trunkSid}`);
+    } catch (e) {
+      // May already be associated (race condition) - that's fine
+      if (!String(e?.message || "").includes("already associated") && !String(e?.message || "").includes("already exists")) {
+        console.warn(`[ensureSipTrunkIpAcl] Could not associate ACL: ${e?.message || e}`);
+      } else {
+        console.log(`[ensureSipTrunkIpAcl] ACL already associated (ok)`);
+      }
+    }
+  }
+
+  // Add IP addresses to the ACL
+  const existingIps = await client.trunking.v1.ipAccessControlLists(ipAclList.sid).ipAddresses.list({ limit: 100 });
+  const existingIpSet = new Set(existingIps.map((ip) => ip.ipAddress));
+
+  let addedCount = 0;
+  for (const ip of ipAddresses) {
+    // Validate IP format (basic check)
+    if (!/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(ip)) {
+      console.warn(`[ensureSipTrunkIpAcl] Skipping invalid IP: ${ip}`);
+      continue;
+    }
+
+    if (!existingIpSet.has(ip)) {
+      try {
+        await client.trunking.v1.ipAccessControlLists(ipAclList.sid).ipAddresses.create({
+          friendlyName: `LiveKit SIP ${ip}`,
+          ipAddress: ip,
+        });
+        addedCount++;
+        console.log(`[ensureSipTrunkIpAcl] Added IP ${ip} to ACL ${ipAclList.sid}`);
+      } catch (e) {
+        console.warn(`[ensureSipTrunkIpAcl] Failed to add IP ${ip}: ${e?.message || e}`);
+      }
+    } else {
+      console.log(`[ensureSipTrunkIpAcl] IP ${ip} already in ACL`);
+    }
+  }
+
+  return {
+    aclSid: ipAclList.sid,
+    aclFriendlyName: ipAclList.friendlyName,
+    ipAddressesAdded: addedCount,
+    totalIps: existingIps.length + addedCount,
+  };
+}
+
 module.exports = {
   getMasterCreds,
   getSubaccountClient,
@@ -298,6 +525,7 @@ module.exports = {
   ensureSipTrunkTerminationCreds,
   ensureSipTrunkOriginationUri,
   associateNumberWithSipTrunk,
+  ensureSipTrunkIpAcl,
+  getCallIpAddresses,
+  getIpAddressesFromRecentCalls,
 };
-
-

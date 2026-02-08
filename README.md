@@ -148,7 +148,7 @@ POST /api/calls/:callId/metrics
 
 For this to work in LiveKit Cloud, the agent must have:
 
-- `SERVER_BASE_URL=https://api.rapidcallai.com` (or your API domain)
+- `SERVER_BASE_URL=https://api.rapidcall.ai` (or your API domain)
 
 ## Troubleshooting
 
