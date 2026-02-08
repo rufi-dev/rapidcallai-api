@@ -517,20 +517,45 @@ async function ensureSipTrunkIpAcl({ subaccountSid, trunkSid, ipAddresses }) {
 
   const client = await getSubaccountDirectClient(subaccountSid);
   
-  // Verify trunk exists first and API is available
+  console.log(`[ensureSipTrunkIpAcl] Using client for subaccount ${subaccountSid}, trunk ${trunkSid}`);
+  
+  // Verify trunk exists first
   try {
-    await client.trunking.v1.trunks(trunkSid).fetch();
+    const trunk = await client.trunking.v1.trunks(trunkSid).fetch();
+    console.log(`[ensureSipTrunkIpAcl] ✓ Verified trunk ${trunkSid} exists on account ${trunk.accountSid}`);
   } catch (e) {
     const errorMsg = String(e?.message || e);
-    if (errorMsg.includes("not found") || String(e?.status || "") === "404") {
+    const status = String(e?.status || "");
+    console.error(`[ensureSipTrunkIpAcl] ✗ Failed to verify trunk: ${errorMsg} (status: ${status})`);
+    if (errorMsg.includes("not found") || status === "404") {
       throw new Error(`Trunk ${trunkSid} does not exist. Please ensure the trunk is created first.`);
     }
     throw new Error(`Failed to verify trunk exists: ${errorMsg}`);
   }
 
-  // Verify IP ACL API is available
-  if (!client.trunking || !client.trunking.v1 || !client.trunking.v1.ipAccessControlLists) {
-    throw new Error("Twilio Trunking API (IP Access Control Lists) is not available. Check your Twilio credentials and ensure trunking API access is enabled.");
+  // Try to access IP ACL API - don't check existence, just try to use it
+  // The API might be available even if the property check fails
+  let ipAclApiAvailable = false;
+  try {
+    // Test if we can list ACLs - this will fail if API is not available
+    await client.trunking.v1.ipAccessControlLists.list({ limit: 1 });
+    ipAclApiAvailable = true;
+    console.log(`[ensureSipTrunkIpAcl] ✓ IP ACL API is available`);
+  } catch (e) {
+    const errorMsg = String(e?.message || e);
+    const status = String(e?.status || "");
+    console.error(`[ensureSipTrunkIpAcl] ✗ IP ACL API test failed: ${errorMsg} (status: ${status})`);
+    
+    // Check if it's a permissions/auth issue vs API not existing
+    if (status === "401" || status === "403") {
+      throw new Error(`Twilio API authorization failed for IP ACL. Check your subaccount credentials. Error: ${errorMsg}`);
+    }
+    if (status === "404") {
+      throw new Error(`IP ACL API endpoint not found. This may indicate your Twilio account doesn't have Trunking API access enabled. Error: ${errorMsg}`);
+    }
+    
+    // If it's not a clear auth/404 error, still try to proceed - might be a different issue
+    console.warn(`[ensureSipTrunkIpAcl] IP ACL API test failed but continuing - will attempt operations anyway`);
   }
 
   // Create or find an IP Access Control List for this trunk
@@ -543,32 +568,53 @@ async function ensureSipTrunkIpAcl({ subaccountSid, trunkSid, ipAddresses }) {
     if (trunkAcls && trunkAcls.length > 0) {
       // Use the first ACL already associated with the trunk
       ipAclList = trunkAcls[0];
-      console.log(`[ensureSipTrunkIpAcl] Found existing ACL ${ipAclList.sid} already associated with trunk`);
+      console.log(`[ensureSipTrunkIpAcl] ✓ Found existing ACL ${ipAclList.sid} already associated with trunk`);
+    } else {
+      console.log(`[ensureSipTrunkIpAcl] No ACLs currently associated with trunk ${trunkSid}`);
     }
   } catch (e) {
-    console.warn(`[ensureSipTrunkIpAcl] Could not list trunk ACLs: ${e?.message || e}`);
+    const errorMsg = String(e?.message || e);
+    const status = String(e?.status || "");
+    console.warn(`[ensureSipTrunkIpAcl] Could not list trunk ACLs: ${errorMsg} (status: ${status}) - will try to create new ACL`);
   }
 
   // If no ACL is associated, try to find or create one
   if (!ipAclList) {
     try {
       // Try to find an existing ACL by name on the account
+      console.log(`[ensureSipTrunkIpAcl] Listing all ACLs on account to find or create one`);
       const allAcls = await client.trunking.v1.ipAccessControlLists.list({ limit: 100 });
+      console.log(`[ensureSipTrunkIpAcl] Found ${allAcls?.length || 0} existing ACLs on account`);
+      
       if (allAcls && Array.isArray(allAcls)) {
         ipAclList = allAcls.find((acl) => acl.friendlyName === aclFriendlyName);
       }
       
       if (!ipAclList) {
         // Create a new IP ACL resource on the account
+        console.log(`[ensureSipTrunkIpAcl] Creating new IP ACL with name: ${aclFriendlyName}`);
         ipAclList = await client.trunking.v1.ipAccessControlLists.create({
           friendlyName: aclFriendlyName,
         });
-        console.log(`[ensureSipTrunkIpAcl] Created new IP ACL ${ipAclList.sid}`);
+        console.log(`[ensureSipTrunkIpAcl] ✓ Created new IP ACL ${ipAclList.sid}`);
       } else {
-        console.log(`[ensureSipTrunkIpAcl] Found existing IP ACL ${ipAclList.sid} by name`);
+        console.log(`[ensureSipTrunkIpAcl] ✓ Found existing IP ACL ${ipAclList.sid} by name`);
       }
     } catch (e) {
-      throw new Error(`Failed to create or find IP ACL: ${e?.message || e}`);
+      const errorMsg = String(e?.message || e);
+      const status = String(e?.status || "");
+      const code = String(e?.code || "");
+      console.error(`[ensureSipTrunkIpAcl] ✗ Failed to create or find IP ACL: ${errorMsg} (status: ${status}, code: ${code})`);
+      
+      // Provide more specific error messages
+      if (status === "401" || status === "403") {
+        throw new Error(`Twilio API authorization failed for IP ACL operations. Check your subaccount credentials. Error: ${errorMsg}`);
+      }
+      if (status === "404") {
+        throw new Error(`IP ACL API endpoint not found (404). Your Twilio account may not have Elastic SIP Trunking API access enabled. Please contact Twilio support to enable it. Error: ${errorMsg}`);
+      }
+      
+      throw new Error(`Failed to create or find IP ACL: ${errorMsg} (status: ${status}, code: ${code})`);
     }
 
     // Associate the IP ACL with the trunk
