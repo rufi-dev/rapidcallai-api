@@ -51,6 +51,8 @@ const stripeBilling = require("./billing/stripe");
 const { provisionBillingForWorkspace } = require("./billing/provision");
 const { createBillingRouter } = require("./billing/routes");
 const { registerStripeWebhookRoute } = require("./billing/stripeWebhook");
+const { createCrmRouter } = require("./crm/routes");
+const contactStore = require("./crm/store");
 
 // LiveKit webhooks receiver (verified with LIVEKIT_API_KEY/SECRET).
 // NOTE: WebhookReceiver needs the *raw* body string, so we use express.raw on that route.
@@ -1061,6 +1063,9 @@ app.post("/api/kb/search", requireAuth, async (req, res) => {
 // Billing API routes (Trial credits + Stripe + OpenMeter)
 app.use("/api/billing", requireAuth, createBillingRouter({ store: USE_DB ? store : null, stripeBilling }));
 
+// CRM API routes (Contacts / Leads)
+app.use("/api/crm", requireAuth, createCrmRouter({ store: USE_DB ? store : null, USE_DB }));
+
 // --- Internal (used by the LiveKit agent to create/update call records) ---
 app.post("/api/internal/telephony/inbound/start", requireAgentSecret, async (req, res) => {
   const schema = z.object({
@@ -1285,6 +1290,17 @@ app.post("/api/internal/calls/:id/end", requireAgentSecret, async (req, res) => 
     }
   } catch {
     // ignore; call end should not fail because of egress
+  }
+
+  // Auto-create/update contact from call (best-effort)
+  try {
+    if (updated.to && updated.to !== "webtest" && /^\+?[1-9]\d{6,14}$/.test(updated.to)) {
+      const phone = updated.to.startsWith("+") ? updated.to : `+${updated.to}`;
+      const source = updated.metrics?.normalized?.source === "outbound" ? "outbound" : "inbound";
+      await contactStore.upsertContactFromCall(updated.workspaceId, phone, "", source);
+    }
+  } catch (e) {
+    logger.warn({ requestId: req.requestId, err: String(e?.message || e) }, "[internal.calls.end] contact auto-create failed");
   }
 
   return res.json({ call: updated });
@@ -2381,6 +2397,14 @@ app.post("/api/outbound/jobs", requireAuth, async (req, res) => {
 
   // Trigger the outbound worker immediately so the call starts right away
   outboundWorker.triggerNow();
+
+  // Auto-create/update contact from outbound job (best-effort)
+  try {
+    const phone = job.phoneE164.startsWith("+") ? job.phoneE164 : `+${job.phoneE164}`;
+    await contactStore.upsertContactFromCall(req.workspace.id, phone, job.leadName ?? "", "outbound");
+  } catch (e) {
+    logger.warn({ requestId: req.requestId, err: String(e?.message || e) }, "[outbound.jobs] contact auto-create failed");
+  }
 
   return res.status(201).json({ job });
 });

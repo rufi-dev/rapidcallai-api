@@ -94,6 +94,7 @@ function rowToOutboundJobLog(r) {
   };
 }
 
+
 function rowToWorkspace(r) {
   return {
     id: r.id,
@@ -1350,6 +1351,8 @@ async function listOutboundJobLogs(workspaceId, jobId, limit = 200) {
   return rows.map(rowToOutboundJobLog);
 }
 
+// Contacts / CRM - re-exported from crm/store.js
+
 module.exports = {
   // Auth
   createUser,
@@ -1423,6 +1426,9 @@ module.exports = {
   claimOutboundJobs,
   addOutboundJobLog,
   listOutboundJobLogs,
+
+  // Contacts / CRM - re-exported from crm/store.js
+  ...require("./crm/store"),
 };
 
 

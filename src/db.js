@@ -324,6 +324,30 @@ async function initSchema() {
   await p.query(`CREATE INDEX IF NOT EXISTS phone_numbers_workspace_idx ON phone_numbers(workspace_id, created_at DESC);`);
   await p.query(`CREATE UNIQUE INDEX IF NOT EXISTS phone_numbers_workspace_e164_uniq ON phone_numbers(workspace_id, e164);`);
 
+  // Contacts / CRM
+  await p.query(`
+    CREATE TABLE IF NOT EXISTS contacts (
+      id TEXT PRIMARY KEY,
+      workspace_id TEXT NOT NULL,
+      phone_e164 TEXT NOT NULL,
+      name TEXT NOT NULL DEFAULT '',
+      email TEXT NOT NULL DEFAULT '',
+      company TEXT NOT NULL DEFAULT '',
+      tags JSONB NOT NULL DEFAULT '[]'::jsonb,
+      notes TEXT NOT NULL DEFAULT '',
+      source TEXT NOT NULL DEFAULT 'manual',
+      total_calls INT NOT NULL DEFAULT 0,
+      last_call_at BIGINT NULL,
+      last_call_outcome TEXT NOT NULL DEFAULT '',
+      metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at BIGINT NOT NULL,
+      updated_at BIGINT NOT NULL
+    );
+  `);
+  await p.query(`CREATE INDEX IF NOT EXISTS contacts_workspace_idx ON contacts(workspace_id, created_at DESC);`);
+  await p.query(`CREATE INDEX IF NOT EXISTS contacts_phone_idx ON contacts(workspace_id, phone_e164);`);
+  await p.query(`CREATE UNIQUE INDEX IF NOT EXISTS contacts_workspace_phone_uniq ON contacts(workspace_id, phone_e164);`);
+
   return true;
 }
 
