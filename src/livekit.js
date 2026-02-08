@@ -113,10 +113,35 @@ async function getOutboundTrunkInfo(trunkId) {
 }
 
 /**
+ * Delete a LiveKit SIP outbound trunk.
+ * Note: This may not be available in all SDK versions.
+ */
+async function deleteOutboundTrunk(trunkId) {
+  const sip = sipClient();
+  try {
+    if (typeof sip.deleteSipOutboundTrunk === "function") {
+      await sip.deleteSipOutboundTrunk(trunkId);
+      console.log(`[deleteOutboundTrunk] Successfully deleted trunk ${trunkId}`);
+      return true;
+    } else {
+      console.warn(`[deleteOutboundTrunk] deleteSipOutboundTrunk method not available in SDK`);
+      return false;
+    }
+  } catch (e) {
+    console.error(`[deleteOutboundTrunk] Failed to delete trunk ${trunkId}: ${e?.message || e}`);
+    throw new Error(`Failed to delete trunk: ${e?.message || e}`);
+  }
+}
+
+/**
  * Ensure an existing LiveKit SIP outbound trunk uses TLS transport.
  * This is required when the Twilio trunk has secure: true.
  * 
- * CRITICAL: LiveKit SDK requires transport as numeric enum (2 = TLS), not string.
+ * CRITICAL: LiveKit SDK requires transport as numeric enum:
+ * - 0 = UDP
+ * - 1 = TCP
+ * - 2 = TLS
+ * 
  * String values fail with encoding errors.
  */
 async function ensureOutboundTrunkUsesTls(trunkId) {
@@ -124,40 +149,47 @@ async function ensureOutboundTrunkUsesTls(trunkId) {
   try {
     // First, check current state (if possible)
     const current = await getOutboundTrunkInfo(trunkId);
-    const currentTransport = current?.transport || "unknown";
+    const currentTransport = current?.transport ?? null;
     
-    // Check if already using TLS (numeric 2 is the correct value)
-    if (currentTransport === 2) {
-      console.log(`[ensureOutboundTrunkUsesTls] Trunk ${trunkId} already uses TLS transport (2)`);
-      return { updated: false, previousTransport: currentTransport };
-    }
-
-    console.log(`[ensureOutboundTrunkUsesTls] Updating trunk ${trunkId} from transport "${currentTransport}" to TLS (2)`);
+    // Log what we found
+    console.log(`[ensureOutboundTrunkUsesTls] Trunk ${trunkId} current transport: ${currentTransport} (0=UDP, 1=TCP, 2=TLS)`);
+    
+    // Always update to TLS (2), even if it reports TLS already
+    // Some trunks may report TLS (2) but still use TCP (1) internally, so we force the update
+    const transportName = currentTransport === 1 ? 'TCP' : currentTransport === 0 ? 'UDP' : currentTransport === 2 ? 'TLS' : 'unknown';
+    console.log(`[ensureOutboundTrunkUsesTls] Updating trunk ${trunkId} to TLS (2) - current: ${currentTransport} (${transportName})`);
+    console.log(`[ensureOutboundTrunkUsesTls] Updating trunk ${trunkId} from transport ${currentTransport} (${currentTransport === 1 ? 'TCP' : currentTransport === 0 ? 'UDP' : 'unknown'}) to TLS (2)`);
     console.log(`[ensureOutboundTrunkUsesTls] Trunk details:`, JSON.stringify({
       trunkId,
       currentTransport,
+      transportName: currentTransport === 1 ? 'TCP' : currentTransport === 0 ? 'UDP' : currentTransport === 2 ? 'TLS' : 'unknown',
       address: current?.outboundAddress,
       numbers: current?.outboundNumbers?.length || 0,
     }, null, 2));
     
     // CRITICAL: Use numeric 2 (not string "tls") - strings fail to encode
+    console.log(`[ensureOutboundTrunkUsesTls] Calling updateSipOutboundTrunkFields with transport: 2`);
     await sip.updateSipOutboundTrunkFields(trunkId, {
       transport: 2, // Numeric enum: 2 = TLS
     });
     console.log(`[ensureOutboundTrunkUsesTls] Update call succeeded with transport=2`);
 
-    // Wait a moment for the change to propagate (LiveKit may need time to apply)
-    await new Promise((resolve) => setTimeout(resolve, 1000));
+    // Wait longer for the change to propagate (LiveKit may need time to apply)
+    console.log(`[ensureOutboundTrunkUsesTls] Waiting 3 seconds for change to propagate...`);
+    await new Promise((resolve) => setTimeout(resolve, 3000));
 
     // Verify the update worked (if we can retrieve trunk info)
+    console.log(`[ensureOutboundTrunkUsesTls] Verifying transport update...`);
     const updated = await getOutboundTrunkInfo(trunkId);
     if (updated) {
-      const newTransport = updated?.transport || "unknown";
+      const newTransport = updated?.transport ?? null;
+      console.log(`[ensureOutboundTrunkUsesTls] Verified transport after update: ${newTransport} (0=UDP, 1=TCP, 2=TLS)`);
       if (newTransport !== 2) {
-        console.error(`[ensureOutboundTrunkUsesTls] WARNING: Transport update may have failed. Expected 2 (TLS), got: ${newTransport}`);
-        throw new Error(`Transport update verification failed: expected 2, got ${newTransport}`);
+        const errorMsg = `Transport update verification failed: expected 2 (TLS), got ${newTransport} (${newTransport === 1 ? 'TCP' : newTransport === 0 ? 'UDP' : 'unknown'})`;
+        console.error(`[ensureOutboundTrunkUsesTls] WARNING: ${errorMsg}`);
+        throw new Error(errorMsg);
       } else {
-        console.log(`[ensureOutboundTrunkUsesTls] Successfully verified trunk ${trunkId} uses TLS transport (2)`);
+        console.log(`[ensureOutboundTrunkUsesTls] ✓ Successfully verified trunk ${trunkId} uses TLS transport (2)`);
       }
     } else {
       console.warn(`[ensureOutboundTrunkUsesTls] Cannot verify transport update - trunk info retrieval not available`);
@@ -209,6 +241,7 @@ module.exports = {
   createOutboundTrunkForWorkspace,
   ensureOutboundTrunkUsesTls,
   getOutboundTrunkInfo,
+  deleteOutboundTrunk,
 };
 
 

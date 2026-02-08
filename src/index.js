@@ -39,7 +39,7 @@ const {
 } = require("./storage");
 const { getPool, initSchema } = require("./db");
 const store = require("./store_pg");
-const { roomService, agentDispatchService, createParticipantToken, sipClient, addNumberToInboundTrunk, addNumberToOutboundTrunk, removeNumberFromInboundTrunk, removeNumberFromOutboundTrunk, createOutboundTrunkForWorkspace, ensureOutboundTrunkUsesTls } = require("./livekit");
+const { roomService, agentDispatchService, createParticipantToken, sipClient, addNumberToInboundTrunk, addNumberToOutboundTrunk, removeNumberFromInboundTrunk, removeNumberFromOutboundTrunk, createOutboundTrunkForWorkspace, ensureOutboundTrunkUsesTls, deleteOutboundTrunk, getOutboundTrunkInfo } = require("./livekit");
 const outboundWorker = require("./outbound_worker");
 const { startCallEgress, stopEgress, getEgressInfo } = require("./egress");
 const { getObject, headObject } = require("./s3");
@@ -2326,8 +2326,60 @@ app.post("/api/phone-numbers/:id/reprovision-outbound", requireAuth, async (req,
     }
 
     // 4) Create or reuse LiveKit outbound trunk.
+    // CRITICAL: Always check transport and force-recreate if it's TCP (1) instead of TLS (2).
     let lkTrunkId = ws.livekitOutboundTrunkId;
-    if (!lkTrunkId) {
+    let needsRecreate = false;
+    
+    if (lkTrunkId) {
+      // Check current transport - if it's TCP (1) or anything other than TLS (2), recreate
+      try {
+        const trunkInfo = await getOutboundTrunkInfo(lkTrunkId);
+        const currentTransport = trunkInfo?.transport ?? null;
+        console.log(`[reprovision-outbound] Current trunk ${lkTrunkId} transport: ${currentTransport} (0=UDP, 1=TCP, 2=TLS)`);
+        
+        if (currentTransport !== 2) {
+          // Transport is not TLS - need to recreate
+          console.log(`[reprovision-outbound] Trunk ${lkTrunkId} uses transport ${currentTransport} (${currentTransport === 1 ? 'TCP' : currentTransport === 0 ? 'UDP' : 'unknown'}), must be TLS (2). Recreating...`);
+          needsRecreate = true;
+        } else {
+          // Already TLS, but try updating anyway to ensure it's correct
+          console.log(`[reprovision-outbound] Trunk ${lkTrunkId} already reports TLS (2), but ensuring it's correct...`);
+          try {
+            await ensureOutboundTrunkUsesTls(lkTrunkId);
+            // Verify it's still TLS after update
+            const verifyInfo = await getOutboundTrunkInfo(lkTrunkId);
+            if (verifyInfo?.transport !== 2) {
+              console.warn(`[reprovision-outbound] Update didn't work - transport is still ${verifyInfo?.transport}. Recreating...`);
+              needsRecreate = true;
+            }
+          } catch (e) {
+            console.warn(`[reprovision-outbound] Failed to update trunk TLS: ${e?.message || e}. Recreating...`);
+            needsRecreate = true;
+          }
+        }
+      } catch (e) {
+        console.warn(`[reprovision-outbound] Could not check trunk ${lkTrunkId} state: ${e?.message || e}. Recreating...`);
+        needsRecreate = true;
+      }
+    }
+    
+    if (!lkTrunkId || needsRecreate) {
+      // Delete old trunk if recreating
+      if (needsRecreate && lkTrunkId) {
+        try {
+          console.log(`[reprovision-outbound] Deleting trunk ${lkTrunkId} before recreation`);
+          await deleteOutboundTrunk(lkTrunkId);
+          // Wait for deletion to propagate
+          await new Promise((resolve) => setTimeout(resolve, 2000));
+        } catch (e) {
+          console.warn(`[reprovision-outbound] Failed to delete old trunk (may not exist): ${e?.message || e}`);
+          // Continue anyway - recreation will create a new trunk
+        }
+        lkTrunkId = null; // Clear so we create a new one
+      }
+      
+      // Create new trunk with TLS from the start
+      console.log(`[reprovision-outbound] Creating new LiveKit outbound trunk with TLS transport (2)`);
       const result = await createOutboundTrunkForWorkspace({
         workspaceId: ws.id,
         twilioSipDomainName: domainName,
@@ -2336,13 +2388,22 @@ app.post("/api/phone-numbers/:id/reprovision-outbound", requireAuth, async (req,
         numbers: [phoneNumber.e164],
       });
       lkTrunkId = result.trunkId;
-    } else {
-      // Ensure existing trunk uses TLS transport (required for secure Twilio trunks)
+      console.log(`[reprovision-outbound] ✓ Created new trunk ${lkTrunkId} with TLS transport (2)`);
+      
+      // Verify the new trunk actually has TLS
       try {
-        await ensureOutboundTrunkUsesTls(lkTrunkId);
+        const verifyNew = await getOutboundTrunkInfo(lkTrunkId);
+        if (verifyNew?.transport !== 2) {
+          console.error(`[reprovision-outbound] WARNING: New trunk ${lkTrunkId} was created but transport is ${verifyNew?.transport} instead of 2 (TLS)!`);
+          provisionErrors.push(`New trunk created but transport verification failed: got ${verifyNew?.transport}, expected 2`);
+        } else {
+          console.log(`[reprovision-outbound] ✓ Verified new trunk ${lkTrunkId} uses TLS transport (2)`);
+        }
       } catch (e) {
-        provisionErrors.push(`Update trunk TLS: ${e?.message || e}`);
+        console.warn(`[reprovision-outbound] Could not verify new trunk transport: ${e?.message || e}`);
       }
+    } else {
+      // Trunk exists and is TLS - just ensure the number is added
       try {
         await addNumberToOutboundTrunk(lkTrunkId, phoneNumber.e164);
       } catch { /* may already be there */ }
