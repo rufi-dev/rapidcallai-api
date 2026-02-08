@@ -1103,9 +1103,12 @@ app.post("/api/internal/telephony/inbound/start", requireAgentSecret, async (req
 
   const agentId = phoneRow.inboundAgentId;
   if (!agentId) {
-    // eslint-disable-next-line no-console
-    console.log("[internal.telephony.inbound.start] inbound agent not configured", { to, phoneNumberId: phoneRow.id });
-    return res.status(400).json({ error: "Inbound agent not configured for this number" });
+    console.warn("[internal.telephony.inbound.start] Inbound agent not configured — set Inbound agent in Dashboard for this number to get voice.", { to, from, phoneNumberId: phoneRow.id, roomName: parsed.data.roomName });
+    return res.status(400).json({
+      error: "Inbound agent not configured for this number",
+      code: "INBOUND_AGENT_NOT_SET",
+      hint: "In the Dashboard, open this phone number and set 'Inbound agent' to your voice agent.",
+    });
   }
 
   const agent = await store.getAgent(phoneRow.workspaceId, agentId);
@@ -1155,6 +1158,7 @@ app.post("/api/internal/telephony/inbound/start", requireAgentSecret, async (req
   };
 
   await store.createCall(callRecord);
+  console.log("[internal.telephony.inbound.start] call created, agent will join", { callId, roomName: parsed.data.roomName, to, from, agentId: agent.id });
 
   // Start recording (egress) if configured.
   try {
@@ -2999,8 +3003,12 @@ app.post("/api/twilio/inbound", async (req, res) => {
     return;
   }
 
-  let dest = `${to}@${sipEndpoint}`;
-  if (!dest.startsWith("sip:")) dest = `sip:${dest}`;
+  // Use TLS transport so Twilio connects to LiveKit over TLS (matches outbound; avoids "TLS required" from LiveKit).
+  let dest = `sip:${to}@${sipEndpoint};transport=tls`;
+
+  if (!phoneRow.inboundAgentId) {
+    console.warn("[twilio-inbound] No inbound agent configured for this number — call will reach LiveKit but may have no voice. Set Inbound agent in Phone Numbers.", { to, from, phoneNumberId: phoneRow.id });
+  }
 
   console.log("[twilio-inbound] dial", {
     twilioCallSid,
@@ -3008,11 +3016,12 @@ app.post("/api/twilio/inbound", async (req, res) => {
     from,
     dest,
     hasAuth: Boolean(sipUser && sipPass),
+    inboundAgentId: phoneRow.inboundAgentId || null,
   });
 
-  const dial = vr.dial({ answerOnBridge: true });
-  // SIP auth is optional: it is recommended for Twilio Programmable Voice to prevent arbitrary calls hitting your SIP endpoint,
-  // but LiveKit inbound trunks can also work without auth when configured by allowed numbers/dispatch rules.
+  // timeout: seconds to wait for LiveKit to answer; default 30 so caller doesn't ring forever
+  const dial = vr.dial({ answerOnBridge: true, timeout: 30 });
+  // SIP auth is optional: LiveKit inbound trunks can work without auth when identified by number.
   const sipNode = sipUser && sipPass ? dial.sip({ username: sipUser, password: sipPass }, dest) : dial.sip(dest);
   // Propagate Twilio CallSid to the SIP endpoint so LiveKit can surface it as participant attributes (best-effort).
   // This helps us reconcile carrier billing later.

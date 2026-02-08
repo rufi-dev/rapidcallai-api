@@ -118,6 +118,19 @@ The Python agent posts metrics to:
 
 ```
 POST /api/calls/:callId/metrics
+```
+
+### Inbound calls (no answer / no voice)
+
+For inbound calls to work you need **both**:
+
+1. **Inbound agent set in Dashboard**  
+   In Phone Numbers, open the number and set **Inbound agent** to your voice agent. If this is not set, the call can reach LiveKit but the agent has no prompt and you get no voice.
+
+2. **LiveKit Cloud dispatch rule**  
+   In LiveKit Cloud → your project → SIP → Inbound → create a **dispatch rule** for your inbound trunk (room prefix e.g. `call-`) so that when a call arrives, LiveKit creates a room and dispatches your agent. Without this, Twilio may ring until timeout and never get answered.
+
+API logs to check: `[twilio-inbound] dial` (TwiML sent), `[internal.telephony.inbound.start]` (agent config requested). If you see `Inbound agent not configured`, set the Inbound agent on the number in the dashboard.
 
 ## Observability (recommended for production)
 
