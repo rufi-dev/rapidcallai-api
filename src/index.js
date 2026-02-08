@@ -1974,8 +1974,9 @@ app.post("/api/workspaces/:id/twilio/buy-number", requireAuth, async (req, res) 
           await addNumberToInboundTrunk(effectiveInboundTrunkId, purchased.phoneNumber);
           logger.info({ e164: purchased.phoneNumber, trunkId: effectiveInboundTrunkId }, "[buy-number] added to inbound trunk");
         } catch (e) {
-          const msg = String(e?.message || e);
-          if (isTrunkNotFoundError(e) || e?.code === "TRUNK_NOT_FOUND") {
+          const msg = String(e?.message ?? e?.error ?? e ?? "").toLowerCase();
+          const isTrunkMissing = isTrunkNotFoundError(e) || e?.code === "TRUNK_NOT_FOUND" || msg.includes("object cannot be found") || (msg.includes("twirp") && msg.includes("not found"));
+          if (isTrunkMissing) {
             // Inbound trunk no longer exists — create a new one
             logger.warn({ workspaceId: ws.id, e164: purchased.phoneNumber, oldTrunkId: effectiveInboundTrunkId }, "[buy-number] inbound trunk not found in LiveKit, creating new one");
             try {
@@ -2707,10 +2708,12 @@ app.post("/api/phone-numbers/:id/reprovision-outbound", requireAuth, async (req,
         await addNumberToInboundTrunk(effectiveInboundTrunkId, phoneNumber.e164);
         console.log(`[reprovision-outbound] ✓ Added ${phoneNumber.e164} to inbound trunk ${effectiveInboundTrunkId}`);
       } catch (e) {
-        const msg = String(e?.message || e);
-        if (msg.includes("already") || msg.includes("duplicate")) {
+        const msg = String(e?.message ?? e?.error ?? e ?? "").toLowerCase();
+        const isAlready = msg.includes("already") || msg.includes("duplicate");
+        const isTrunkMissing = isTrunkNotFoundError(e) || e?.code === "TRUNK_NOT_FOUND" || msg.includes("object cannot be found") || (msg.includes("twirp") && msg.includes("not found"));
+        if (isAlready) {
           // Number already on trunk — ok
-        } else if (isTrunkNotFoundError(e) || e?.code === "TRUNK_NOT_FOUND") {
+        } else if (isTrunkMissing) {
           // Inbound trunk no longer exists in LiveKit — create a new one
           console.warn(`[reprovision-outbound] Inbound trunk ${effectiveInboundTrunkId} not found in LiveKit, creating new one`);
           effectiveInboundTrunkId = null;
@@ -2726,8 +2729,8 @@ app.post("/api/phone-numbers/:id/reprovision-outbound", requireAuth, async (req,
             provisionErrors.push(`Inbound trunk creation: ${createErr?.message || createErr}`);
           }
         } else {
-          console.warn(`[reprovision-outbound] Failed to add number to inbound trunk: ${msg}`);
-          provisionErrors.push(`Inbound trunk: ${msg}`);
+          console.warn(`[reprovision-outbound] Failed to add number to inbound trunk: ${e?.message || e}`);
+          provisionErrors.push(`Inbound trunk: ${e?.message || e}`);
         }
       }
     }
@@ -2748,7 +2751,7 @@ app.post("/api/phone-numbers/:id/reprovision-outbound", requireAuth, async (req,
       }
     }
 
-    // 7) Persist.
+    // 7) Persist. Clear stale inbound trunk ID when we recreated (or failed to create) so next run doesn't retry old ID.
     const updateData = {
       twilioSipTrunkSid: trunkSid,
       twilioSipDomainName: domainName,
@@ -2758,6 +2761,8 @@ app.post("/api/phone-numbers/:id/reprovision-outbound", requireAuth, async (req,
     };
     if (effectiveInboundTrunkId) {
       updateData.livekitInboundTrunkId = effectiveInboundTrunkId;
+    } else {
+      await getPool().query("UPDATE workspaces SET livekit_inbound_trunk_id = NULL WHERE id = $1", [ws.id]);
     }
     await store.updateWorkspace(ws.id, updateData);
 
