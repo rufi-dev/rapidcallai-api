@@ -414,7 +414,7 @@ async function associateNumberWithSipTrunk({ subaccountSid, trunkSid, numberSid 
  * @param {Object} opts
  * @param {string} opts.subaccountSid - Twilio subaccount SID
  * @param {string} opts.trunkSid - Twilio SIP trunk SID
- * @param {string[]} opts.ipAddresses - Array of IP addresses to whitelist (e.g., ["143.223.92.68", "168.86.137.235"])
+ * @param {string[]} opts.ipAddresses - Array of IP addresses or CIDR ranges to whitelist (e.g., ["143.223.92.0/24", "168.86.137.0/24"] or ["143.223.92.68", "168.86.137.235"])
  */
 async function ensureSipTrunkIpAcl({ subaccountSid, trunkSid, ipAddresses }) {
   if (!subaccountSid) throw new Error("Workspace has no Twilio subaccount yet");
@@ -477,31 +477,45 @@ async function ensureSipTrunkIpAcl({ subaccountSid, trunkSid, ipAddresses }) {
     }
   }
 
-  // Add IP addresses to the ACL
+  // Add IP addresses or CIDR ranges to the ACL
   const existingIps = await client.trunking.v1.ipAccessControlLists(ipAclList.sid).ipAddresses.list({ limit: 100 });
   const existingIpSet = new Set(existingIps.map((ip) => ip.ipAddress));
 
   let addedCount = 0;
-  for (const ip of ipAddresses) {
-    // Validate IP format (basic check)
-    if (!/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(ip)) {
-      console.warn(`[ensureSipTrunkIpAcl] Skipping invalid IP: ${ip}`);
+  for (const ipOrRange of ipAddresses) {
+    // Validate IP format: individual IP (x.x.x.x) or CIDR range (x.x.x.x/prefix)
+    const isCidr = /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\/\d{1,2}$/.test(ipOrRange);
+    const isSingleIp = /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(ipOrRange);
+    
+    if (!isCidr && !isSingleIp) {
+      console.warn(`[ensureSipTrunkIpAcl] Skipping invalid IP/CIDR: ${ipOrRange}`);
       continue;
     }
 
-    if (!existingIpSet.has(ip)) {
+    // Check if already exists (for single IPs, check exact match; for CIDR, check if same CIDR exists)
+    const alreadyExists = isCidr 
+      ? existingIps.some((ip) => {
+          // Check if this CIDR range already exists (compare normalized CIDR)
+          const existingCidr = ip.ipAddress.includes('/') ? ip.ipAddress : `${ip.ipAddress}/32`;
+          return existingCidr === ipOrRange;
+        })
+      : existingIpSet.has(ipOrRange);
+
+    if (!alreadyExists) {
       try {
+        // Twilio API accepts CIDR notation directly in ipAddress field
+        // Format: "x.x.x.x/prefix" or "x.x.x.x" for single IP
         await client.trunking.v1.ipAccessControlLists(ipAclList.sid).ipAddresses.create({
-          friendlyName: `LiveKit SIP ${ip}`,
-          ipAddress: ip,
+          friendlyName: `LiveKit SIP ${ipOrRange}`,
+          ipAddress: ipOrRange, // Twilio accepts CIDR notation directly
         });
         addedCount++;
-        console.log(`[ensureSipTrunkIpAcl] Added IP ${ip} to ACL ${ipAclList.sid}`);
+        console.log(`[ensureSipTrunkIpAcl] Added ${isCidr ? 'CIDR range' : 'IP'} ${ipOrRange} to ACL ${ipAclList.sid}`);
       } catch (e) {
-        console.warn(`[ensureSipTrunkIpAcl] Failed to add IP ${ip}: ${e?.message || e}`);
+        console.warn(`[ensureSipTrunkIpAcl] Failed to add ${isCidr ? 'CIDR range' : 'IP'} ${ipOrRange}: ${e?.message || e}`);
       }
     } else {
-      console.log(`[ensureSipTrunkIpAcl] IP ${ip} already in ACL`);
+      console.log(`[ensureSipTrunkIpAcl] ${isCidr ? 'CIDR range' : 'IP'} ${ipOrRange} already in ACL`);
     }
   }
 
