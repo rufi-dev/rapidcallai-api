@@ -1102,12 +1102,49 @@ app.post("/api/internal/telephony/inbound/start", requireAgentSecret, async (req
   }
 
   const agentId = phoneRow.inboundAgentId;
+  const callId = `call_${nanoid(12)}`;
+  const now = Date.now();
+
+  // Fallback when no inbound agent is set: return 201 with a prompt so the agent speaks and user hears something.
   if (!agentId) {
-    console.warn("[internal.telephony.inbound.start] Inbound agent not configured — set Inbound agent in Dashboard for this number to get voice.", { to, from, phoneNumberId: phoneRow.id, roomName: parsed.data.roomName });
-    return res.status(400).json({
-      error: "Inbound agent not configured for this number",
-      code: "INBOUND_AGENT_NOT_SET",
-      hint: "In the Dashboard, open this phone number and set 'Inbound agent' to your voice agent.",
+    console.warn("[internal.telephony.inbound.start] Inbound agent not configured — returning fallback prompt so agent speaks.", { to, from, phoneNumberId: phoneRow.id, roomName: parsed.data.roomName });
+    const fallbackPrompt = "You are a voice assistant. The number you were called on does not have an inbound agent configured. Say exactly once: This number is not configured for inbound calls. Please set the Inbound agent for this phone number in the dashboard.";
+    const callRecord = {
+      id: callId,
+      workspaceId: phoneRow.workspaceId,
+      agentId: null,
+      agentName: "System",
+      to: from || "unknown",
+      roomName: parsed.data.roomName,
+      startedAt: now,
+      endedAt: null,
+      durationSec: null,
+      outcome: "in_progress",
+      costUsd: null,
+      transcript: [],
+      recording: null,
+      metrics: {
+        normalized: { source: "telephony", fallback: true },
+        telephony: {
+          trunkNumber: to,
+          callerNumber: from || "",
+          twilioCallSid: twilioCallSid || undefined,
+        },
+      },
+      createdAt: now,
+      updatedAt: now,
+    };
+    await store.createCall(callRecord);
+    return res.status(201).json({
+      callId,
+      agent: { id: null, name: "System" },
+      prompt: fallbackPrompt,
+      welcome: {},
+      voice: {},
+      llmModel: "",
+      maxCallSeconds: 60,
+      knowledgeFolderIds: [],
+      phoneNumber: { id: phoneRow.id, e164: phoneRow.e164 },
     });
   }
 
@@ -1127,8 +1164,6 @@ app.post("/api/internal/telephony/inbound/start", requireAgentSecret, async (req
     return res.status(400).json({ error: "Agent prompt is empty" });
   }
 
-  const callId = `call_${nanoid(12)}`;
-  const now = Date.now();
   callsStartedTotal.inc({ source: "telephony" });
   inProgressCallsGaugeValue += 1;
   const callRecord = {

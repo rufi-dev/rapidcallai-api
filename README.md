@@ -122,15 +122,21 @@ POST /api/calls/:callId/metrics
 
 ### Inbound calls (no answer / no voice)
 
-For inbound calls to work you need **both**:
+For inbound calls to work you need:
 
-1. **Inbound agent set in Dashboard**  
-   In Phone Numbers, open the number and set **Inbound agent** to your voice agent. If this is not set, the call can reach LiveKit but the agent has no prompt and you get no voice.
-
-2. **LiveKit Cloud dispatch rule**  
+1. **LiveKit Cloud dispatch rule**  
    In LiveKit Cloud → your project → SIP → Inbound → create a **dispatch rule** for your inbound trunk (room prefix e.g. `call-`) so that when a call arrives, LiveKit creates a room and dispatches your agent. Without this, Twilio may ring until timeout and never get answered.
 
-API logs to check: `[twilio-inbound] dial` (TwiML sent), `[internal.telephony.inbound.start]` (agent config requested). If you see `Inbound agent not configured`, set the Inbound agent on the number in the dashboard.
+2. **Agent env so it can reach the API and get dispatched**  
+   The Python agent must have:
+   - `SERVER_BASE_URL` (or `PUBLIC_API_BASE_URL`) = your API base URL (e.g. `https://api.rapidcall.ai`)
+   - `AGENT_SHARED_SECRET` = same value as on the API (required for `/api/internal/telephony/inbound/start`)
+   - `LIVEKIT_AGENT_NAME=VoiceAgent` (or whatever name your dispatch rule uses under “Agents”) so LiveKit dispatches this agent to the room.
+
+3. **Inbound agent set in Dashboard (recommended)**  
+   In Phone Numbers, open the number and set **Inbound agent** to your voice agent. If this is not set, the API returns a fallback prompt and the agent will say “This number is not configured for inbound calls…”; set it to get your real agent prompt and voice.
+
+API logs to check: `[twilio-inbound] dial` (TwiML sent), `[internal.telephony.inbound.start]` (agent config requested). If you hear the fallback message, set the Inbound agent on the number in the dashboard.
 
 ## Observability (recommended for production)
 
