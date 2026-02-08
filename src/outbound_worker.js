@@ -9,7 +9,7 @@ if (require.main === module) {
 const { nanoid } = require("./id");
 const { logger } = require("./logger");
 const store = require("./store_pg");
-const { roomService, agentDispatchService, sipClient, addNumberToOutboundTrunk, createOutboundTrunkForWorkspace, ensureOutboundTrunkUsesTls } = require("./livekit");
+const { roomService, agentDispatchService, sipClient, addNumberToOutboundTrunk, createOutboundTrunkForWorkspace, ensureOutboundTrunkUsesTls, ensureOutboundTrunkTransport } = require("./livekit");
 const tw = require("./twilio");
 
 const USE_DB = Boolean(process.env.DATABASE_URL);
@@ -40,12 +40,13 @@ async function ensureWorkspaceOutboundTrunk(workspace, phoneRow) {
 
   // 1) Ensure Twilio SIP trunk on the subaccount.
   logger.info({ wsId, subSid, existingTrunkSid: workspace.twilioSipTrunkSid }, "[outbound] step 1: ensuring Twilio SIP trunk");
-  const { trunkSid, domainName } = await tw.ensureSipTrunk({
+  const { trunkSid, domainName, secure } = await tw.ensureSipTrunk({
     subaccountSid: subSid,
     existingTrunkSid: workspace.twilioSipTrunkSid,
     workspaceId: wsId,
   });
-  logger.info({ wsId, trunkSid, domainName }, "[outbound] step 1 done: Twilio SIP trunk ready");
+  const isSecure = Boolean(secure);
+  logger.info({ wsId, trunkSid, domainName, secure: isSecure }, "[outbound] step 1 done: Twilio SIP trunk ready");
 
   // 2) Ensure termination credentials.
   logger.info({ wsId, trunkSid, hasExistingCreds: Boolean(workspace.twilioSipCredUsername) }, "[outbound] step 2: ensuring SIP credentials");
@@ -78,8 +79,8 @@ async function ensureWorkspaceOutboundTrunk(workspace, phoneRow) {
   const sipEndpoint = String(process.env.LIVEKIT_SIP_ENDPOINT || "").trim();
   if (sipEndpoint) {
     try {
-      await tw.ensureSipTrunkOriginationUri({ subaccountSid: subSid, trunkSid, sipEndpoint });
-      logger.info({ wsId, trunkSid, sipEndpoint }, "[outbound] step 3b done: origination URI ensured");
+      await tw.ensureSipTrunkOriginationUri({ subaccountSid: subSid, trunkSid, sipEndpoint, secure: isSecure });
+      logger.info({ wsId, trunkSid, sipEndpoint, secure: isSecure }, "[outbound] step 3b done: origination URI ensured");
     } catch (e) {
       logger.warn({ err: String(e?.message || e) }, "[outbound] step 3b: origination URI failed (best-effort)");
     }
@@ -88,30 +89,31 @@ async function ensureWorkspaceOutboundTrunk(workspace, phoneRow) {
   // 4) Create or reuse LiveKit outbound trunk.
   let lkTrunkId = workspace.livekitOutboundTrunkId;
   if (!lkTrunkId) {
-    logger.info({ wsId, domainName, e164: phoneRow.e164 }, "[outbound] step 4: creating LiveKit outbound trunk");
+    logger.info({ wsId, domainName, e164: phoneRow.e164, secure: isSecure }, "[outbound] step 4: creating LiveKit outbound trunk");
     const result = await createOutboundTrunkForWorkspace({
       workspaceId: wsId,
       twilioSipDomainName: domainName,
       credUsername,
       credPassword,
       numbers: [phoneRow.e164],
+      secure: isSecure,
     });
     lkTrunkId = result.trunkId;
-    // Explicitly ensure TLS is set (createOutboundTrunkForWorkspace should set it, but double-check)
+    // Explicitly ensure transport is correct (createOutboundTrunkForWorkspace should set it, but double-check)
     try {
-      await ensureOutboundTrunkUsesTls(lkTrunkId);
-      logger.info({ wsId, lkTrunkId }, "[outbound] step 4a: ensured TLS transport on new trunk");
+      await ensureOutboundTrunkTransport(lkTrunkId, isSecure);
+      logger.info({ wsId, lkTrunkId, secure: isSecure }, "[outbound] step 4a: ensured transport on new trunk");
     } catch (e) {
-      logger.warn({ wsId, lkTrunkId, err: String(e?.message || e) }, "[outbound] step 4a: failed to ensure TLS on new trunk (best-effort)");
+      logger.warn({ wsId, lkTrunkId, err: String(e?.message || e) }, "[outbound] step 4a: failed to ensure transport on new trunk (best-effort)");
     }
-    logger.info({ wsId, lkTrunkId, domainName }, "[outbound] step 4 done: LiveKit outbound trunk created with TLS");
+    logger.info({ wsId, lkTrunkId, domainName, secure: isSecure }, "[outbound] step 4 done: LiveKit outbound trunk created");
   } else {
-    // Ensure existing trunk uses TLS transport (required for secure Twilio trunks)
+    // Ensure existing trunk uses correct transport
     try {
-      await ensureOutboundTrunkUsesTls(lkTrunkId);
-      logger.info({ wsId, lkTrunkId }, "[outbound] step 4a: ensured TLS transport on existing trunk");
+      await ensureOutboundTrunkTransport(lkTrunkId, isSecure);
+      logger.info({ wsId, lkTrunkId, secure: isSecure }, "[outbound] step 4a: ensured transport on existing trunk");
     } catch (e) {
-      logger.warn({ wsId, lkTrunkId, err: String(e?.message || e) }, "[outbound] step 4a: failed to update trunk TLS (best-effort)");
+      logger.warn({ wsId, lkTrunkId, err: String(e?.message || e) }, "[outbound] step 4a: failed to update trunk transport (best-effort)");
     }
     // Ensure the number is on the existing trunk.
     logger.info({ wsId, lkTrunkId, e164: phoneRow.e164 }, "[outbound] step 4: adding number to existing LiveKit outbound trunk");
@@ -287,12 +289,23 @@ async function handleJob(workspace, job) {
     return;
   }
 
-  // Safety check: ensure TLS is set on the trunk before dialing (required for secure Twilio trunks)
+  // Safety check: ensure correct transport is set on the trunk before dialing
+  // Fetch secure status from Twilio trunk to determine correct transport
   try {
-    await ensureOutboundTrunkUsesTls(trunkId);
-    logger.info({ workspaceId, trunkId, jobId: job.id }, "[outbound] ensured TLS transport before dialing");
+    let isSecure = false;
+    if (workspace.twilioSipTrunkSid && workspace.twilioSubaccountSid) {
+      try {
+        const client = await tw.getSubaccountDirectClient(workspace.twilioSubaccountSid);
+        const trunk = await client.trunking.v1.trunks(workspace.twilioSipTrunkSid).fetch();
+        isSecure = Boolean(trunk.secure);
+      } catch (e) {
+        logger.warn({ workspaceId, err: String(e?.message || e) }, "[outbound] failed to fetch trunk secure status, defaulting to non-secure");
+      }
+    }
+    await ensureOutboundTrunkTransport(trunkId, isSecure);
+    logger.info({ workspaceId, trunkId, jobId: job.id, secure: isSecure }, "[outbound] ensured transport before dialing");
   } catch (e) {
-    logger.warn({ workspaceId, trunkId, jobId: job.id, err: String(e?.message || e) }, "[outbound] failed to ensure TLS before dialing (best-effort, may fail)");
+    logger.warn({ workspaceId, trunkId, jobId: job.id, err: String(e?.message || e) }, "[outbound] failed to ensure transport before dialing (best-effort, may fail)");
   }
 
   const roomName = job.roomName || `out-${job.id}`;

@@ -39,7 +39,7 @@ const {
 } = require("./storage");
 const { getPool, initSchema } = require("./db");
 const store = require("./store_pg");
-const { roomService, agentDispatchService, createParticipantToken, sipClient, addNumberToInboundTrunk, addNumberToOutboundTrunk, removeNumberFromInboundTrunk, removeNumberFromOutboundTrunk, createOutboundTrunkForWorkspace, ensureOutboundTrunkUsesTls, deleteOutboundTrunk, getOutboundTrunkInfo } = require("./livekit");
+const { roomService, agentDispatchService, createParticipantToken, sipClient, addNumberToInboundTrunk, addNumberToOutboundTrunk, removeNumberFromInboundTrunk, removeNumberFromOutboundTrunk, createOutboundTrunkForWorkspace, ensureOutboundTrunkUsesTls, ensureOutboundTrunkTransport, deleteOutboundTrunk, getOutboundTrunkInfo } = require("./livekit");
 const outboundWorker = require("./outbound_worker");
 const { startCallEgress, stopEgress, getEgressInfo } = require("./egress");
 const { getObject, headObject } = require("./s3");
@@ -1928,12 +1928,13 @@ app.post("/api/workspaces/:id/twilio/buy-number", requireAuth, async (req, res) 
       let effectiveOutboundTrunkId = ws.livekitOutboundTrunkId || outboundTrunkId;
       try {
         // 3a) Ensure a Twilio Elastic SIP Trunk exists on the subaccount.
-        const { trunkSid, domainName } = await tw.ensureSipTrunk({
+        const { trunkSid, domainName, secure } = await tw.ensureSipTrunk({
           subaccountSid: ws.twilioSubaccountSid,
           existingTrunkSid: ws.twilioSipTrunkSid,
           workspaceId: ws.id,
         });
-        logger.info({ trunkSid, domainName }, "[buy-number] Twilio SIP trunk ensured");
+        const isSecure = Boolean(secure);
+        logger.info({ trunkSid, domainName, secure: isSecure }, "[buy-number] Twilio SIP trunk ensured");
 
         // 3b) Ensure termination credentials exist on the trunk.
         const { credUsername, credPassword } = await tw.ensureSipTrunkTerminationCreds({
@@ -1966,9 +1967,10 @@ app.post("/api/workspaces/:id/twilio/buy-number", requireAuth, async (req, res) 
             subaccountSid: ws.twilioSubaccountSid,
             trunkSid,
             sipEndpoint,
+            secure: isSecure,
           });
           if (origResult.created) {
-            logger.info({ trunkSid, sipEndpoint }, "[buy-number] origination URI added to Twilio trunk");
+            logger.info({ trunkSid, sipEndpoint, secure: isSecure }, "[buy-number] origination URI added to Twilio trunk");
           }
         } catch (origErr) {
           const msg = String(origErr?.message || origErr);
@@ -1984,22 +1986,23 @@ app.post("/api/workspaces/:id/twilio/buy-number", requireAuth, async (req, res) 
             credUsername,
             credPassword,
             numbers: [purchased.phoneNumber],
+            secure: isSecure,
           });
           effectiveOutboundTrunkId = lkTrunkId;
-          // Explicitly ensure TLS is set (createOutboundTrunkForWorkspace should set it, but double-check)
+          // Explicitly ensure transport is correct (createOutboundTrunkForWorkspace should set it, but double-check)
           try {
-            await ensureOutboundTrunkUsesTls(lkTrunkId);
+            await ensureOutboundTrunkTransport(lkTrunkId, isSecure);
           } catch (e) {
-            logger.warn({ trunkId: lkTrunkId, err: String(e?.message || e) }, "[buy-number] failed to ensure TLS on new trunk (best-effort)");
+            logger.warn({ trunkId: lkTrunkId, err: String(e?.message || e) }, "[buy-number] failed to ensure transport on new trunk (best-effort)");
           }
-          logger.info({ lkTrunkId, domainName }, "[buy-number] LiveKit outbound trunk created with TLS");
+          logger.info({ lkTrunkId, domainName, secure: isSecure }, "[buy-number] LiveKit outbound trunk created");
         } else {
-          // Trunk already exists — ensure TLS and add the number to it.
+          // Trunk already exists — ensure correct transport and add the number to it.
           effectiveOutboundTrunkId = ws.livekitOutboundTrunkId;
           try {
-            await ensureOutboundTrunkUsesTls(effectiveOutboundTrunkId);
+            await ensureOutboundTrunkTransport(effectiveOutboundTrunkId, isSecure);
           } catch (e) {
-            logger.warn({ trunkId: effectiveOutboundTrunkId, err: String(e?.message || e) }, "[buy-number] failed to update trunk TLS (best-effort)");
+            logger.warn({ trunkId: effectiveOutboundTrunkId, err: String(e?.message || e) }, "[buy-number] failed to update trunk transport (best-effort)");
           }
           await addNumberToOutboundTrunk(effectiveOutboundTrunkId, purchased.phoneNumber);
           logger.info({ e164: purchased.phoneNumber, trunkId: effectiveOutboundTrunkId }, "[buy-number] added to existing LiveKit outbound trunk");
@@ -2284,76 +2287,80 @@ app.post("/api/phone-numbers/:id/reprovision-outbound", requireAuth, async (req,
   const sipEndpoint = String(process.env.LIVEKIT_SIP_ENDPOINT || "").trim();
   const provisionErrors = [];
   try {
-    // 1) Ensure Twilio SIP trunk (with secure trunking + call transfer).
-    const { trunkSid, domainName } = await tw.ensureSipTrunk({
-      subaccountSid: ws.twilioSubaccountSid,
-      existingTrunkSid: ws.twilioSipTrunkSid,
-      workspaceId: ws.id,
-    });
+      // 1) Ensure Twilio SIP trunk (with secure trunking + call transfer).
+      const { trunkSid, domainName, secure } = await tw.ensureSipTrunk({
+        subaccountSid: ws.twilioSubaccountSid,
+        existingTrunkSid: ws.twilioSipTrunkSid,
+        workspaceId: ws.id,
+      });
+      const isSecure = Boolean(secure);
 
-    // 2) Ensure termination credentials.
-    const { credUsername, credPassword } = await tw.ensureSipTrunkTerminationCreds({
-      subaccountSid: ws.twilioSubaccountSid,
-      trunkSid,
-      existingUsername: ws.twilioSipCredUsername,
-      existingPassword: ws.twilioSipCredPassword,
-    });
-
-    // 3) Associate the phone number with the Twilio trunk.
-    try {
-      await tw.associateNumberWithSipTrunk({
+      // 2) Ensure termination credentials.
+      const { credUsername, credPassword } = await tw.ensureSipTrunkTerminationCreds({
         subaccountSid: ws.twilioSubaccountSid,
         trunkSid,
-        numberSid: phoneNumber.twilioNumberSid,
+        existingUsername: ws.twilioSipCredUsername,
+        existingPassword: ws.twilioSipCredPassword,
       });
-    } catch (e) {
-      if (!String(e?.message || "").includes("already associated")) {
-        provisionErrors.push(`Associate number: ${e?.message || e}`);
-      }
-    }
 
-    // 3b) Ensure Origination URI → LiveKit SIP endpoint (required for inbound calls).
-    if (sipEndpoint) {
+      // 3) Associate the phone number with the Twilio trunk.
       try {
-        await tw.ensureSipTrunkOriginationUri({
+        await tw.associateNumberWithSipTrunk({
           subaccountSid: ws.twilioSubaccountSid,
           trunkSid,
-          sipEndpoint,
+          numberSid: phoneNumber.twilioNumberSid,
         });
       } catch (e) {
-        provisionErrors.push(`Origination URI: ${e?.message || e}`);
+        if (!String(e?.message || "").includes("already associated")) {
+          provisionErrors.push(`Associate number: ${e?.message || e}`);
+        }
       }
-    }
+
+      // 3b) Ensure Origination URI → LiveKit SIP endpoint (required for inbound calls).
+      if (sipEndpoint) {
+        try {
+          await tw.ensureSipTrunkOriginationUri({
+            subaccountSid: ws.twilioSubaccountSid,
+            trunkSid,
+            sipEndpoint,
+            secure: isSecure,
+          });
+        } catch (e) {
+          provisionErrors.push(`Origination URI: ${e?.message || e}`);
+        }
+      }
 
     // 4) Create or reuse LiveKit outbound trunk.
-    // CRITICAL: Always check transport and force-recreate if it's TCP (1) instead of TLS (2).
+    // CRITICAL: Check transport and match it to Twilio secure trunking setting.
+    const targetTransport = isSecure ? 2 : 1; // TLS (2) if secure, TCP (1) if not
+    const targetName = isSecure ? 'TLS' : 'TCP';
     let lkTrunkId = ws.livekitOutboundTrunkId;
     let needsRecreate = false;
     
     if (lkTrunkId) {
-      // Check current transport - if it's TCP (1) or anything other than TLS (2), recreate
+      // Check current transport - if it doesn't match the target, recreate
       try {
         const trunkInfo = await getOutboundTrunkInfo(lkTrunkId);
         const currentTransport = trunkInfo?.transport ?? null;
-        console.log(`[reprovision-outbound] Current trunk ${lkTrunkId} transport: ${currentTransport} (0=UDP, 1=TCP, 2=TLS)`);
+        console.log(`[reprovision-outbound] Current trunk ${lkTrunkId} transport: ${currentTransport} (0=UDP, 1=TCP, 2=TLS), target: ${targetTransport} (${targetName}), secure: ${isSecure}`);
         
-        if (currentTransport !== 2) {
-          // Transport is not TLS - need to recreate
-          console.log(`[reprovision-outbound] Trunk ${lkTrunkId} uses transport ${currentTransport} (${currentTransport === 1 ? 'TCP' : currentTransport === 0 ? 'UDP' : 'unknown'}), must be TLS (2). Recreating...`);
+        if (currentTransport !== targetTransport) {
+          // Transport doesn't match - need to recreate
+          console.log(`[reprovision-outbound] Trunk ${lkTrunkId} uses transport ${currentTransport} (${currentTransport === 1 ? 'TCP' : currentTransport === 0 ? 'UDP' : currentTransport === 2 ? 'TLS' : 'unknown'}), must be ${targetName} (${targetTransport}). Recreating...`);
           needsRecreate = true;
         } else {
-          // Already TLS, but try updating anyway to ensure it's correct
-          console.log(`[reprovision-outbound] Trunk ${lkTrunkId} already reports TLS (2), but ensuring it's correct...`);
+          // Already correct transport, but try updating anyway to ensure it's correct
+          console.log(`[reprovision-outbound] Trunk ${lkTrunkId} already reports ${targetName} (${targetTransport}), but ensuring it's correct...`);
           try {
-            await ensureOutboundTrunkUsesTls(lkTrunkId);
-            // Verify it's still TLS after update
+            await ensureOutboundTrunkTransport(lkTrunkId, isSecure);
+            // Verify it's still correct after update
             const verifyInfo = await getOutboundTrunkInfo(lkTrunkId);
-            if (verifyInfo?.transport !== 2) {
+            if (verifyInfo?.transport !== targetTransport) {
               console.warn(`[reprovision-outbound] Update didn't work - transport is still ${verifyInfo?.transport}. Recreating...`);
               needsRecreate = true;
             }
           } catch (e) {
-            console.warn(`[reprovision-outbound] Failed to update trunk TLS: ${e?.message || e}. Recreating...`);
+            console.warn(`[reprovision-outbound] Failed to update trunk transport: ${e?.message || e}. Recreating...`);
             needsRecreate = true;
           }
         }
@@ -2378,32 +2385,33 @@ app.post("/api/phone-numbers/:id/reprovision-outbound", requireAuth, async (req,
         lkTrunkId = null; // Clear so we create a new one
       }
       
-      // Create new trunk with TLS from the start
-      console.log(`[reprovision-outbound] Creating new LiveKit outbound trunk with TLS transport (2)`);
+      // Create new trunk with correct transport
+      console.log(`[reprovision-outbound] Creating new LiveKit outbound trunk with ${targetName} transport (${targetTransport}), secure: ${isSecure}`);
       const result = await createOutboundTrunkForWorkspace({
         workspaceId: ws.id,
         twilioSipDomainName: domainName,
         credUsername,
         credPassword,
         numbers: [phoneNumber.e164],
+        secure: isSecure,
       });
       lkTrunkId = result.trunkId;
-      console.log(`[reprovision-outbound] ✓ Created new trunk ${lkTrunkId} with TLS transport (2)`);
+      console.log(`[reprovision-outbound] ✓ Created new trunk ${lkTrunkId} with ${targetName} transport (${targetTransport})`);
       
-      // Verify the new trunk actually has TLS
+      // Verify the new trunk actually has the correct transport
       try {
         const verifyNew = await getOutboundTrunkInfo(lkTrunkId);
-        if (verifyNew?.transport !== 2) {
-          console.error(`[reprovision-outbound] WARNING: New trunk ${lkTrunkId} was created but transport is ${verifyNew?.transport} instead of 2 (TLS)!`);
-          provisionErrors.push(`New trunk created but transport verification failed: got ${verifyNew?.transport}, expected 2`);
+        if (verifyNew?.transport !== targetTransport) {
+          console.error(`[reprovision-outbound] WARNING: New trunk ${lkTrunkId} was created but transport is ${verifyNew?.transport} instead of ${targetTransport} (${targetName})!`);
+          provisionErrors.push(`New trunk created but transport verification failed: got ${verifyNew?.transport}, expected ${targetTransport}`);
         } else {
-          console.log(`[reprovision-outbound] ✓ Verified new trunk ${lkTrunkId} uses TLS transport (2)`);
+          console.log(`[reprovision-outbound] ✓ Verified new trunk ${lkTrunkId} uses ${targetName} transport (${targetTransport})`);
         }
       } catch (e) {
         console.warn(`[reprovision-outbound] Could not verify new trunk transport: ${e?.message || e}`);
       }
     } else {
-      // Trunk exists and is TLS - just ensure the number is added
+      // Trunk exists and has correct transport - just ensure the number is added
       try {
         await addNumberToOutboundTrunk(lkTrunkId, phoneNumber.e164);
       } catch { /* may already be there */ }

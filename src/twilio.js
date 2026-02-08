@@ -149,12 +149,12 @@ async function ensureSipTrunk({ subaccountSid, existingTrunkSid, workspaceId }) 
     try {
       const trunk = await client.trunking.v1.trunks(existingTrunkSid).fetch();
 
-      // Ensure secure trunking + call transfer are enabled on existing trunk.
-      const needsUpdate = !trunk.secure || trunk.transferMode !== "enable-all";
+      // Don't force enable secure trunking - respect user's choice
+      // Only ensure call transfer is enabled
+      const needsUpdate = trunk.transferMode !== "enable-all";
       if (needsUpdate) {
         try {
           await client.trunking.v1.trunks(existingTrunkSid).update({
-            secure: true,
             transferMode: "enable-all",
           });
         } catch {
@@ -165,6 +165,7 @@ async function ensureSipTrunk({ subaccountSid, existingTrunkSid, workspaceId }) 
       return {
         trunkSid: trunk.sid,
         domainName: trunk.domainName || null,
+        secure: Boolean(trunk.secure), // Return actual secure status
       };
     } catch {
       // Trunk may have been deleted or was on the wrong account; fall through to create a new one.
@@ -175,11 +176,12 @@ async function ensureSipTrunk({ subaccountSid, existingTrunkSid, workspaceId }) 
   const slug = `rc-${(workspaceId || "ws").replace(/[^a-z0-9]/gi, "").slice(0, 16)}-${Date.now().toString(36)}`;
   const domainName = `${slug}.pstn.twilio.com`;
 
+  // Default to secure: false (user can enable it manually in Twilio console)
   const trunk = await client.trunking.v1.trunks.create({
     friendlyName: `RapidCall AI (${workspaceId || "default"})`,
     domainName,
-    // Secure Trunking: SRTP for media + TLS for signaling.
-    secure: true,
+    // Secure Trunking: disabled by default (user can enable in Twilio console)
+    secure: false,
     // Call Transfer: enable SIP REFER so agents can do cold/warm transfers.
     transferMode: "enable-all",
   });
@@ -187,6 +189,7 @@ async function ensureSipTrunk({ subaccountSid, existingTrunkSid, workspaceId }) 
   return {
     trunkSid: trunk.sid,
     domainName: trunk.domainName,
+    secure: Boolean(trunk.secure),
   };
 }
 
@@ -197,20 +200,21 @@ async function ensureSipTrunk({ subaccountSid, existingTrunkSid, workspaceId }) 
  * Without this, inbound calls to numbers associated with the trunk get no audio because
  * the trunk has nowhere to forward the call.
  */
-async function ensureSipTrunkOriginationUri({ subaccountSid, trunkSid, sipEndpoint }) {
+async function ensureSipTrunkOriginationUri({ subaccountSid, trunkSid, sipEndpoint, secure }) {
   if (!subaccountSid) throw new Error("Workspace has no Twilio subaccount yet");
   if (!trunkSid) throw new Error("Trunk SID is required");
   if (!sipEndpoint) throw new Error("LIVEKIT_SIP_ENDPOINT is required for origination URI");
 
   const client = await getSubaccountDirectClient(subaccountSid);
 
-  // Build the origination SIP URL. Use TLS transport for secure trunking.
-  const sipUrl = `sip:${sipEndpoint};transport=tls`;
+  // Build the origination SIP URL. Use TLS transport if secure trunking is enabled, TCP otherwise.
+  const transport = secure ? "tls" : "tcp";
+  const sipUrl = `sip:${sipEndpoint};transport=${transport}`;
 
-  // Check if an origination URI already exists for this endpoint.
+  // Check if an origination URI already exists for this endpoint (with any transport).
   const existing = await client.trunking.v1.trunks(trunkSid).originationUrls.list({ limit: 50 });
   const alreadyExists = existing.some((o) => {
-    const normalized = String(o.sipUrl || "").replace(/;transport=tls$/i, "");
+    const normalized = String(o.sipUrl || "").replace(/;transport=(tls|tcp|udp)$/i, "");
     return normalized === `sip:${sipEndpoint}` || o.sipUrl === sipUrl;
   });
 
@@ -285,6 +289,7 @@ async function associateNumberWithSipTrunk({ subaccountSid, trunkSid, numberSid 
 module.exports = {
   getMasterCreds,
   getSubaccountClient,
+  getSubaccountDirectClient,
   ensureSubaccount,
   searchAvailableNumbers,
   buyNumber,
