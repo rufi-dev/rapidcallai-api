@@ -1954,8 +1954,10 @@ app.post("/api/workspaces/:id/twilio/buy-number", requireAuth, async (req, res) 
           existingTrunkSid: ws.twilioSipTrunkSid,
           workspaceId: ws.id,
         });
-        const isSecure = Boolean(secure);
-        logger.info({ trunkSid, domainName, secure: isSecure }, "[buy-number] Twilio SIP trunk ensured");
+        // IMPORTANT: Twilio "secure" only controls SRTP (disabled because LiveKit doesn't support it).
+        // Always use TLS signaling on LiveKit side (transport=3).
+        const isSecure = true; // Always TLS signaling, regardless of Twilio SRTP setting
+        logger.info({ trunkSid, domainName, twilioSecure: secure, livekitTls: isSecure }, "[buy-number] Twilio SIP trunk ensured");
 
         // 3b) Ensure termination credentials exist on the trunk.
         const { credUsername, credPassword } = await tw.ensureSipTrunkTerminationCreds({
@@ -2376,7 +2378,9 @@ app.post("/api/phone-numbers/:id/reprovision-outbound", requireAuth, async (req,
         existingTrunkSid: ws.twilioSipTrunkSid,
         workspaceId: ws.id,
       });
-      const isSecure = Boolean(secure);
+      // IMPORTANT: Twilio "secure" only controls SRTP (disabled because LiveKit doesn't support it).
+      // Always use TLS signaling on LiveKit side (transport=3).
+      const isSecure = true; // Always TLS signaling, regardless of Twilio SRTP setting
 
       // 2) Ensure termination credentials (and ensure they're associated with the Twilio trunk).
       const { credUsername, credPassword } = await tw.ensureSipTrunkTerminationCreds({
@@ -2443,7 +2447,7 @@ app.post("/api/phone-numbers/:id/reprovision-outbound", requireAuth, async (req,
 
     // 4) Create or reuse LiveKit outbound trunk.
     // CRITICAL: Check transport and address match Twilio configuration.
-    const targetTransport = isSecure ? 2 : 1; // TLS (2) if secure, TCP (1) if not
+    const targetTransport = isSecure ? 3 : 2; // TLS (3) if secure, TCP (2) if not — LiveKit SIPTransport: 0=AUTO, 1=UDP, 2=TCP, 3=TLS
     const targetName = isSecure ? 'TLS' : 'TCP';
     let lkTrunkId = ws.livekitOutboundTrunkId;
     let needsRecreate = false;
@@ -2455,7 +2459,7 @@ app.post("/api/phone-numbers/:id/reprovision-outbound", requireAuth, async (req,
         const currentTransport = trunkInfo?.transport ?? null;
         const currentAddress = trunkInfo?.outboundAddress || trunkInfo?.address || null;
         
-        console.log(`[reprovision-outbound] Current trunk ${lkTrunkId} transport: ${currentTransport} (0=UDP, 1=TCP, 2=TLS), target: ${targetTransport} (${targetName}), secure: ${isSecure}`);
+        console.log(`[reprovision-outbound] Current trunk ${lkTrunkId} transport: ${currentTransport} (0=AUTO, 1=UDP, 2=TCP, 3=TLS), target: ${targetTransport} (${targetName}), secure: ${isSecure}`);
         console.log(`[reprovision-outbound] Current trunk ${lkTrunkId} address: ${currentAddress}, Twilio termination URI: ${domainName}`);
         
         // Check if address matches Twilio termination URI
@@ -2480,7 +2484,7 @@ app.post("/api/phone-numbers/:id/reprovision-outbound", requireAuth, async (req,
         
         if (currentTransport !== targetTransport) {
           // Transport doesn't match - need to recreate
-          console.log(`[reprovision-outbound] Trunk ${lkTrunkId} uses transport ${currentTransport} (${currentTransport === 1 ? 'TCP' : currentTransport === 0 ? 'UDP' : currentTransport === 2 ? 'TLS' : 'unknown'}), must be ${targetName} (${targetTransport}). Recreating...`);
+          console.log(`[reprovision-outbound] Trunk ${lkTrunkId} uses transport ${currentTransport} (${currentTransport === 3 ? 'TLS' : currentTransport === 2 ? 'TCP' : currentTransport === 1 ? 'UDP' : currentTransport === 0 ? 'AUTO' : 'unknown'}), must be ${targetName} (${targetTransport}). Recreating...`);
           needsRecreate = true;
         } else if (!needsRecreate) {
           // Already correct transport and address, but try updating anyway to ensure it's correct

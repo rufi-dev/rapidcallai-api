@@ -317,15 +317,17 @@ async function ensureSipTrunk({ subaccountSid, existingTrunkSid, workspaceId }) 
       console.log(`[ensureSipTrunk] ✓ Found existing trunk ${trunk.sid}, domain: ${twilioDomainName}, secure: ${trunk.secure}`);
       console.log(`[ensureSipTrunk] Using domain name from Twilio API: ${twilioDomainName}`);
 
-      // Always enable secure trunking (TLS) and call transfer
-      const needsUpdate = !trunk.secure || trunk.transferMode !== "enable-all";
+      // IMPORTANT: Twilio "secure" flag controls SRTP (media encryption), NOT TLS signaling.
+      // LiveKit Cloud does NOT support SRTP, so we MUST set secure=false on Twilio.
+      // TLS signaling transport is configured separately on the LiveKit outbound trunk (transport=3).
+      const needsUpdate = trunk.secure || trunk.transferMode !== "enable-all";
       if (needsUpdate) {
         try {
           await client.trunking.v1.trunks(existingTrunkSid).update({
-            secure: true,
+            secure: false, // Disable SRTP requirement — LiveKit doesn't support SRTP
             transferMode: "enable-all",
           });
-          console.log(`[ensureSipTrunk] ✓ Updated trunk ${trunk.sid}: secure=true, transferMode=enable-all`);
+          console.log(`[ensureSipTrunk] ✓ Updated trunk ${trunk.sid}: secure=false (no SRTP), transferMode=enable-all`);
         } catch (e) {
           console.warn(`[ensureSipTrunk] Failed to update trunk settings (best-effort): ${e?.message || e}`);
         }
@@ -334,7 +336,7 @@ async function ensureSipTrunk({ subaccountSid, existingTrunkSid, workspaceId }) 
       return {
         trunkSid: trunk.sid,
         domainName: twilioDomainName, // Always use Twilio's domain name
-        secure: true, // Always return secure=true (TLS enabled)
+        secure: false, // No SRTP — LiveKit uses TLS signaling (transport=3) separately
       };
     } catch (e) {
       const errorMsg = String(e?.message || e);
@@ -350,14 +352,17 @@ async function ensureSipTrunk({ subaccountSid, existingTrunkSid, workspaceId }) 
 
   console.log(`[ensureSipTrunk] Creating new trunk with domain: ${domainName}`);
 
-  // Secure trunking enabled (TLS + SRTP)
+  // IMPORTANT: Twilio "secure" flag controls SRTP (media encryption).
+  // LiveKit Cloud does NOT support SRTP, so we MUST set secure=false.
+  // TLS signaling is handled separately via LiveKit outbound trunk transport=3.
   let trunk;
   try {
     trunk = await client.trunking.v1.trunks.create({
       friendlyName: `RapidCall AI (${workspaceId || "default"})`,
       domainName,
-      // Secure Trunking: enabled (requires TLS transport + SRTP media)
-      secure: true,
+      // Secure Trunking: DISABLED — LiveKit doesn't support SRTP media encryption
+      // TLS transport for SIP signaling is configured on the LiveKit side (transport=3)
+      secure: false,
       // Call Transfer: enable SIP REFER so agents can do cold/warm transfers.
       transferMode: "enable-all",
     });

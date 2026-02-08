@@ -45,8 +45,11 @@ async function ensureWorkspaceOutboundTrunk(workspace, phoneRow) {
     existingTrunkSid: workspace.twilioSipTrunkSid,
     workspaceId: wsId,
   });
-  const isSecure = Boolean(secure);
-  logger.info({ wsId, trunkSid, domainName, secure: isSecure }, "[outbound] step 1 done: Twilio SIP trunk ready");
+  // IMPORTANT: Twilio "secure" flag only controls SRTP (media encryption), NOT TLS signaling.
+  // LiveKit doesn't support SRTP, so Twilio secure=false, but we ALWAYS use TLS signaling (transport=3).
+  // isSecure controls LiveKit's SIP transport: true → TLS (3), false → TCP (2).
+  const isSecure = true; // Always use TLS signaling on LiveKit, regardless of Twilio SRTP setting
+  logger.info({ wsId, trunkSid, domainName, twilioSecure: secure, livekitTls: isSecure }, "[outbound] step 1 done: Twilio SIP trunk ready (SRTP=%s, TLS=always)", secure);
 
   // 2) Ensure termination credentials.
   logger.info({ wsId, trunkSid, hasExistingCreds: Boolean(workspace.twilioSipCredUsername) }, "[outbound] step 2: ensuring SIP credentials");
@@ -351,22 +354,10 @@ async function handleJob(workspace, job) {
   }
 
   // Safety check: ensure correct transport is set on the trunk before dialing
-  // Default to secure (TLS) — our trunks always use secure trunking
+  // Always use TLS signaling (transport=3) on LiveKit, regardless of Twilio's SRTP setting.
+  // Twilio "secure" flag controls SRTP only; LiveKit doesn't support SRTP, so Twilio secure=false.
   try {
-    let isSecure = true;
-    if (workspace.twilioSipTrunkSid && workspace.twilioSubaccountSid) {
-      try {
-        const client = await tw.getSubaccountDirectClient(workspace.twilioSubaccountSid);
-        const trunk = await client.trunking.v1.trunks(workspace.twilioSipTrunkSid).fetch();
-        isSecure = Boolean(trunk.secure);
-        if (!isSecure) {
-          logger.warn({ workspaceId }, "[outbound] Twilio trunk has secure=false, but we expect TLS. Will use TLS anyway.");
-          isSecure = true;
-        }
-      } catch (e) {
-        logger.warn({ workspaceId, err: String(e?.message || e) }, "[outbound] failed to fetch trunk secure status, defaulting to TLS (secure)");
-      }
-    }
+    const isSecure = true; // Always TLS signaling on LiveKit
     await ensureOutboundTrunkTransport(trunkId, isSecure);
     logger.info({ workspaceId, trunkId, jobId: job.id, secure: isSecure }, "[outbound] ensured transport before dialing");
   } catch (e) {
