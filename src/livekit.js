@@ -134,6 +134,72 @@ async function deleteOutboundTrunk(trunkId) {
 }
 
 /**
+ * Ensure an existing LiveKit SIP outbound trunk address matches the Twilio termination URI.
+ * If the address doesn't match, updates it to match Twilio's domain name.
+ * 
+ * @param {string} trunkId - LiveKit outbound trunk ID
+ * @param {string} twilioTerminationUri - Twilio termination URI (domain name) that should match
+ * @returns {Promise<{updated: boolean, previousAddress?: string, newAddress?: string}>}
+ */
+async function ensureOutboundTrunkAddress(trunkId, twilioTerminationUri) {
+  const sip = sipClient();
+  
+  if (!twilioTerminationUri) {
+    console.warn(`[ensureOutboundTrunkAddress] No Twilio termination URI provided for trunk ${trunkId}`);
+    return { updated: false };
+  }
+  
+  try {
+    const trunkInfo = await getOutboundTrunkInfo(trunkId);
+    if (!trunkInfo) {
+      console.warn(`[ensureOutboundTrunkAddress] Cannot retrieve trunk ${trunkId} info - cannot verify address`);
+      return { updated: false };
+    }
+    
+    const currentAddress = trunkInfo.outboundAddress || trunkInfo.address || null;
+    const normalizedTwilioUri = String(twilioTerminationUri).trim();
+    
+    console.log(`[ensureOutboundTrunkAddress] Trunk ${trunkId} current address: ${currentAddress}, Twilio termination URI: ${normalizedTwilioUri}`);
+    
+    if (currentAddress === normalizedTwilioUri) {
+      console.log(`[ensureOutboundTrunkAddress] ✓ Trunk ${trunkId} address already matches Twilio termination URI`);
+      return { updated: false, previousAddress: currentAddress, newAddress: normalizedTwilioUri };
+    }
+    
+    // Address doesn't match - update it
+    // Note: LiveKit SDK uses "address" field (same as createSipOutboundTrunk)
+    console.log(`[ensureOutboundTrunkAddress] Updating trunk ${trunkId} address from "${currentAddress}" to "${normalizedTwilioUri}"`);
+    try {
+      await sip.updateSipOutboundTrunkFields(trunkId, {
+        address: normalizedTwilioUri, // Use "address" field (same as createSipOutboundTrunk)
+      });
+      console.log(`[ensureOutboundTrunkAddress] ✓ Updated trunk ${trunkId} address to "${normalizedTwilioUri}"`);
+    } catch (e) {
+      // If update fails (e.g., field not supported), we'll need to recreate the trunk
+      console.warn(`[ensureOutboundTrunkAddress] Failed to update address via updateSipOutboundTrunkFields: ${e?.message || e}. Address updates may require recreating the trunk.`);
+      throw new Error(`Cannot update trunk address - may need to recreate trunk: ${e?.message || e}`);
+    }
+    
+    // Wait for change to propagate
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+    
+    // Verify the update
+    const updatedInfo = await getOutboundTrunkInfo(trunkId);
+    const verifiedAddress = updatedInfo?.outboundAddress || updatedInfo?.address || null;
+    if (verifiedAddress === normalizedTwilioUri) {
+      console.log(`[ensureOutboundTrunkAddress] ✓ Verified trunk ${trunkId} address matches Twilio termination URI`);
+      return { updated: true, previousAddress: currentAddress, newAddress: normalizedTwilioUri };
+    } else {
+      console.warn(`[ensureOutboundTrunkAddress] WARNING: Address update verification failed. Expected "${normalizedTwilioUri}", got "${verifiedAddress}"`);
+      return { updated: true, previousAddress: currentAddress, newAddress: verifiedAddress };
+    }
+  } catch (e) {
+    console.error(`[ensureOutboundTrunkAddress] Failed to ensure trunk ${trunkId} address matches Twilio termination URI: ${e?.message || e}`);
+    throw new Error(`Failed to ensure trunk address matches Twilio termination URI: ${e?.message || e}`);
+  }
+}
+
+/**
  * Ensure an existing LiveKit SIP outbound trunk uses the correct transport.
  * Uses TLS (2) when secure trunking is enabled, TCP (1) when disabled.
  * 
@@ -245,6 +311,7 @@ module.exports = {
   createOutboundTrunkForWorkspace,
   ensureOutboundTrunkUsesTls,
   ensureOutboundTrunkTransport,
+  ensureOutboundTrunkAddress,
   getOutboundTrunkInfo,
   deleteOutboundTrunk,
 };

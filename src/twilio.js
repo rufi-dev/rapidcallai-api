@@ -307,7 +307,15 @@ async function ensureSipTrunk({ subaccountSid, existingTrunkSid, workspaceId }) 
     console.log(`[ensureSipTrunk] Attempting to fetch existing trunk ${existingTrunkSid}`);
     try {
       const trunk = await client.trunking.v1.trunks(existingTrunkSid).fetch();
-      console.log(`[ensureSipTrunk] ✓ Found existing trunk ${trunk.sid}, domain: ${trunk.domainName}, secure: ${trunk.secure}`);
+      
+      // CRITICAL: Always use the domain name from Twilio's API response, not from database
+      const twilioDomainName = trunk.domainName || null;
+      if (!twilioDomainName) {
+        console.warn(`[ensureSipTrunk] WARNING: Trunk ${trunk.sid} has no domainName in Twilio response. This may cause issues.`);
+      }
+      
+      console.log(`[ensureSipTrunk] ✓ Found existing trunk ${trunk.sid}, domain: ${twilioDomainName}, secure: ${trunk.secure}`);
+      console.log(`[ensureSipTrunk] Using domain name from Twilio API: ${twilioDomainName}`);
 
       // Don't force enable secure trunking - respect user's choice
       // Only ensure call transfer is enabled
@@ -325,7 +333,7 @@ async function ensureSipTrunk({ subaccountSid, existingTrunkSid, workspaceId }) 
 
       return {
         trunkSid: trunk.sid,
-        domainName: trunk.domainName || null,
+        domainName: twilioDomainName, // Always use Twilio's domain name
         secure: Boolean(trunk.secure), // Return actual secure status
       };
     } catch (e) {

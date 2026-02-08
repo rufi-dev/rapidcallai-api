@@ -39,7 +39,7 @@ const {
 } = require("./storage");
 const { getPool, initSchema } = require("./db");
 const store = require("./store_pg");
-const { roomService, agentDispatchService, createParticipantToken, sipClient, addNumberToInboundTrunk, addNumberToOutboundTrunk, removeNumberFromInboundTrunk, removeNumberFromOutboundTrunk, createOutboundTrunkForWorkspace, ensureOutboundTrunkUsesTls, ensureOutboundTrunkTransport, deleteOutboundTrunk, getOutboundTrunkInfo } = require("./livekit");
+const { roomService, agentDispatchService, createParticipantToken, sipClient, addNumberToInboundTrunk, addNumberToOutboundTrunk, removeNumberFromInboundTrunk, removeNumberFromOutboundTrunk, createOutboundTrunkForWorkspace, ensureOutboundTrunkUsesTls, ensureOutboundTrunkTransport, ensureOutboundTrunkAddress, deleteOutboundTrunk, getOutboundTrunkInfo } = require("./livekit");
 const outboundWorker = require("./outbound_worker");
 const { startCallEgress, stopEgress, getEgressInfo } = require("./egress");
 const { getObject, headObject } = require("./s3");
@@ -2376,36 +2376,58 @@ app.post("/api/phone-numbers/:id/reprovision-outbound", requireAuth, async (req,
     }
 
     // 4) Create or reuse LiveKit outbound trunk.
-    // CRITICAL: Check transport and match it to Twilio secure trunking setting.
+    // CRITICAL: Check transport and address match Twilio configuration.
     const targetTransport = isSecure ? 2 : 1; // TLS (2) if secure, TCP (1) if not
     const targetName = isSecure ? 'TLS' : 'TCP';
     let lkTrunkId = ws.livekitOutboundTrunkId;
     let needsRecreate = false;
     
     if (lkTrunkId) {
-      // Check current transport - if it doesn't match the target, recreate
+      // Check current transport and address - if they don't match, recreate
       try {
         const trunkInfo = await getOutboundTrunkInfo(lkTrunkId);
         const currentTransport = trunkInfo?.transport ?? null;
+        const currentAddress = trunkInfo?.outboundAddress || trunkInfo?.address || null;
+        
         console.log(`[reprovision-outbound] Current trunk ${lkTrunkId} transport: ${currentTransport} (0=UDP, 1=TCP, 2=TLS), target: ${targetTransport} (${targetName}), secure: ${isSecure}`);
+        console.log(`[reprovision-outbound] Current trunk ${lkTrunkId} address: ${currentAddress}, Twilio termination URI: ${domainName}`);
+        
+        // Check if address matches Twilio termination URI
+        if (currentAddress && currentAddress !== domainName) {
+          console.log(`[reprovision-outbound] Trunk ${lkTrunkId} address "${currentAddress}" doesn't match Twilio termination URI "${domainName}". Will try to update, or recreate if update fails...`);
+          // Try to update the address first
+          try {
+            await ensureOutboundTrunkAddress(lkTrunkId, domainName);
+            console.log(`[reprovision-outbound] ✓ Successfully updated trunk ${lkTrunkId} address to match Twilio termination URI`);
+          } catch (e) {
+            console.warn(`[reprovision-outbound] Failed to update trunk address: ${e?.message || e}. Will recreate trunk...`);
+            needsRecreate = true;
+          }
+        } else if (!currentAddress) {
+          console.warn(`[reprovision-outbound] Trunk ${lkTrunkId} has no address set. Will recreate...`);
+          needsRecreate = true;
+        }
         
         if (currentTransport !== targetTransport) {
           // Transport doesn't match - need to recreate
           console.log(`[reprovision-outbound] Trunk ${lkTrunkId} uses transport ${currentTransport} (${currentTransport === 1 ? 'TCP' : currentTransport === 0 ? 'UDP' : currentTransport === 2 ? 'TLS' : 'unknown'}), must be ${targetName} (${targetTransport}). Recreating...`);
           needsRecreate = true;
-        } else {
-          // Already correct transport, but try updating anyway to ensure it's correct
-          console.log(`[reprovision-outbound] Trunk ${lkTrunkId} already reports ${targetName} (${targetTransport}), but ensuring it's correct...`);
+        } else if (!needsRecreate) {
+          // Already correct transport and address, but try updating anyway to ensure it's correct
+          console.log(`[reprovision-outbound] Trunk ${lkTrunkId} already reports ${targetName} (${targetTransport}) and correct address, but ensuring it's correct...`);
           try {
+            // Ensure address matches (in case it was updated in Twilio)
+            await ensureOutboundTrunkAddress(lkTrunkId, domainName);
             await ensureOutboundTrunkTransport(lkTrunkId, isSecure);
             // Verify it's still correct after update
             const verifyInfo = await getOutboundTrunkInfo(lkTrunkId);
-            if (verifyInfo?.transport !== targetTransport) {
-              console.warn(`[reprovision-outbound] Update didn't work - transport is still ${verifyInfo?.transport}. Recreating...`);
+            const verifyAddress = verifyInfo?.outboundAddress || verifyInfo?.address || null;
+            if (verifyInfo?.transport !== targetTransport || verifyAddress !== domainName) {
+              console.warn(`[reprovision-outbound] Update didn't work - transport is ${verifyInfo?.transport}, address is "${verifyAddress}". Recreating...`);
               needsRecreate = true;
             }
           } catch (e) {
-            console.warn(`[reprovision-outbound] Failed to update trunk transport: ${e?.message || e}. Recreating...`);
+            console.warn(`[reprovision-outbound] Failed to update trunk: ${e?.message || e}. Recreating...`);
             needsRecreate = true;
           }
         }
@@ -2443,17 +2465,24 @@ app.post("/api/phone-numbers/:id/reprovision-outbound", requireAuth, async (req,
       lkTrunkId = result.trunkId;
       console.log(`[reprovision-outbound] ✓ Created new trunk ${lkTrunkId} with ${targetName} transport (${targetTransport})`);
       
-      // Verify the new trunk actually has the correct transport
+      // Verify the new trunk actually has the correct transport and address
       try {
         const verifyNew = await getOutboundTrunkInfo(lkTrunkId);
+        const verifyAddress = verifyNew?.outboundAddress || verifyNew?.address || null;
         if (verifyNew?.transport !== targetTransport) {
           console.error(`[reprovision-outbound] WARNING: New trunk ${lkTrunkId} was created but transport is ${verifyNew?.transport} instead of ${targetTransport} (${targetName})!`);
           provisionErrors.push(`New trunk created but transport verification failed: got ${verifyNew?.transport}, expected ${targetTransport}`);
         } else {
           console.log(`[reprovision-outbound] ✓ Verified new trunk ${lkTrunkId} uses ${targetName} transport (${targetTransport})`);
         }
+        if (verifyAddress !== domainName) {
+          console.error(`[reprovision-outbound] WARNING: New trunk ${lkTrunkId} address "${verifyAddress}" doesn't match Twilio termination URI "${domainName}"!`);
+          provisionErrors.push(`New trunk created but address verification failed: got "${verifyAddress}", expected "${domainName}"`);
+        } else {
+          console.log(`[reprovision-outbound] ✓ Verified new trunk ${lkTrunkId} address matches Twilio termination URI "${domainName}"`);
+        }
       } catch (e) {
-        console.warn(`[reprovision-outbound] Could not verify new trunk transport: ${e?.message || e}`);
+        console.warn(`[reprovision-outbound] Could not verify new trunk: ${e?.message || e}`);
       }
     } else {
       // Trunk exists and has correct transport - just ensure the number is added

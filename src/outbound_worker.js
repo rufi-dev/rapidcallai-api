@@ -9,7 +9,7 @@ if (require.main === module) {
 const { nanoid } = require("./id");
 const { logger } = require("./logger");
 const store = require("./store_pg");
-const { roomService, agentDispatchService, sipClient, addNumberToOutboundTrunk, createOutboundTrunkForWorkspace, ensureOutboundTrunkUsesTls, ensureOutboundTrunkTransport } = require("./livekit");
+const { roomService, agentDispatchService, sipClient, addNumberToOutboundTrunk, createOutboundTrunkForWorkspace, ensureOutboundTrunkUsesTls, ensureOutboundTrunkTransport, ensureOutboundTrunkAddress } = require("./livekit");
 const tw = require("./twilio");
 
 const USE_DB = Boolean(process.env.DATABASE_URL);
@@ -119,21 +119,23 @@ async function ensureWorkspaceOutboundTrunk(workspace, phoneRow) {
       secure: isSecure,
     });
     lkTrunkId = result.trunkId;
-    // Explicitly ensure transport is correct (createOutboundTrunkForWorkspace should set it, but double-check)
+    // Explicitly ensure transport and address are correct (createOutboundTrunkForWorkspace should set it, but double-check)
     try {
+      await ensureOutboundTrunkAddress(lkTrunkId, domainName);
       await ensureOutboundTrunkTransport(lkTrunkId, isSecure);
-      logger.info({ wsId, lkTrunkId, secure: isSecure }, "[outbound] step 4a: ensured transport on new trunk");
+      logger.info({ wsId, lkTrunkId, domainName, secure: isSecure }, "[outbound] step 4a: ensured address and transport on new trunk");
     } catch (e) {
-      logger.warn({ wsId, lkTrunkId, err: String(e?.message || e) }, "[outbound] step 4a: failed to ensure transport on new trunk (best-effort)");
+      logger.warn({ wsId, lkTrunkId, err: String(e?.message || e) }, "[outbound] step 4a: failed to ensure address/transport on new trunk (best-effort)");
     }
     logger.info({ wsId, lkTrunkId, domainName, secure: isSecure }, "[outbound] step 4 done: LiveKit outbound trunk created");
   } else {
-    // Ensure existing trunk uses correct transport
+    // Ensure existing trunk uses correct address (matches Twilio termination URI) and transport
     try {
+      await ensureOutboundTrunkAddress(lkTrunkId, domainName);
       await ensureOutboundTrunkTransport(lkTrunkId, isSecure);
-      logger.info({ wsId, lkTrunkId, secure: isSecure }, "[outbound] step 4a: ensured transport on existing trunk");
+      logger.info({ wsId, lkTrunkId, domainName, secure: isSecure }, "[outbound] step 4a: ensured address and transport on existing trunk");
     } catch (e) {
-      logger.warn({ wsId, lkTrunkId, err: String(e?.message || e) }, "[outbound] step 4a: failed to update trunk transport (best-effort)");
+      logger.warn({ wsId, lkTrunkId, err: String(e?.message || e) }, "[outbound] step 4a: failed to update trunk address/transport (best-effort)");
     }
     // Ensure the number is on the existing trunk.
     logger.info({ wsId, lkTrunkId, e164: phoneRow.e164 }, "[outbound] step 4: adding number to existing LiveKit outbound trunk");
