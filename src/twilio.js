@@ -544,11 +544,16 @@ async function associateNumberWithSipTrunk({ subaccountSid, trunkSid, numberSid 
  * Make a REST API request to Twilio Trunking API (for IP ACL operations not exposed in SDK)
  */
 async function twilioTrunkingRequest({ subaccountSid, method, path, data }) {
-  // Get the subaccount's auth token
-  const masterClient = getMasterClient();
-  if (!masterClient) throw new Error("Master Twilio client not available");
+  // Get the subaccount's auth token - reuse the same logic as getSubaccountDirectClient
+  const masterCreds = getMasterCreds();
+  if (!masterCreds) throw new Error("Twilio master credentials not configured");
   
-  const subaccount = await masterClient.accounts(subaccountSid).fetch();
+  const masterClient = twilio(masterCreds.accountSid, masterCreds.authToken);
+  const subaccount = await masterClient.api.accounts(subaccountSid).fetch();
+  if (!subaccount || !subaccount.authToken) {
+    throw new Error(`Subaccount ${subaccountSid} auth token not available`);
+  }
+  
   const authToken = subaccount.authToken;
   const accountSid = subaccountSid;
   
