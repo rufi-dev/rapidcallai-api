@@ -116,8 +116,8 @@ async function getOutboundTrunkInfo(trunkId) {
  * Ensure an existing LiveKit SIP outbound trunk uses TLS transport.
  * This is required when the Twilio trunk has secure: true.
  * 
- * IMPORTANT: The transport parameter must match what LiveKit SDK expects.
- * Common values: "tls", "TLS", or numeric enum (check SDK docs).
+ * CRITICAL: LiveKit SDK requires transport as numeric enum (2 = TLS), not string.
+ * String values fail with encoding errors.
  */
 async function ensureOutboundTrunkUsesTls(trunkId) {
   const sip = sipClient();
@@ -126,12 +126,13 @@ async function ensureOutboundTrunkUsesTls(trunkId) {
     const current = await getOutboundTrunkInfo(trunkId);
     const currentTransport = current?.transport || "unknown";
     
-    if (currentTransport === "tls" || currentTransport === "TLS" || currentTransport === 2) {
-      console.log(`[ensureOutboundTrunkUsesTls] Trunk ${trunkId} already uses TLS transport (${currentTransport})`);
+    // Check if already using TLS (numeric 2 is the correct value)
+    if (currentTransport === 2) {
+      console.log(`[ensureOutboundTrunkUsesTls] Trunk ${trunkId} already uses TLS transport (2)`);
       return { updated: false, previousTransport: currentTransport };
     }
 
-    console.log(`[ensureOutboundTrunkUsesTls] Updating trunk ${trunkId} from transport "${currentTransport}" to TLS`);
+    console.log(`[ensureOutboundTrunkUsesTls] Updating trunk ${trunkId} from transport "${currentTransport}" to TLS (2)`);
     console.log(`[ensureOutboundTrunkUsesTls] Trunk details:`, JSON.stringify({
       trunkId,
       currentTransport,
@@ -139,43 +140,24 @@ async function ensureOutboundTrunkUsesTls(trunkId) {
       numbers: current?.outboundNumbers?.length || 0,
     }, null, 2));
     
-    // Try updating with "tls" string first (most common)
-    try {
-      await sip.updateSipOutboundTrunkFields(trunkId, {
-        transport: "tls",
-      });
-      console.log(`[ensureOutboundTrunkUsesTls] Update call succeeded with transport="tls"`);
-    } catch (e1) {
-      // If "tls" fails, try "TLS" (uppercase)
-      console.warn(`[ensureOutboundTrunkUsesTls] Update with "tls" failed: ${e1?.message || e1}, trying "TLS"`);
-      try {
-        await sip.updateSipOutboundTrunkFields(trunkId, {
-          transport: "TLS",
-        });
-        console.log(`[ensureOutboundTrunkUsesTls] Update call succeeded with transport="TLS"`);
-      } catch (e2) {
-        // If both fail, try numeric enum value 2 (common for TLS)
-        console.warn(`[ensureOutboundTrunkUsesTls] Update with "TLS" failed: ${e2?.message || e2}, trying numeric 2`);
-        try {
-          await sip.updateSipOutboundTrunkFields(trunkId, {
-            transport: 2,
-          });
-          console.log(`[ensureOutboundTrunkUsesTls] Update call succeeded with transport=2`);
-        } catch (e3) {
-          throw new Error(`All transport update attempts failed. Last error: ${e3?.message || e3}. Previous: ${e2?.message || e2}, ${e1?.message || e1}`);
-        }
-      }
-    }
+    // CRITICAL: Use numeric 2 (not string "tls") - strings fail to encode
+    await sip.updateSipOutboundTrunkFields(trunkId, {
+      transport: 2, // Numeric enum: 2 = TLS
+    });
+    console.log(`[ensureOutboundTrunkUsesTls] Update call succeeded with transport=2`);
+
+    // Wait a moment for the change to propagate (LiveKit may need time to apply)
+    await new Promise((resolve) => setTimeout(resolve, 1000));
 
     // Verify the update worked (if we can retrieve trunk info)
     const updated = await getOutboundTrunkInfo(trunkId);
     if (updated) {
       const newTransport = updated?.transport || "unknown";
-      const isTls = newTransport === "tls" || newTransport === "TLS" || newTransport === 2;
-      if (!isTls) {
-        console.error(`[ensureOutboundTrunkUsesTls] WARNING: Transport update may have failed. Expected TLS, got: ${newTransport}`);
+      if (newTransport !== 2) {
+        console.error(`[ensureOutboundTrunkUsesTls] WARNING: Transport update may have failed. Expected 2 (TLS), got: ${newTransport}`);
+        throw new Error(`Transport update verification failed: expected 2, got ${newTransport}`);
       } else {
-        console.log(`[ensureOutboundTrunkUsesTls] Successfully verified trunk ${trunkId} uses TLS transport (${newTransport})`);
+        console.log(`[ensureOutboundTrunkUsesTls] Successfully verified trunk ${trunkId} uses TLS transport (2)`);
       }
     } else {
       console.warn(`[ensureOutboundTrunkUsesTls] Cannot verify transport update - trunk info retrieval not available`);
@@ -198,6 +180,9 @@ async function ensureOutboundTrunkUsesTls(trunkId) {
 async function createOutboundTrunkForWorkspace({ workspaceId, twilioSipDomainName, credUsername, credPassword, numbers }) {
   const sip = sipClient();
   const address = `${twilioSipDomainName}`;
+  
+  // CRITICAL: LiveKit SDK requires transport as numeric enum (2 = TLS), not string "tls"
+  // String "tls" fails with: "cannot encode field livekit.SIPOutboundTrunkUpdate.transport to JSON"
   const trunk = await sip.createSipOutboundTrunk(
     `RapidCall AI outbound (${workspaceId || "default"})`,
     address,
@@ -205,9 +190,10 @@ async function createOutboundTrunkForWorkspace({ workspaceId, twilioSipDomainNam
     {
       authUsername: credUsername,
       authPassword: credPassword,
-      transport: "tls", // Required for secure Twilio trunks (secure: true)
+      transport: 2, // Numeric enum: 2 = TLS (required for secure Twilio trunks with secure: true)
     }
   );
+  console.log(`[createOutboundTrunkForWorkspace] Created trunk ${trunk.sipTrunkId} with TLS transport (2)`);
   return { trunkId: trunk.sipTrunkId };
 }
 
