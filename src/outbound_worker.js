@@ -351,16 +351,20 @@ async function handleJob(workspace, job) {
   }
 
   // Safety check: ensure correct transport is set on the trunk before dialing
-  // Fetch secure status from Twilio trunk to determine correct transport
+  // Default to secure (TLS) — our trunks always use secure trunking
   try {
-    let isSecure = false;
+    let isSecure = true;
     if (workspace.twilioSipTrunkSid && workspace.twilioSubaccountSid) {
       try {
         const client = await tw.getSubaccountDirectClient(workspace.twilioSubaccountSid);
         const trunk = await client.trunking.v1.trunks(workspace.twilioSipTrunkSid).fetch();
         isSecure = Boolean(trunk.secure);
+        if (!isSecure) {
+          logger.warn({ workspaceId }, "[outbound] Twilio trunk has secure=false, but we expect TLS. Will use TLS anyway.");
+          isSecure = true;
+        }
       } catch (e) {
-        logger.warn({ workspaceId, err: String(e?.message || e) }, "[outbound] failed to fetch trunk secure status, defaulting to non-secure");
+        logger.warn({ workspaceId, err: String(e?.message || e) }, "[outbound] failed to fetch trunk secure status, defaulting to TLS (secure)");
       }
     }
     await ensureOutboundTrunkTransport(trunkId, isSecure);

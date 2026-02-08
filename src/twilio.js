@@ -317,24 +317,24 @@ async function ensureSipTrunk({ subaccountSid, existingTrunkSid, workspaceId }) 
       console.log(`[ensureSipTrunk] ✓ Found existing trunk ${trunk.sid}, domain: ${twilioDomainName}, secure: ${trunk.secure}`);
       console.log(`[ensureSipTrunk] Using domain name from Twilio API: ${twilioDomainName}`);
 
-      // Don't force enable secure trunking - respect user's choice
-      // Only ensure call transfer is enabled
-      const needsUpdate = trunk.transferMode !== "enable-all";
+      // Always enable secure trunking (TLS) and call transfer
+      const needsUpdate = !trunk.secure || trunk.transferMode !== "enable-all";
       if (needsUpdate) {
         try {
           await client.trunking.v1.trunks(existingTrunkSid).update({
+            secure: true,
             transferMode: "enable-all",
           });
-          console.log(`[ensureSipTrunk] Updated trunk ${trunk.sid} transfer mode to enable-all`);
+          console.log(`[ensureSipTrunk] ✓ Updated trunk ${trunk.sid}: secure=true, transferMode=enable-all`);
         } catch (e) {
-          console.warn(`[ensureSipTrunk] Failed to update trunk transfer mode (best-effort): ${e?.message || e}`);
+          console.warn(`[ensureSipTrunk] Failed to update trunk settings (best-effort): ${e?.message || e}`);
         }
       }
 
       return {
         trunkSid: trunk.sid,
         domainName: twilioDomainName, // Always use Twilio's domain name
-        secure: Boolean(trunk.secure), // Return actual secure status
+        secure: true, // Always return secure=true (TLS enabled)
       };
     } catch (e) {
       const errorMsg = String(e?.message || e);
@@ -350,14 +350,14 @@ async function ensureSipTrunk({ subaccountSid, existingTrunkSid, workspaceId }) 
 
   console.log(`[ensureSipTrunk] Creating new trunk with domain: ${domainName}`);
 
-  // Default to secure: false (user can enable it manually in Twilio console)
+  // Secure trunking enabled (TLS + SRTP)
   let trunk;
   try {
     trunk = await client.trunking.v1.trunks.create({
       friendlyName: `RapidCall AI (${workspaceId || "default"})`,
       domainName,
-      // Secure Trunking: disabled by default (user can enable in Twilio console)
-      secure: false,
+      // Secure Trunking: enabled (requires TLS transport + SRTP media)
+      secure: true,
       // Call Transfer: enable SIP REFER so agents can do cold/warm transfers.
       transferMode: "enable-all",
     });
@@ -412,15 +412,38 @@ async function ensureSipTrunkOriginationUri({ subaccountSid, trunkSid, sipEndpoi
   const transport = secure ? "tls" : "tcp";
   const sipUrl = `sip:${sipEndpoint};transport=${transport}`;
 
-  // Check if an origination URI already exists for this endpoint (with any transport).
+  // Check existing origination URIs for this endpoint.
   const existing = await client.trunking.v1.trunks(trunkSid).originationUrls.list({ limit: 50 });
-  const alreadyExists = existing.some((o) => {
+  
+  // Find any existing URI for this SIP endpoint (regardless of transport)
+  const matchingUri = existing.find((o) => {
     const normalized = String(o.sipUrl || "").replace(/;transport=(tls|tcp|udp)$/i, "");
-    return normalized === `sip:${sipEndpoint}` || o.sipUrl === sipUrl;
+    return normalized === `sip:${sipEndpoint}`;
   });
 
-  if (alreadyExists) {
-    return { created: false };
+  if (matchingUri) {
+    // Check if transport matches
+    if (matchingUri.sipUrl === sipUrl) {
+      console.log(`[ensureSipTrunkOriginationUri] ✓ Origination URI already correct: ${sipUrl}`);
+      return { created: false };
+    }
+    // Transport mismatch — update the existing URI to use the correct transport
+    console.log(`[ensureSipTrunkOriginationUri] Updating origination URI from ${matchingUri.sipUrl} to ${sipUrl}`);
+    try {
+      await client.trunking.v1.trunks(trunkSid).originationUrls(matchingUri.sid).update({
+        sipUrl,
+        friendlyName: "LiveKit SIP",
+      });
+      console.log(`[ensureSipTrunkOriginationUri] ✓ Updated origination URI to ${sipUrl}`);
+      return { created: false, updated: true };
+    } catch (e) {
+      console.warn(`[ensureSipTrunkOriginationUri] Failed to update URI, will delete and recreate: ${e?.message || e}`);
+      try {
+        await client.trunking.v1.trunks(trunkSid).originationUrls(matchingUri.sid).remove();
+      } catch (delErr) {
+        console.warn(`[ensureSipTrunkOriginationUri] Failed to delete old URI: ${delErr?.message || delErr}`);
+      }
+    }
   }
 
   await client.trunking.v1.trunks(trunkSid).originationUrls.create({
@@ -430,6 +453,7 @@ async function ensureSipTrunkOriginationUri({ subaccountSid, trunkSid, sipEndpoi
     priority: 10,
     enabled: true,
   });
+  console.log(`[ensureSipTrunkOriginationUri] ✓ Created origination URI: ${sipUrl}`);
 
   return { created: true };
 }
