@@ -27,13 +27,31 @@ function getSubaccountClient(subaccountSid) {
  * Required for APIs hosted on separate domains (e.g. trunking.twilio.com)
  * which ignore the `accountSid` constructor option and scope resources
  * to whichever account the credentials belong to.
+ * 
+ * For Trunking API, we MUST use the subaccount's own credentials, not master account credentials.
+ * Trunks created with master account credentials will be on the master account, not the subaccount.
  */
 async function getSubaccountDirectClient(subaccountSid) {
-  const creds = getMasterCreds();
-  if (!creds) throw new Error("Twilio master credentials not configured");
-  // For trunking API, we must use the master account credentials but scope by subaccountSid in requests.
-  // The trunking API doesn't support subaccount auth tokens directly.
-  return twilio(creds.accountSid, creds.authToken);
+  const masterCreds = getMasterCreds();
+  if (!masterCreds) throw new Error("Twilio master credentials not configured");
+  
+  // Fetch the subaccount to get its auth token
+  const masterClient = twilio(masterCreds.accountSid, masterCreds.authToken);
+  try {
+    const subaccount = await masterClient.api.accounts(subaccountSid).fetch();
+    if (!subaccount || !subaccount.authToken) {
+      throw new Error(`Subaccount ${subaccountSid} auth token not available`);
+    }
+    console.log(`[getSubaccountDirectClient] Using subaccount ${subaccountSid} credentials for Trunking API`);
+    // Use subaccount's own credentials for trunking API
+    // This ensures trunks are created on the subaccount, not the master account
+    return twilio(subaccountSid, subaccount.authToken);
+  } catch (e) {
+    const errorMsg = String(e?.message || e);
+    const status = String(e?.status || "");
+    console.error(`[getSubaccountDirectClient] Failed to fetch subaccount credentials: ${errorMsg} (status: ${status})`);
+    throw new Error(`Failed to get subaccount credentials for ${subaccountSid}: ${errorMsg}`);
+  }
 }
 
 /**
