@@ -236,9 +236,11 @@ async function ensureOutboundTrunkAddress(trunkId, twilioTerminationUri) {
  * Uses TLS (2) when secure trunking is enabled, TCP (1) when disabled.
  * 
  * CRITICAL: LiveKit SDK requires transport as numeric enum:
- * - 0 = UDP
- * - 1 = TCP
- * - 2 = TLS
+ * LiveKit SIPTransport protobuf enum:
+ *   0 = SIP_TRANSPORT_AUTO
+ *   1 = SIP_TRANSPORT_UDP
+ *   2 = SIP_TRANSPORT_TCP
+ *   3 = SIP_TRANSPORT_TLS
  * 
  * String values fail with encoding errors.
  * 
@@ -246,7 +248,7 @@ async function ensureOutboundTrunkAddress(trunkId, twilioTerminationUri) {
  */
 async function ensureOutboundTrunkTransport(trunkId, secure) {
   const sip = sipClient();
-  const targetTransport = secure ? 2 : 1; // TLS (2) if secure, TCP (1) if not
+  const targetTransport = secure ? 3 : 2; // TLS (3) if secure, TCP (2) if not
   const targetName = secure ? 'TLS' : 'TCP';
   
   try {
@@ -256,7 +258,7 @@ async function ensureOutboundTrunkTransport(trunkId, secure) {
     const currentTransport = current?.transport ?? null;
     
     // Log what we found
-    const currentName = currentTransport === 1 ? 'TCP' : currentTransport === 0 ? 'UDP' : currentTransport === 2 ? 'TLS' : 'unknown';
+    const currentName = currentTransport === 3 ? 'TLS' : currentTransport === 2 ? 'TCP' : currentTransport === 1 ? 'UDP' : currentTransport === 0 ? 'AUTO' : 'unknown';
     console.log(`[ensureOutboundTrunkTransport] Trunk ${trunkId} current transport: ${currentTransport} (${currentName}), target: ${targetTransport} (${targetName}), secure: ${secure}`);
     
     // Skip update if transport already matches — avoids unnecessary 3s delay on every call
@@ -270,7 +272,7 @@ async function ensureOutboundTrunkTransport(trunkId, secure) {
     
     // CRITICAL: Use numeric enum (not string) - strings fail to encode
     await sip.updateSipOutboundTrunkFields(trunkId, {
-      transport: targetTransport, // Numeric enum: 2 = TLS, 1 = TCP
+      transport: targetTransport, // Numeric enum: 3 = TLS, 2 = TCP
     });
     console.log(`[ensureOutboundTrunkTransport] Update call succeeded with transport=${targetTransport}`);
 
@@ -283,9 +285,9 @@ async function ensureOutboundTrunkTransport(trunkId, secure) {
     const updated = await getOutboundTrunkInfo(trunkId);
     if (updated) {
       const newTransport = updated?.transport ?? null;
-      console.log(`[ensureOutboundTrunkTransport] Verified transport after update: ${newTransport} (0=UDP, 1=TCP, 2=TLS)`);
+      console.log(`[ensureOutboundTrunkTransport] Verified transport after update: ${newTransport} (0=AUTO, 1=UDP, 2=TCP, 3=TLS)`);
       if (newTransport !== targetTransport) {
-        const errorMsg = `Transport update verification failed: expected ${targetTransport} (${targetName}), got ${newTransport} (${newTransport === 1 ? 'TCP' : newTransport === 0 ? 'UDP' : newTransport === 2 ? 'TLS' : 'unknown'})`;
+        const errorMsg = `Transport update verification failed: expected ${targetTransport} (${targetName}), got ${newTransport} (${newTransport === 3 ? 'TLS' : newTransport === 2 ? 'TCP' : newTransport === 1 ? 'UDP' : newTransport === 0 ? 'AUTO' : 'unknown'})`;
         console.error(`[ensureOutboundTrunkTransport] WARNING: ${errorMsg}`);
         throw new Error(errorMsg);
       } else {
@@ -336,10 +338,13 @@ async function createOutboundTrunkForWorkspace({ workspaceId, twilioSipDomainNam
   const address = `${twilioSipDomainName}`;
   
   // CRITICAL: LiveKit SDK requires transport as numeric enum, not string
-  // - 2 = TLS (when secure trunking is enabled)
-  // - 1 = TCP (when secure trunking is disabled)
+  // LiveKit SIPTransport protobuf enum:
+  //   0 = SIP_TRANSPORT_AUTO
+  //   1 = SIP_TRANSPORT_UDP
+  //   2 = SIP_TRANSPORT_TCP
+  //   3 = SIP_TRANSPORT_TLS
   // String "tls" fails with: "cannot encode field livekit.SIPOutboundTrunkUpdate.transport to JSON"
-  const transport = secure ? 2 : 1; // TLS (2) if secure, TCP (1) if not
+  const transport = secure ? 3 : 2; // TLS (3) if secure, TCP (2) if not
   const transportName = secure ? 'TLS' : 'TCP';
   
   const trunk = await sip.createSipOutboundTrunk(
@@ -349,7 +354,7 @@ async function createOutboundTrunkForWorkspace({ workspaceId, twilioSipDomainNam
     {
       authUsername: credUsername,
       authPassword: credPassword,
-      transport: transport, // Numeric enum: 2 = TLS, 1 = TCP
+      transport: transport, // Numeric enum: 3 = TLS, 2 = TCP
     }
   );
   console.log(`[createOutboundTrunkForWorkspace] Created trunk ${trunk.sipTrunkId} with ${transportName} transport (${transport}), secure: ${secure}`);
