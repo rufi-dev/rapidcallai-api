@@ -86,8 +86,25 @@ async function removeNumberFromOutboundTrunk(trunkId, phoneE164) {
 }
 
 /**
+ * Ensure an existing LiveKit SIP outbound trunk uses TLS transport.
+ * This is required when the Twilio trunk has secure: true.
+ */
+async function ensureOutboundTrunkUsesTls(trunkId) {
+  const sip = sipClient();
+  try {
+    await sip.updateSipOutboundTrunkFields(trunkId, {
+      transport: "tls",
+    });
+  } catch (e) {
+    // Best-effort: if update fails, log but don't throw
+    console.warn(`[ensureOutboundTrunkUsesTls] Failed to update trunk ${trunkId} to TLS: ${e?.message || e}`);
+  }
+}
+
+/**
  * Create a new LiveKit SIP outbound trunk pointing to a Twilio SIP trunk.
  * Uses the subaccount's termination credentials so Caller ID is recognized.
+ * Configures TLS transport for secure trunking (required when Twilio trunk has secure: true).
  */
 async function createOutboundTrunkForWorkspace({ workspaceId, twilioSipDomainName, credUsername, credPassword, numbers }) {
   const sip = sipClient();
@@ -99,6 +116,7 @@ async function createOutboundTrunkForWorkspace({ workspaceId, twilioSipDomainNam
     {
       authUsername: credUsername,
       authPassword: credPassword,
+      transport: "tls", // Required for secure Twilio trunks (secure: true)
     }
   );
   return { trunkId: trunk.sipTrunkId };
@@ -114,6 +132,7 @@ module.exports = {
   removeNumberFromInboundTrunk,
   removeNumberFromOutboundTrunk,
   createOutboundTrunkForWorkspace,
+  ensureOutboundTrunkUsesTls,
 };
 
 

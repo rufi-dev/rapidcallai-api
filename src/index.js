@@ -39,7 +39,7 @@ const {
 } = require("./storage");
 const { getPool, initSchema } = require("./db");
 const store = require("./store_pg");
-const { roomService, agentDispatchService, createParticipantToken, sipClient, addNumberToInboundTrunk, addNumberToOutboundTrunk, removeNumberFromInboundTrunk, removeNumberFromOutboundTrunk, createOutboundTrunkForWorkspace } = require("./livekit");
+const { roomService, agentDispatchService, createParticipantToken, sipClient, addNumberToInboundTrunk, addNumberToOutboundTrunk, removeNumberFromInboundTrunk, removeNumberFromOutboundTrunk, createOutboundTrunkForWorkspace, ensureOutboundTrunkUsesTls } = require("./livekit");
 const outboundWorker = require("./outbound_worker");
 const { startCallEgress, stopEgress, getEgressInfo } = require("./egress");
 const { getObject, headObject } = require("./s3");
@@ -1988,8 +1988,13 @@ app.post("/api/workspaces/:id/twilio/buy-number", requireAuth, async (req, res) 
           effectiveOutboundTrunkId = lkTrunkId;
           logger.info({ lkTrunkId, domainName }, "[buy-number] LiveKit outbound trunk created");
         } else {
-          // Trunk already exists — just add the number to it.
+          // Trunk already exists — ensure TLS and add the number to it.
           effectiveOutboundTrunkId = ws.livekitOutboundTrunkId;
+          try {
+            await ensureOutboundTrunkUsesTls(effectiveOutboundTrunkId);
+          } catch (e) {
+            logger.warn({ trunkId: effectiveOutboundTrunkId, err: String(e?.message || e) }, "[buy-number] failed to update trunk TLS (best-effort)");
+          }
           await addNumberToOutboundTrunk(effectiveOutboundTrunkId, purchased.phoneNumber);
           logger.info({ e164: purchased.phoneNumber, trunkId: effectiveOutboundTrunkId }, "[buy-number] added to existing LiveKit outbound trunk");
         }
@@ -2326,6 +2331,12 @@ app.post("/api/phone-numbers/:id/reprovision-outbound", requireAuth, async (req,
       });
       lkTrunkId = result.trunkId;
     } else {
+      // Ensure existing trunk uses TLS transport (required for secure Twilio trunks)
+      try {
+        await ensureOutboundTrunkUsesTls(lkTrunkId);
+      } catch (e) {
+        provisionErrors.push(`Update trunk TLS: ${e?.message || e}`);
+      }
       try {
         await addNumberToOutboundTrunk(lkTrunkId, phoneNumber.e164);
       } catch { /* may already be there */ }

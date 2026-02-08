@@ -9,7 +9,7 @@ if (require.main === module) {
 const { nanoid } = require("./id");
 const { logger } = require("./logger");
 const store = require("./store_pg");
-const { roomService, agentDispatchService, sipClient, addNumberToOutboundTrunk, createOutboundTrunkForWorkspace } = require("./livekit");
+const { roomService, agentDispatchService, sipClient, addNumberToOutboundTrunk, createOutboundTrunkForWorkspace, ensureOutboundTrunkUsesTls } = require("./livekit");
 const tw = require("./twilio");
 
 const USE_DB = Boolean(process.env.DATABASE_URL);
@@ -99,6 +99,13 @@ async function ensureWorkspaceOutboundTrunk(workspace, phoneRow) {
     lkTrunkId = result.trunkId;
     logger.info({ wsId, lkTrunkId, domainName }, "[outbound] step 4 done: LiveKit outbound trunk created");
   } else {
+    // Ensure existing trunk uses TLS transport (required for secure Twilio trunks)
+    try {
+      await ensureOutboundTrunkUsesTls(lkTrunkId);
+      logger.info({ wsId, lkTrunkId }, "[outbound] step 4a: ensured TLS transport on existing trunk");
+    } catch (e) {
+      logger.warn({ wsId, lkTrunkId, err: String(e?.message || e) }, "[outbound] step 4a: failed to update trunk TLS (best-effort)");
+    }
     // Ensure the number is on the existing trunk.
     logger.info({ wsId, lkTrunkId, e164: phoneRow.e164 }, "[outbound] step 4: adding number to existing LiveKit outbound trunk");
     try {
