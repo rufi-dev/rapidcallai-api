@@ -1067,7 +1067,18 @@ app.use("/api/billing", requireAuth, createBillingRouter({ store: USE_DB ? store
 app.use("/api/crm", requireAuth, createCrmRouter({ store: USE_DB ? store : null, USE_DB }));
 
 // --- Internal (used by the LiveKit agent to create/update call records) ---
-app.post("/api/internal/telephony/inbound/start", requireAgentSecret, async (req, res) => {
+// Log every request to inbound/start so we can see if the agent reaches the API (even before auth).
+app.post(
+  "/api/internal/telephony/inbound/start",
+  (req, _res, next) => {
+    console.log("[internal.telephony.inbound.start] request received", {
+      hasSecret: Boolean(req.headers["x-agent-secret"]),
+      bodyKeys: req.body && typeof req.body === "object" ? Object.keys(req.body) : [],
+    });
+    next();
+  },
+  requireAgentSecret,
+  async (req, res) => {
   const schema = z.object({
     roomName: z.string().min(1).max(200),
     to: z.string().min(3).max(32), // trunk phone number (E.164)
@@ -1225,7 +1236,8 @@ app.post("/api/internal/telephony/inbound/start", requireAgentSecret, async (req
     knowledgeFolderIds: Array.isArray(agent.knowledgeFolderIds) ? agent.knowledgeFolderIds : [],
     phoneNumber: { id: phoneRow.id, e164: phoneRow.e164 },
   });
-});
+  }
+);
 
 app.post("/api/internal/calls/:id/end", requireAgentSecret, async (req, res) => {
   const { id } = req.params;

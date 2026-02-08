@@ -136,7 +136,20 @@ For inbound calls to work you need:
 3. **Inbound agent set in Dashboard (recommended)**  
    In Phone Numbers, open the number and set **Inbound agent** to your voice agent. If this is not set, the API returns a fallback prompt and the agent will say “This number is not configured for inbound calls…”; set it to get your real agent prompt and voice.
 
-API logs to check: `[twilio-inbound] dial` (TwiML sent), `[internal.telephony.inbound.start]` (agent config requested). If you hear the fallback message, set the Inbound agent on the number in the dashboard.
+**Important — numbers on the SIP trunk:**  
+When a phone number is associated with the Twilio SIP trunk (for outbound), Twilio **ignores** that number’s “Voice URL”. Inbound calls go straight to the trunk’s **Origination URI** (your LiveKit SIP endpoint). So you will **not** see `[twilio-inbound]` in API logs for those calls. You will see `[internal.telephony.inbound.start]` when the agent joins and calls the API. Audio depends on: LiveKit dispatch rule, agent env (`SERVER_BASE_URL`, `AGENT_SHARED_SECRET`, `LIVEKIT_AGENT_NAME`), and (optionally) Inbound agent set in the dashboard.
+
+**After migrating to a new Twilio account:**
+
+1. Run **Reprovision** for each phone number (Dashboard → Phone Numbers → ⋮ → Reprovision) so the new account’s trunk, origination URI, and LiveKit trunks are correct.
+2. In Twilio Console → Elastic SIP Trunking → your trunk → **Origination**: confirm the URI is `sip:YOUR_LIVEKIT_SIP_ENDPOINT;transport=tls` (e.g. `sip:25f6q0vix3k.sip.livekit.cloud;transport=tls`).
+3. Ensure the Python agent has the correct `SERVER_BASE_URL`, `AGENT_SHARED_SECRET`, and `LIVEKIT_AGENT_NAME` (must match the dispatch rule’s “Agents” field).
+4. Place a test inbound call and watch API logs for `[internal.telephony.inbound.start]`. If that line appears but you still get no voice, the issue is likely agent dispatch or RTP/audio; if it never appears, the agent may not be joining or cannot reach the API.
+
+**Calling from Europe (or any international number):**  
+No impact. Twilio accepts callers from any country; the “From” number (e.g. +371…) is just caller ID. Inbound routing and audio depend on your trunk/origination and agent, not the caller’s region.
+
+API logs to check: `[internal.telephony.inbound.start]` (agent requested config). For numbers *not* on a trunk you may also see `[twilio-inbound] dial`. If you hear the fallback message, set the Inbound agent on the number in the dashboard.
 
 ## Observability (recommended for production)
 
@@ -163,11 +176,6 @@ API logs to check: `[twilio-inbound] dial` (TwiML sent), `[internal.telephony.in
 5) Remove the old secret and redeploy.
 
 **Tip:** Keep a calendar reminder (monthly or quarterly) and log each rotation.
-```
-
-For this to work in LiveKit Cloud, the agent must have:
-
-- `SERVER_BASE_URL=https://api.rapidcall.ai` (or your API domain)
 
 ## Troubleshooting
 
