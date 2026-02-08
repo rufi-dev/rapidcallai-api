@@ -1986,7 +1986,13 @@ app.post("/api/workspaces/:id/twilio/buy-number", requireAuth, async (req, res) 
             numbers: [purchased.phoneNumber],
           });
           effectiveOutboundTrunkId = lkTrunkId;
-          logger.info({ lkTrunkId, domainName }, "[buy-number] LiveKit outbound trunk created");
+          // Explicitly ensure TLS is set (createOutboundTrunkForWorkspace should set it, but double-check)
+          try {
+            await ensureOutboundTrunkUsesTls(lkTrunkId);
+          } catch (e) {
+            logger.warn({ trunkId: lkTrunkId, err: String(e?.message || e) }, "[buy-number] failed to ensure TLS on new trunk (best-effort)");
+          }
+          logger.info({ lkTrunkId, domainName }, "[buy-number] LiveKit outbound trunk created with TLS");
         } else {
           // Trunk already exists — ensure TLS and add the number to it.
           effectiveOutboundTrunkId = ws.livekitOutboundTrunkId;
