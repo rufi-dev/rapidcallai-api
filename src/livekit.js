@@ -233,7 +233,7 @@ async function ensureOutboundTrunkAddress(trunkId, twilioTerminationUri) {
 
 /**
  * Ensure an existing LiveKit SIP outbound trunk uses the correct transport.
- * Uses TLS (2) when secure trunking is enabled, TCP (1) when disabled.
+ * Uses TLS (3) when secure trunking is enabled, TCP (2) when disabled.
  * 
  * CRITICAL: LiveKit SDK requires transport as numeric enum:
  * LiveKit SIPTransport protobuf enum:
