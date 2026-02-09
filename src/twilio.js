@@ -477,6 +477,24 @@ async function ensureSipTrunkOriginationUri({ subaccountSid, trunkSid, sipEndpoi
 }
 
 /**
+ * List Origination URLs configured on a Twilio SIP trunk (for diagnostics).
+ * Returns array of { sid, sipUrl, friendlyName, priority, weight, enabled }.
+ */
+async function listSipTrunkOriginationUrls({ subaccountSid, trunkSid }) {
+  if (!subaccountSid || !trunkSid) return [];
+  const client = await getSubaccountDirectClient(subaccountSid);
+  const list = await client.trunking.v1.trunks(trunkSid).originationUrls.list({ limit: 50 });
+  return list.map((o) => ({
+    sid: o.sid,
+    sipUrl: o.sipUrl,
+    friendlyName: o.friendlyName,
+    priority: o.priority,
+    weight: o.weight,
+    enabled: o.enabled,
+  }));
+}
+
+/**
  * Ensure termination credentials exist on the Twilio SIP trunk.
  * Creates a credential list + credential and associates it with the trunk.
  * Returns { credUsername, credPassword }.
@@ -1113,6 +1131,7 @@ module.exports = {
   ensureSipTrunk,
   ensureSipTrunkTerminationCreds,
   ensureSipTrunkOriginationUri,
+  listSipTrunkOriginationUrls,
   associateNumberWithSipTrunk,
   ensureSipTrunkIpAcl,
   removeAllSipTrunkIpAcls,

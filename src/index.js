@@ -1830,6 +1830,35 @@ app.get("/api/workspaces/:id/twilio", requireAuth, async (req, res) => {
   return res.json({ workspace: ws, twilioConfigured: Boolean(tw.getMasterCreds()) });
 });
 
+// Inbound diagnostics: Twilio trunk origination URIs + LiveKit inbound trunk (for debugging "trunking issue").
+app.get("/api/workspaces/:id/inbound-diagnostics", requireAuth, async (req, res) => {
+  if (!USE_DB) return res.status(400).json({ error: "Requires Postgres mode" });
+  const id = String(req.params.id);
+  if (id !== req.workspace.id) return res.status(403).json({ error: "Forbidden" });
+  const ws = req.workspace;
+  const sipEndpoint = String(process.env.LIVEKIT_SIP_ENDPOINT || "").trim();
+  let originationUrls = [];
+  if (ws.twilioSubaccountSid && ws.twilioSipTrunkSid) {
+    try {
+      originationUrls = await tw.listSipTrunkOriginationUrls({
+        subaccountSid: ws.twilioSubaccountSid,
+        trunkSid: ws.twilioSipTrunkSid,
+      });
+    } catch (e) {
+      originationUrls = [{ error: String(e?.message || e) }];
+    }
+  }
+  const phoneNumbers = await store.listPhoneNumbers(ws.id);
+  return res.json({
+    LIVEKIT_SIP_ENDPOINT: sipEndpoint || null,
+    twilioSipTrunkSid: ws.twilioSipTrunkSid || null,
+    livekitInboundTrunkId: ws.livekitInboundTrunkId || null,
+    originationUrls,
+    expectedOriginationSipUrl: sipEndpoint ? `sip:${sipEndpoint};transport=tls` : null,
+    phoneNumbers: phoneNumbers.map((p) => ({ id: p.id, e164: p.e164, inboundAgentId: p.inboundAgentId || null })),
+  });
+});
+
 app.post("/api/workspaces/:id/twilio/subaccount", requireAuth, async (req, res) => {
   const id = String(req.params.id);
   if (id !== req.workspace.id) return res.status(403).json({ error: "Forbidden" });
@@ -2521,6 +2550,10 @@ app.post("/api/phone-numbers/:id/reprovision-outbound", requireAuth, async (req,
 
   const sipEndpoint = String(process.env.LIVEKIT_SIP_ENDPOINT || "").trim();
   const provisionErrors = [];
+  if (!sipEndpoint) {
+    console.warn("[reprovision-outbound] LIVEKIT_SIP_ENDPOINT is not set — inbound calls will fail (Twilio trunking issue). Set it to your LiveKit SIP host, e.g. 25f6q0vix3k.sip.livekit.cloud");
+    provisionErrors.push("LIVEKIT_SIP_ENDPOINT is not set. Inbound calls require it. Set to your LiveKit SIP host (e.g. 25f6q0vix3k.sip.livekit.cloud).");
+  }
   try {
       // 1) Ensure Twilio SIP trunk (with secure trunking + call transfer).
       const { trunkSid, domainName, secure } = await tw.ensureSipTrunk({
@@ -2561,6 +2594,8 @@ app.post("/api/phone-numbers/:id/reprovision-outbound", requireAuth, async (req,
 
     // 3b) Ensure Origination URI → LiveKit SIP endpoint (required for inbound calls).
     if (sipEndpoint) {
+      const expectedSipUrl = `sip:${sipEndpoint};transport=tls`;
+      console.log(`[reprovision-outbound] Setting Twilio trunk origination for inbound: ${expectedSipUrl}`);
       try {
         await tw.ensureSipTrunkOriginationUri({
           subaccountSid: ws.twilioSubaccountSid,
@@ -2568,7 +2603,9 @@ app.post("/api/phone-numbers/:id/reprovision-outbound", requireAuth, async (req,
           sipEndpoint,
           secure: isSecure,
         });
+        console.log(`[reprovision-outbound] ✓ Origination URI set — inbound calls will route to LiveKit`);
       } catch (e) {
+        console.warn(`[reprovision-outbound] Origination URI failed: ${e?.message || e}`);
         provisionErrors.push(`Origination URI: ${e?.message || e}`);
       }
     }

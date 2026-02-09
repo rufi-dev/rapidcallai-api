@@ -179,7 +179,56 @@ API logs to check: `[internal.telephony.inbound.start]` (agent requested config)
 
 ## Troubleshooting
 
-### “database does not exist”
+### Nothing in API logs when I make an inbound call
+
+If **no line appears** in the API logs when you call your number, the request from the agent to your API never reaches the server. The flow is: **Twilio → LiveKit (Origination) → room created → dispatch rule runs → agent joins → agent calls your API**. So "nothing in log" usually means either the **agent is not being dispatched** or the **agent cannot reach the API**.
+
+**1. Confirm the API is reachable from the agent**
+
+From the **same machine (or network) where the Python agent runs**, run (replace URL and secret):
+
+```bash
+curl -s -o /dev/null -w "%{http_code}" -X POST "https://api.rapidcall.ai/api/internal/telephony/inbound/start" \
+  -H "Content-Type: application/json" \
+  -H "x-agent-secret: YOUR_AGENT_SHARED_SECRET" \
+  -d '{"roomName":"test","to":"+17073808675","from":"+3710000000"}'
+```
+
+- If you see **201** and a log line like `[internal.telephony.inbound.start] request received`, the API is reachable and the problem is that the **agent is not being dispatched** when you call.
+- If you see **401**, the secret is wrong: `AGENT_SHARED_SECRET` on the API and on the agent must match exactly.
+- If you see **connection refused / timeout / no route**, the agent host cannot reach the API (firewall, wrong `SERVER_BASE_URL`, or DNS).
+
+**2. Confirm the agent is running and registered**
+
+- The agent must be **running** and connected to LiveKit.
+- It must register with the **same name** as in your LiveKit dispatch rule (e.g. `LIVEKIT_AGENT_NAME=VoiceAgent` if the rule's "Agents" is `VoiceAgent`).
+- Check agent logs when you call: you should see it joining a room; if it never joins, the dispatch rule or room name may not match.
+
+**3. Confirm LiveKit creates a room and dispatches**
+
+- In **LiveKit Cloud** → your project → **Rooms** (or SIP / call logs), check whether a **room** is created when you place the call.
+- If no room is created, Twilio may not be sending the call to LiveKit (check **Origination URI** on the Twilio trunk).
+- If a room is created but no agent joins, the **dispatch rule** may not match (trunk, room prefix, or agent name).
+
+After deploying the latest API, you will see at least `[internal.telephony.inbound.start] request received` for **every** POST to that URL (including failed auth). If you still see nothing when you call, the agent is not calling the API — fix dispatch and agent connectivity first.
+
+### Twilio "trunking issue" / agent doesn't connect on inbound
+
+If Twilio reports a trunking error when you call your number, or the call never reaches the agent:
+
+1. **Check inbound diagnostics** (Dashboard logged in, or with a valid session):
+   ```bash
+   curl -s -H "Authorization: Bearer YOUR_JWT" "https://api.rapidcall.ai/api/workspaces/YOUR_WORKSPACE_ID/inbound-diagnostics"
+   ```
+   Look at `LIVEKIT_SIP_ENDPOINT`, `originationUrls`, and `expectedOriginationSipUrl`. If `originationUrls` is empty or doesn't match `expectedOriginationSipUrl`, the Twilio trunk has no (or wrong) origination and inbound will fail.
+
+2. **Set `LIVEKIT_SIP_ENDPOINT`** on the API server (e.g. in `.env`): your LiveKit SIP host only, e.g. `25f6q0vix3k.sip.livekit.cloud` (no `sip:` or port). Restart the API.
+
+3. **Run Reprovision** for the phone number (Dashboard → Phone Numbers → ⋮ → Reprovision). Watch API logs for `[reprovision-outbound] Setting Twilio trunk origination for inbound: sip:...;transport=tls` and `✓ Origination URI set`. If you see `LIVEKIT_SIP_ENDPOINT is not set`, set it and reprovision again.
+
+4. Call the diagnostics URL again and confirm `originationUrls` now contains the expected URI. Then place a test inbound call.
+
+### "database does not exist"
 
 Your `DATABASE_URL` points to a DB name that hasn’t been created yet.
 
