@@ -202,7 +202,15 @@ curl -s -o /dev/null -w "%{http_code}" -X POST "https://api.rapidcall.ai/api/int
 
 - The agent must be **running** and connected to LiveKit.
 - It must register with the **same name** as in your LiveKit dispatch rule (e.g. `LIVEKIT_AGENT_NAME=VoiceAgent` if the rule's "Agents" is `VoiceAgent`).
-- Check agent logs when you call: you should see it joining a room; if it never joins, the dispatch rule or room name may not match.
+- When the agent is dispatched you should see in **agent logs**: `Job received for room call-...`. If you never see that when you call, LiveKit is not dispatching the agent (see dispatch rule checklist below).
+
+**Dispatch rule checklist (agent never joins)**
+
+In **LiveKit Cloud** → your project → **Telephony** → **Dispatch rules** ([docs](https://docs.livekit.io/telephony/accepting-calls/dispatch-rule/)):
+
+- **Trunk match:** The rule must apply to the trunk that receives the call. Your number is on an **inbound trunk** (e.g. `ST_fcSgRLMVYMDQ`). Either set the rule to "All numbers and trunks" or include that trunk ID in the rule’s **Trunks**. If the rule only matches a different trunk, the agent will not be dispatched.
+- **Agent name:** The rule’s **Room configuration** → **Agents** must list an `agentName` that **exactly** matches `LIVEKIT_AGENT_NAME` in the Python agent (e.g. `VoiceAgent`). Case-sensitive.
+- **Room prefix:** For "Caller (individual)" rules, the room name will be like `call-+1234567890-xxxx`. The rule’s room prefix (e.g. `call-`) must match how rooms are created.
 
 **3. Confirm LiveKit creates a room and dispatches**
 
