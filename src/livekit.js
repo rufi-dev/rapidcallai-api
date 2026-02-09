@@ -103,6 +103,18 @@ function isTrunkNotFoundError(error) {
 }
 
 /**
+ * If LiveKit returns "Conflicting inbound SIP Trunks: ... and \"ST_xxx\" ...", the number
+ * is already on an existing trunk. Parse and return that trunk ID so we can use it instead of creating.
+ * @param {Error|string} error - The error from createSipInboundTrunk
+ * @returns {string|null} - The existing trunk ID (e.g. ST_fcSgRLMVYMDQ) or null
+ */
+function parseConflictingInboundTrunkId(error) {
+  const msg = String(error?.message || error || "");
+  const match = msg.match(/ and "(ST_[A-Za-z0-9]+)"/);
+  return match ? match[1] : null;
+}
+
+/**
  * Get the current state of a LiveKit SIP outbound trunk.
  * Note: This may not be available in all SDK versions - falls back to listing all trunks.
  * Throws a specific error if the trunk doesn't exist (so callers can recreate it).
@@ -378,6 +390,7 @@ module.exports = {
   getOutboundTrunkInfo,
   deleteOutboundTrunk,
   isTrunkNotFoundError,
+  parseConflictingInboundTrunkId,
 };
 
 

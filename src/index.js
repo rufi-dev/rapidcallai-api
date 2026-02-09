@@ -39,7 +39,7 @@ const {
 } = require("./storage");
 const { getPool, initSchema } = require("./db");
 const store = require("./store_pg");
-const { roomService, agentDispatchService, createParticipantToken, sipClient, addNumberToInboundTrunk, addNumberToOutboundTrunk, removeNumberFromInboundTrunk, removeNumberFromOutboundTrunk, createInboundTrunkForWorkspace, createOutboundTrunkForWorkspace, ensureOutboundTrunkUsesTls, ensureOutboundTrunkTransport, ensureOutboundTrunkAddress, deleteOutboundTrunk, getOutboundTrunkInfo, isTrunkNotFoundError } = require("./livekit");
+const { roomService, agentDispatchService, createParticipantToken, sipClient, addNumberToInboundTrunk, addNumberToOutboundTrunk, removeNumberFromInboundTrunk, removeNumberFromOutboundTrunk, createInboundTrunkForWorkspace, createOutboundTrunkForWorkspace, ensureOutboundTrunkUsesTls, ensureOutboundTrunkTransport, ensureOutboundTrunkAddress, deleteOutboundTrunk, getOutboundTrunkInfo, isTrunkNotFoundError, parseConflictingInboundTrunkId } = require("./livekit");
 const outboundWorker = require("./outbound_worker");
 const { startCallEgress, stopEgress, getEgressInfo } = require("./egress");
 const { getObject, headObject } = require("./s3");
@@ -2044,9 +2044,16 @@ app.post("/api/workspaces/:id/twilio/buy-number", requireAuth, async (req, res) 
           
           logger.info({ workspaceId: ws.id, trunkId: effectiveInboundTrunkId, e164: purchased.phoneNumber }, "[buy-number] auto-created LiveKit inbound trunk");
         } catch (e) {
-          const msg = String(e?.message || e);
-          logger.warn({ workspaceId: ws.id, e164: purchased.phoneNumber, err: msg }, "[buy-number] failed to auto-create inbound trunk");
-          provisionErrors.push(`Inbound trunk creation: ${msg}`);
+          const existingTrunkId = parseConflictingInboundTrunkId(e);
+          if (existingTrunkId) {
+            effectiveInboundTrunkId = existingTrunkId;
+            await store.updateWorkspace(ws.id, { livekitInboundTrunkId: effectiveInboundTrunkId });
+            logger.info({ workspaceId: ws.id, trunkId: effectiveInboundTrunkId, e164: purchased.phoneNumber }, "[buy-number] using existing inbound trunk (number already on it)");
+          } else {
+            const msg = String(e?.message || e);
+            logger.warn({ workspaceId: ws.id, e164: purchased.phoneNumber, err: msg }, "[buy-number] failed to auto-create inbound trunk");
+            provisionErrors.push(`Inbound trunk creation: ${msg}`);
+          }
         }
       } else {
         // Add number to existing inbound trunk
@@ -2068,9 +2075,16 @@ app.post("/api/workspaces/:id/twilio/buy-number", requireAuth, async (req, res) 
               await store.updateWorkspace(ws.id, { livekitInboundTrunkId: effectiveInboundTrunkId });
               logger.info({ workspaceId: ws.id, trunkId: effectiveInboundTrunkId, e164: purchased.phoneNumber }, "[buy-number] created new inbound trunk");
             } catch (createErr) {
-              const createMsg = String(createErr?.message || createErr);
-              logger.warn({ workspaceId: ws.id, e164: purchased.phoneNumber, err: createMsg }, "[buy-number] failed to create inbound trunk");
-              provisionErrors.push(`Inbound trunk creation: ${createMsg}`);
+              const existingTrunkId = parseConflictingInboundTrunkId(createErr);
+              if (existingTrunkId) {
+                effectiveInboundTrunkId = existingTrunkId;
+                await store.updateWorkspace(ws.id, { livekitInboundTrunkId: effectiveInboundTrunkId });
+                logger.info({ workspaceId: ws.id, trunkId: effectiveInboundTrunkId, e164: purchased.phoneNumber }, "[buy-number] using existing inbound trunk (number already on it)");
+              } else {
+                const createMsg = String(createErr?.message || createErr);
+                logger.warn({ workspaceId: ws.id, e164: purchased.phoneNumber, err: createMsg }, "[buy-number] failed to create inbound trunk");
+                provisionErrors.push(`Inbound trunk creation: ${createMsg}`);
+              }
             }
           } else {
             logger.warn({ e164: purchased.phoneNumber, err: msg }, "[buy-number] failed to add to inbound trunk");
@@ -2787,8 +2801,14 @@ app.post("/api/phone-numbers/:id/reprovision-outbound", requireAuth, async (req,
         effectiveInboundTrunkId = inboundResult.trunkId;
         console.log(`[reprovision-outbound] ✓ Created inbound trunk ${effectiveInboundTrunkId}`);
       } catch (e) {
-        console.warn(`[reprovision-outbound] Failed to create inbound trunk: ${e?.message || e}`);
-        provisionErrors.push(`Inbound trunk creation: ${e?.message || e}`);
+        const existingTrunkId = parseConflictingInboundTrunkId(e);
+        if (existingTrunkId) {
+          effectiveInboundTrunkId = existingTrunkId;
+          console.log(`[reprovision-outbound] ✓ Number already on existing inbound trunk ${existingTrunkId}, using it`);
+        } else {
+          console.warn(`[reprovision-outbound] Failed to create inbound trunk: ${e?.message || e}`);
+          provisionErrors.push(`Inbound trunk creation: ${e?.message || e}`);
+        }
       }
     } else {
       // Ensure the phone number is registered on the existing inbound trunk
@@ -2802,7 +2822,7 @@ app.post("/api/phone-numbers/:id/reprovision-outbound", requireAuth, async (req,
         if (isAlready) {
           // Number already on trunk — ok
         } else if (isTrunkMissing) {
-          // Inbound trunk no longer exists in LiveKit — create a new one
+          // Inbound trunk no longer exists in LiveKit — create a new one or use existing that has this number
           console.warn(`[reprovision-outbound] Inbound trunk ${effectiveInboundTrunkId} not found in LiveKit, creating new one`);
           effectiveInboundTrunkId = null;
           try {
@@ -2813,8 +2833,14 @@ app.post("/api/phone-numbers/:id/reprovision-outbound", requireAuth, async (req,
             effectiveInboundTrunkId = inboundResult.trunkId;
             console.log(`[reprovision-outbound] ✓ Created new inbound trunk ${effectiveInboundTrunkId}`);
           } catch (createErr) {
-            console.warn(`[reprovision-outbound] Failed to create inbound trunk: ${createErr?.message || createErr}`);
-            provisionErrors.push(`Inbound trunk creation: ${createErr?.message || createErr}`);
+            const existingTrunkId = parseConflictingInboundTrunkId(createErr);
+            if (existingTrunkId) {
+              effectiveInboundTrunkId = existingTrunkId;
+              console.log(`[reprovision-outbound] ✓ Number already on existing inbound trunk ${existingTrunkId}, using it`);
+            } else {
+              console.warn(`[reprovision-outbound] Failed to create inbound trunk: ${createErr?.message || createErr}`);
+              provisionErrors.push(`Inbound trunk creation: ${createErr?.message || createErr}`);
+            }
           }
         } else {
           console.warn(`[reprovision-outbound] Failed to add number to inbound trunk: ${e?.message || e}`);
