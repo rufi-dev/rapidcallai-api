@@ -196,6 +196,8 @@ curl -s -o /dev/null -w "%{http_code}" -X POST "https://api.rapidcall.ai/api/int
 
 - If you see **201** and a log line like `[internal.telephony.inbound.start] request received`, the API is reachable and the problem is that the **agent is not being dispatched** when you call.
 - If you see **401**, the secret is wrong: `AGENT_SHARED_SECRET` on the API and on the agent must match exactly.
+- If you see **403**, the server was rejecting the request due to missing/invalid **Origin** (browser-style check). Internal routes (`/api/internal/*`) now skip that check so the agent and curl work without an Origin header. Redeploy the API and try again.
+- If you see **404**, you may have used **GET** — this endpoint accepts **POST** only (with JSON body). Use `-X POST` and `-d '...'` as in the example.
 - If you see **connection refused / timeout / no route**, the agent host cannot reach the API (firewall, wrong `SERVER_BASE_URL`, or DNS).
 
 **2. Confirm the agent is running and registered**
@@ -224,7 +226,11 @@ After deploying the latest API, you will see at least `[internal.telephony.inbou
 
 If Twilio reports a trunking error when you call your number, or the call never reaches the agent:
 
-1. **Check inbound diagnostics** (Dashboard logged in, or with a valid session):
+1. **Check inbound diagnostics** (easiest: use the dashboard):
+   - In the **dashboard**, go to **Phone Numbers** and click **"Check inbound setup"**. No JWT needed — it uses your logged-in session.
+   - Or with curl (need a JWT and workspace ID):
+     - **Workspace ID:** Your RapidCall workspace ID (e.g. `aVHHDh2qq7`). After logging in, open browser **DevTools** (F12) → **Application** (Chrome) or **Storage** (Firefox) → **Local Storage** or **Session Storage** → select `https://dashboard.rapidcall.ai` → look for keys that might contain workspace info, or call `GET /api/me` with a token and read `workspace.id` from the JSON.
+     - **JWT:** Log in to the dashboard, then **DevTools** → **Application** → **Local Storage** (or **Session Storage**) → `https://dashboard.rapidcall.ai` → key `auth_token`. Copy that value — that’s your Bearer token.
    ```bash
    curl -s -H "Authorization: Bearer YOUR_JWT" "https://api.rapidcall.ai/api/workspaces/YOUR_WORKSPACE_ID/inbound-diagnostics"
    ```

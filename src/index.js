@@ -490,6 +490,11 @@ function isWebhookPath(pathname) {
   );
 }
 
+// Internal routes use x-agent-secret; no browser Origin (e.g. agent or curl).
+function isInternalAgentPath(pathname) {
+  return pathname.startsWith("/api/internal/");
+}
+
 function isAllowedOrigin(origin) {
   if (!origin) return false;
   if (clientOrigins.includes("*")) return true;
@@ -522,7 +527,7 @@ app.use((req, res, next) => {
 app.use((req, res, next) => {
   if (!isUnsafeMethod(req.method)) return next();
   if (req.method === "OPTIONS") return next();
-  if (isAuthPath(req.path) || isWebhookPath(req.path)) return next();
+  if (isAuthPath(req.path) || isWebhookPath(req.path) || isInternalAgentPath(req.path)) return next();
 
   const origin = String(req.headers.origin || "").trim();
   const referer = String(req.headers.referer || "").trim();
