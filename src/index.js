@@ -1236,6 +1236,7 @@ app.post(
     prompt: promptUsed,
     welcome: agent.welcome ?? {},
     voice: { ...(agent.voice ?? {}), backgroundAudio: agent.backgroundAudio ?? {} },
+    backgroundAudio: agent.backgroundAudio ?? {},
     llmModel: String(agent.llmModel || ""),
     maxCallSeconds: Number(agent.maxCallSeconds || 0),
     knowledgeFolderIds: Array.isArray(agent.knowledgeFolderIds) ? agent.knowledgeFolderIds : [],
