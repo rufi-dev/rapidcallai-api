@@ -446,7 +446,7 @@ const WelcomeConfigSchema = z
 
 const BackgroundAudioConfigSchema = z
   .object({
-    preset: z.enum(["none", "office", "keyboard"]).optional(),
+    preset: z.enum(["none", "office", "keyboard", "office1", "office2"]).optional(),
     ambientVolume: z.number().min(0).max(1).optional(),
     thinkingVolume: z.number().min(0).max(1).optional(),
   })
