@@ -1728,6 +1728,7 @@ app.put("/api/agents/:id", requireAuth, async (req, res) => {
     voice: VoiceConfigSchema,
     backgroundAudio: BackgroundAudioConfigSchema,
     enabledTools: z.array(z.string()).optional(),
+    toolConfigs: z.record(z.string(), z.object({ name: z.string().max(80).optional(), description: z.string().max(800).optional() })).optional(),
     llmModel: LlmModelSchema,
     autoEvalEnabled: z.boolean().optional(),
     knowledgeFolderIds: KnowledgeFolderIdsSchema,
@@ -1774,6 +1775,7 @@ app.put("/api/agents/:id", requireAuth, async (req, res) => {
     autoEvalEnabled: parsed.data.autoEvalEnabled == null ? (current.autoEvalEnabled ?? false) : Boolean(parsed.data.autoEvalEnabled),
     knowledgeFolderIds: parsed.data.knowledgeFolderIds ?? (current.knowledgeFolderIds ?? []),
     enabledTools: parsed.data.enabledTools ?? (current.enabledTools ?? ["end_call"]),
+    toolConfigs: parsed.data.toolConfigs ?? (current.toolConfigs ?? {}),
     maxCallSeconds:
       parsed.data.maxCallSeconds == null
         ? (current.maxCallSeconds ?? 0)
@@ -3238,6 +3240,7 @@ app.post("/api/agents/:id/start", requireAuth, async (req, res) => {
   const voice = startParsed?.data?.voice ?? agent.voice ?? {};
   const enabledTools = startParsed?.data?.enabledTools ?? agent.enabledTools ?? ["end_call"];
   const backgroundAudio = agent.backgroundAudio ?? {};
+  const toolConfigs = agent.toolConfigs && typeof agent.toolConfigs === "object" ? agent.toolConfigs : {};
   const llmModel = String(agent.llmModel || "").trim() || getBillingConfig().defaultLlmModel;
   const maxCallSeconds = Number(agent.maxCallSeconds || 0);
 
@@ -3301,6 +3304,7 @@ app.post("/api/agents/:id/start", requireAuth, async (req, res) => {
         promptVariant: variantChosen?.prompt ?? null,
         voice,
         enabledTools: Array.isArray(enabledTools) ? enabledTools : ["end_call"],
+        toolConfigs,
         backgroundAudio,
         llmModel,
         maxCallSeconds,
