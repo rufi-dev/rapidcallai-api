@@ -1729,6 +1729,7 @@ app.put("/api/agents/:id", requireAuth, async (req, res) => {
     backgroundAudio: BackgroundAudioConfigSchema,
     enabledTools: z.array(z.string()).optional(),
     toolConfigs: z.record(z.string(), z.object({ name: z.string().max(80).optional(), description: z.string().max(800).optional() })).optional(),
+    backchannelEnabled: z.boolean().optional(),
     llmModel: LlmModelSchema,
     autoEvalEnabled: z.boolean().optional(),
     knowledgeFolderIds: KnowledgeFolderIdsSchema,
@@ -3241,6 +3242,7 @@ app.post("/api/agents/:id/start", requireAuth, async (req, res) => {
   const enabledTools = startParsed?.data?.enabledTools ?? agent.enabledTools ?? ["end_call"];
   const backgroundAudio = agent.backgroundAudio ?? {};
   const toolConfigs = agent.toolConfigs && typeof agent.toolConfigs === "object" ? agent.toolConfigs : {};
+  const backchannelEnabled = Boolean(agent.backchannelEnabled);
   const llmModel = String(agent.llmModel || "").trim() || getBillingConfig().defaultLlmModel;
   const maxCallSeconds = Number(agent.maxCallSeconds || 0);
 
@@ -3305,6 +3307,7 @@ app.post("/api/agents/:id/start", requireAuth, async (req, res) => {
         voice,
         enabledTools: Array.isArray(enabledTools) ? enabledTools : ["end_call"],
         toolConfigs,
+        backchannelEnabled,
         backgroundAudio,
         llmModel,
         maxCallSeconds,
