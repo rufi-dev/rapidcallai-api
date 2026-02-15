@@ -1601,6 +1601,100 @@ function openaiAutoEvaluateCall({ apiKey, model, input }) {
   });
 }
 
+/**
+ * Run post-call data extraction: LLM reads transcript and returns one value per extraction item.
+ * @param {{ apiKey: string, model: string, transcriptText: string, extractionItems: Array<{ name: string, type?: string, description?: string, options?: string[] }> }}
+ * @returns {Promise<Array<{ name: string, value: string|number|boolean|null, description?: string }>>}
+ */
+function runPostCallExtraction({ apiKey, model, transcriptText, extractionItems }) {
+  if (!extractionItems || extractionItems.length === 0) {
+    return Promise.resolve([]);
+  }
+  const itemDescriptions = extractionItems
+    .map((item, i) => {
+      const desc = item.description || item.name;
+      const type = (item.type || "text").toLowerCase();
+      const opts = Array.isArray(item.options) && item.options.length > 0 ? ` One of: ${item.options.join(", ")}.` : "";
+      return `${i + 1}. "${item.name}" (${type}): ${desc}${opts}`;
+    })
+    .join("\n");
+
+  const systemContent =
+    "You extract structured data from a call transcript. " +
+    "Return ONLY a JSON array of objects, one per item, each with exactly: name (string), value (string, number, boolean, or null). " +
+    "Use the exact item names given. If something cannot be determined from the transcript, use null for value. " +
+    "For booleans use true/false. For numbers use a number, not a string.";
+
+  const userContent = `Transcript:\n${transcriptText.slice(0, 12000)}\n\nExtract these items:\n${itemDescriptions}`;
+
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify({
+      model,
+      temperature: 0.1,
+      messages: [
+        { role: "system", content: systemContent },
+        { role: "user", content: userContent },
+      ],
+    });
+
+    const req = https.request(
+      {
+        hostname: "api.openai.com",
+        path: "/v1/chat/completions",
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${apiKey}`,
+          "content-type": "application/json",
+          "content-length": Buffer.byteLength(body),
+        },
+      },
+      (res) => {
+        let data = "";
+        res.on("data", (c) => (data += c));
+        res.on("end", () => {
+          try {
+            if (res.statusCode < 200 || res.statusCode >= 300) {
+              return reject(new Error(`OpenAI error ${res.statusCode}: ${String(data).slice(0, 400)}`));
+            }
+            const parsed = JSON.parse(data);
+            const txt =
+              parsed?.choices?.[0]?.message?.content != null ? String(parsed.choices[0].message.content).trim() : "";
+            if (!txt) {
+              return resolve(extractionItems.map((item) => ({ name: item.name, value: null, description: item.description })));
+            }
+            let arr;
+            try {
+              arr = JSON.parse(txt);
+            } catch {
+              const start = txt.indexOf("[");
+              const end = txt.lastIndexOf("]");
+              if (start !== -1 && end !== -1 && end > start) arr = JSON.parse(txt.slice(start, end + 1));
+            }
+            if (!Array.isArray(arr)) {
+              return resolve(extractionItems.map((item) => ({ name: item.name, value: null, description: item.description })));
+            }
+            const results = extractionItems.map((item) => {
+              const found = arr.find((o) => o && String(o.name).trim() === String(item.name).trim());
+              const val = found && Object.prototype.hasOwnProperty.call(found, "value") ? found.value : null;
+              return {
+                name: item.name,
+                value: val === undefined ? null : val,
+                description: item.description,
+              };
+            });
+            resolve(results);
+          } catch (e) {
+            reject(e);
+          }
+        });
+      }
+    );
+    req.on("error", reject);
+    req.write(body);
+    req.end();
+  });
+}
+
 // Serve uploaded call recordings (web-test recordings)
 const RECORDINGS_DIR = path.join(__dirname, "..", "recordings");
 if (!fs.existsSync(RECORDINGS_DIR)) fs.mkdirSync(RECORDINGS_DIR, { recursive: true });
@@ -4491,13 +4585,57 @@ app.post("/api/calls/:id/end", requireAuth, async (req, res) => {
   }
 
   if (USE_DB) {
-    const updated = await store.updateCall(id, {
+    const updatePayload = {
       endedAt: next.endedAt,
       durationSec: next.durationSec,
       outcome: next.outcome,
       transcript: next.transcript,
       recording: next.recording ?? null,
-    });
+    };
+
+    // Post-call data extraction: if agent has extraction items and we have transcript, run LLM extraction.
+    const extractionItems =
+      current.agentId && next.transcript && next.transcript.length > 0
+        ? (async () => {
+            try {
+              const agent = await store.getAgent(req.workspace.id, current.agentId);
+              const items = Array.isArray(agent?.postCallDataExtraction) ? agent.postCallDataExtraction : [];
+              if (items.length === 0) return null;
+              const apiKey = String(process.env.OPENAI_API_KEY || "").trim();
+              if (!apiKey) return null;
+              const model =
+                String(agent?.postCallExtractionModel || "").trim() ||
+                String(process.env.OPENAI_EVAL_MODEL || process.env.OPENAI_GENERATE_MODEL || "gpt-4.1-mini").trim();
+              const transcriptText = next.transcript
+                .map((t) => `${t.role === "user" ? "USER" : "AGENT"}: ${String(t.text || "").trim()}`)
+                .filter(Boolean)
+                .join("\n");
+              const results = await runPostCallExtraction({
+                apiKey,
+                model,
+                transcriptText,
+                extractionItems: items.map((it) => ({
+                  name: it.name || "",
+                  type: it.type,
+                  description: it.description || it.name,
+                  options: it.options,
+                })),
+              });
+              return { analysisStatus: "completed", postCallExtractionResults: results };
+            } catch (e) {
+              logger.warn({ requestId: req.requestId, err: String(e?.message || e) }, "[calls.end] post-call extraction failed");
+              return { analysisStatus: "failed", postCallExtractionResults: [] };
+            }
+          })()
+        : null;
+
+    const extractionResult = await extractionItems;
+    if (extractionResult) {
+      updatePayload.analysisStatus = extractionResult.analysisStatus;
+      updatePayload.postCallExtractionResults = extractionResult.postCallExtractionResults;
+    }
+
+    const updated = await store.updateCall(id, updatePayload);
 
     // Billing finalization (trial debit / OpenMeter event). Best-effort.
     try {
