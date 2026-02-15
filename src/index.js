@@ -549,17 +549,18 @@ app.use((req, res, next) => {
   })(req, res, next);
 });
 
-// Enforce Origin check for state-changing requests.
-// Origin header validation provides equivalent CSRF protection — a malicious site
-// cannot forge the Origin header, so if the origin is in our allowlist the request
-// is safe.  The cookie-based CSRF token is kept as a secondary check but is no
-// longer required when the origin is already verified (fixes cross-subdomain setups
-// where the csrf_token cookie set by api.rapidcall.ai is unreadable by JS on
-// dashboard.rapidcall.ai).
+// Enforce Origin check for state-changing requests (browser CSRF protection).
+// Skip origin check when the request uses an API key (Bearer rck_...) — API clients
+// (Postman, server-to-server) don't send Origin; the key itself proves intent.
 app.use((req, res, next) => {
   if (!isUnsafeMethod(req.method)) return next();
   if (req.method === "OPTIONS") return next();
   if (isAuthPath(req.path) || isWebhookPath(req.path) || isInternalAgentPath(req.path)) return next();
+
+  const authHeader = String(req.headers.authorization || "").trim();
+  if (authHeader.toLowerCase().startsWith("bearer ") && authHeader.slice(7).startsWith("rck_")) {
+    return next(); // API key auth; no origin required
+  }
 
   const origin = String(req.headers.origin || "").trim();
   const referer = String(req.headers.referer || "").trim();
@@ -568,9 +569,6 @@ app.use((req, res, next) => {
     return res.status(403).json({ error: "Origin not allowed. Add it to CLIENT_ORIGIN." });
   }
 
-  // Origin is verified and in our allowlist — this is sufficient CSRF protection.
-  // Bearer token or valid origin both prove the request is intentional, not a
-  // cross-site attack.
   return next();
 });
 
