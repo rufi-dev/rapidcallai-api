@@ -1727,6 +1727,7 @@ app.put("/api/agents/:id", requireAuth, async (req, res) => {
     welcome: WelcomeConfigSchema,
     voice: VoiceConfigSchema,
     backgroundAudio: BackgroundAudioConfigSchema,
+    enabledTools: z.array(z.string()).optional(),
     llmModel: LlmModelSchema,
     autoEvalEnabled: z.boolean().optional(),
     knowledgeFolderIds: KnowledgeFolderIdsSchema,
@@ -1772,6 +1773,7 @@ app.put("/api/agents/:id", requireAuth, async (req, res) => {
     llmModel: parsed.data.llmModel ?? (current.llmModel ?? ""),
     autoEvalEnabled: parsed.data.autoEvalEnabled == null ? (current.autoEvalEnabled ?? false) : Boolean(parsed.data.autoEvalEnabled),
     knowledgeFolderIds: parsed.data.knowledgeFolderIds ?? (current.knowledgeFolderIds ?? []),
+    enabledTools: parsed.data.enabledTools ?? (current.enabledTools ?? ["end_call"]),
     maxCallSeconds:
       parsed.data.maxCallSeconds == null
         ? (current.maxCallSeconds ?? 0)
@@ -3171,6 +3173,12 @@ app.post("/api/agents/:id/start", requireAuth, async (req, res) => {
   const startSchema = z
     .object({
       welcome: WelcomeConfigSchema,
+      voice: z.object({
+        provider: z.enum(["cartesia", "elevenlabs"]).optional(),
+        model: z.string().optional(),
+        voiceId: z.string().optional(),
+      }).optional(),
+      enabledTools: z.array(z.string()).optional(),
     })
     .optional();
   const startParsed = startSchema?.safeParse(req.body);
@@ -3227,7 +3235,8 @@ app.post("/api/agents/:id/start", requireAuth, async (req, res) => {
     aiMessageText: startParsed?.data?.welcome?.aiMessageText ?? agent.welcome?.aiMessageText ?? "",
     aiDelaySeconds: startParsed?.data?.welcome?.aiDelaySeconds ?? agent.welcome?.aiDelaySeconds ?? 0,
   };
-  const voice = agent.voice ?? {};
+  const voice = startParsed?.data?.voice ?? agent.voice ?? {};
+  const enabledTools = startParsed?.data?.enabledTools ?? agent.enabledTools ?? ["end_call"];
   const backgroundAudio = agent.backgroundAudio ?? {};
   const llmModel = String(agent.llmModel || "").trim() || getBillingConfig().defaultLlmModel;
   const maxCallSeconds = Number(agent.maxCallSeconds || 0);
@@ -3291,6 +3300,7 @@ app.post("/api/agents/:id/start", requireAuth, async (req, res) => {
         promptBase: basePrompt,
         promptVariant: variantChosen?.prompt ?? null,
         voice,
+        enabledTools: Array.isArray(enabledTools) ? enabledTools : ["end_call"],
         backgroundAudio,
         llmModel,
         maxCallSeconds,

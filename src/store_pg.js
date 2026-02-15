@@ -13,8 +13,7 @@ function rowToUser(r) {
 
 function rowToAgent(r) {
   const voiceRaw = r.voice ?? {};
-  // backgroundAudio is stored inside the voice JSONB column to avoid a DB migration.
-  const { backgroundAudio, ...voiceFields } = voiceRaw;
+  const { backgroundAudio, enabledTools, ...voiceFields } = voiceRaw;
   return {
     id: r.id,
     workspaceId: r.workspace_id ?? null,
@@ -25,6 +24,7 @@ function rowToAgent(r) {
     welcome: r.welcome ?? {},
     voice: voiceFields,
     backgroundAudio: backgroundAudio ?? {},
+    enabledTools: Array.isArray(enabledTools) ? enabledTools : ["end_call"],
     llmModel: r.llm_model ?? "",
     autoEvalEnabled: Boolean(r.auto_eval_enabled),
     knowledgeFolderIds: Array.isArray(r.knowledge_folder_ids) ? r.knowledge_folder_ids : (r.knowledge_folder_ids ?? []),
@@ -572,7 +572,7 @@ async function getAgent(workspaceId, id) {
 async function updateAgent(
   workspaceId,
   id,
-  { name, promptDraft, publish, welcome, voice, backgroundAudio, llmModel, autoEvalEnabled, knowledgeFolderIds, maxCallSeconds }
+  { name, promptDraft, publish, welcome, voice, backgroundAudio, enabledTools, llmModel, autoEvalEnabled, knowledgeFolderIds, maxCallSeconds }
 ) {
   const p = getPool();
   const current = await getAgent(workspaceId, id);
@@ -592,13 +592,14 @@ async function updateAgent(
   };
 
   const v = voice ? { ...(current.voice ?? {}), ...voice } : current.voice ?? {};
-  // Merge backgroundAudio into the voice JSONB column to avoid a DB migration.
   const ba = backgroundAudio ? { ...(current.backgroundAudio ?? {}), ...backgroundAudio } : (current.backgroundAudio ?? {});
+  const nextEnabledTools = enabledTools !== undefined ? (Array.isArray(enabledTools) ? enabledTools : ["end_call"]) : (current.enabledTools ?? ["end_call"]);
   const voiceNorm = {
     provider: v.provider ?? null,
     model: v.model ?? null,
     voiceId: v.voiceId ?? null,
     backgroundAudio: ba,
+    enabledTools: nextEnabledTools,
   };
 
   const llmTrim = llmModel == null ? null : String(llmModel || "").trim();
