@@ -36,6 +36,7 @@ function rowToAgent(r) {
     fallbackVoice: r.fallback_voice && typeof r.fallback_voice === "object" ? r.fallback_voice : null,
     postCallDataExtraction: Array.isArray(r.post_call_extraction) ? r.post_call_extraction : [],
     postCallExtractionModel: r.post_call_extraction_model != null ? String(r.post_call_extraction_model) : "",
+    webhookUrl: r.webhook_url ?? null,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   };
@@ -592,7 +593,7 @@ async function getAgent(workspaceId, id) {
 async function updateAgent(
   workspaceId,
   id,
-  { name, promptDraft, publish, welcome, voice, backgroundAudio, enabledTools, toolConfigs, backchannelEnabled, llmModel, autoEvalEnabled, knowledgeFolderIds, maxCallSeconds, defaultDynamicVariables, callSettings, fallbackVoice, postCallDataExtraction, postCallExtractionModel }
+  { name, promptDraft, publish, welcome, voice, backgroundAudio, enabledTools, toolConfigs, backchannelEnabled, llmModel, autoEvalEnabled, knowledgeFolderIds, maxCallSeconds, defaultDynamicVariables, callSettings, fallbackVoice, postCallDataExtraction, postCallExtractionModel, webhookUrl }
 ) {
   const p = getPool();
   const current = await getAgent(workspaceId, id);
@@ -653,6 +654,8 @@ async function updateAgent(
     postCallExtractionModel !== undefined
       ? String(postCallExtractionModel || "").trim()
       : (current.postCallExtractionModel ?? "");
+  const nextWebhookUrl =
+    webhookUrl !== undefined ? (webhookUrl && String(webhookUrl).trim() ? String(webhookUrl).trim() : null) : (current.webhookUrl ?? null);
 
   const updatedAt = Date.now();
   const { rows } = await p.query(
@@ -673,8 +676,9 @@ async function updateAgent(
         fallback_voice=$14,
         post_call_extraction=$15,
         post_call_extraction_model=$16,
-        updated_at=$17
-    WHERE workspace_id=$18 AND id=$1
+        webhook_url=$17,
+        updated_at=$18
+    WHERE workspace_id=$19 AND id=$1
     RETURNING *
   `,
     [
@@ -694,6 +698,7 @@ async function updateAgent(
       nextFallbackVoice ? JSON.stringify(nextFallbackVoice) : null,
       JSON.stringify(nextPostCallExtraction),
       nextPostCallExtractionModel,
+      nextWebhookUrl,
       updatedAt,
       workspaceId,
     ]

@@ -48,6 +48,7 @@ const tw = require("./twilio");
 const { getBillingConfig } = require("./billing/config");
 const { assertCanStartWebCall, assertCanBuyNumber, assertCanUsePstn } = require("./billing/gating");
 const { finalizeBillingForCall } = require("./billing/finalize");
+const { sendAgentWebhook } = require("./webhooks");
 const stripeBilling = require("./billing/stripe");
 const { provisionBillingForWorkspace } = require("./billing/provision");
 const { createBillingRouter } = require("./billing/routes");
@@ -1240,6 +1241,13 @@ app.post(
   };
 
   await store.createCall(callRecord);
+  if (agent.webhookUrl) {
+    try {
+      sendAgentWebhook(agent, "call_started", callRecord);
+    } catch (e) {
+      logger.warn({ requestId: req.requestId, err: String(e?.message || e) }, "[internal.telephony.inbound.start] webhook call_started failed");
+    }
+  }
   console.log("[internal.telephony.inbound.start] call created, agent will join", { callId, roomName: parsed.data.roomName, to, from, agentId: agent.id });
 
   // Start recording (egress) if configured.
@@ -1414,6 +1422,15 @@ app.post("/api/internal/calls/:id/end", requireAgentSecret, async (req, res) => 
     }
   } catch (e) {
     logger.warn({ requestId: req.requestId, err: String(e?.message || e) }, "[internal.calls.end] contact auto-create failed");
+  }
+
+  if (updated.agentId && updated.workspaceId && USE_DB) {
+    try {
+      const agent = await store.getAgent(updated.workspaceId, updated.agentId);
+      if (agent) sendAgentWebhook(agent, "call_ended", updated);
+    } catch (e) {
+      logger.warn({ requestId: req.requestId, err: String(e?.message || e) }, "[internal.calls.end] webhook send failed");
+    }
   }
 
   return res.json({ call: updated });
@@ -1889,6 +1906,7 @@ app.put("/api/agents/:id", requireAuth, async (req, res) => {
     fallbackVoice: FallbackVoiceSchema,
     postCallDataExtraction: PostCallDataExtractionSchema,
     postCallExtractionModel: PostCallExtractionModelSchema,
+    webhookUrl: z.union([z.string().url().max(2000), z.literal("")]).optional(),
   });
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) {
@@ -1900,7 +1918,10 @@ app.put("/api/agents/:id", requireAuth, async (req, res) => {
   }
 
   if (USE_DB) {
-    const agent = await store.updateAgent(req.workspace.id, id, parsed.data);
+    const agent = await store.updateAgent(req.workspace.id, id, {
+      ...parsed.data,
+      webhookUrl: parsed.data.webhookUrl !== undefined ? (parsed.data.webhookUrl === "" ? null : parsed.data.webhookUrl) : undefined,
+    });
     if (!agent) return res.status(404).json({ error: "Agent not found" });
     return res.json({ agent });
   }
@@ -1956,6 +1977,10 @@ app.put("/api/agents/:id", requireAuth, async (req, res) => {
       parsed.data.postCallExtractionModel !== undefined
         ? String(parsed.data.postCallExtractionModel || "").trim()
         : (current.postCallExtractionModel ?? ""),
+    webhookUrl:
+      parsed.data.webhookUrl !== undefined
+        ? (parsed.data.webhookUrl === "" ? null : (parsed.data.webhookUrl || null))
+        : (current.webhookUrl ?? null),
     updatedAt: Date.now(),
   };
   delete next.prompt;
@@ -3467,6 +3492,14 @@ app.post("/api/agents/:id/start", requireAuth, async (req, res) => {
     writeCalls(calls);
   }
 
+  if (agent.webhookUrl && USE_DB) {
+    try {
+      sendAgentWebhook(agent, "call_started", callRecord);
+    } catch (e) {
+      logger.warn({ requestId: req.requestId, err: String(e?.message || e) }, "[agents.start] webhook call_started failed");
+    }
+  }
+
   const rs = roomService();
   // If you configured LiveKit dispatch rules (recommended), they will start the correct agent based on room name/prefix.
   // Only set this when you *explicitly* want to target a named agent.
@@ -4636,6 +4669,20 @@ app.post("/api/calls/:id/end", requireAuth, async (req, res) => {
     }
 
     const updated = await store.updateCall(id, updatePayload);
+
+    if (updated.agentId && updated.workspaceId) {
+      try {
+        const agent = await store.getAgent(updated.workspaceId, updated.agentId);
+        if (agent) {
+          sendAgentWebhook(agent, "call_ended", updated);
+          if (extractionResult && (updated.analysisStatus || (updated.postCallExtractionResults && updated.postCallExtractionResults.length > 0))) {
+            sendAgentWebhook(agent, "call_analyzed", updated);
+          }
+        }
+      } catch (e) {
+        logger.warn({ requestId: req.requestId, err: String(e?.message || e) }, "[calls.end] webhook send failed");
+      }
+    }
 
     // Billing finalization (trial debit / OpenMeter event). Best-effort.
     try {

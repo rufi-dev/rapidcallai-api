@@ -124,6 +124,7 @@ async function initSchema() {
   await p.query(`ALTER TABLE agents ADD COLUMN IF NOT EXISTS fallback_voice JSONB NULL;`);
   await p.query(`ALTER TABLE agents ADD COLUMN IF NOT EXISTS post_call_extraction JSONB NULL;`);
   await p.query(`ALTER TABLE agents ADD COLUMN IF NOT EXISTS post_call_extraction_model TEXT NULL;`);
+  await p.query(`ALTER TABLE agents ADD COLUMN IF NOT EXISTS webhook_url TEXT NULL;`);
 
   await p.query(`ALTER TABLE calls ADD COLUMN IF NOT EXISTS analysis_status TEXT NULL;`);
   await p.query(`ALTER TABLE calls ADD COLUMN IF NOT EXISTS post_call_extraction_results JSONB NULL;`);

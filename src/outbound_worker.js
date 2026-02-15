@@ -12,6 +12,7 @@ const store = require("./store_pg");
 const { substituteDynamicVariables } = require("./promptSubstitute");
 const { roomService, agentDispatchService, sipClient, addNumberToOutboundTrunk, createOutboundTrunkForWorkspace, ensureOutboundTrunkUsesTls, ensureOutboundTrunkTransport, ensureOutboundTrunkAddress, isTrunkNotFoundError } = require("./livekit");
 const tw = require("./twilio");
+const { sendAgentWebhook } = require("./webhooks");
 
 const USE_DB = Boolean(process.env.DATABASE_URL);
 const WORKER_ID = `outbound-worker-${nanoid(6)}`;
@@ -314,6 +315,13 @@ async function createCallRecord({ workspaceId, job, callId, roomName, agent }) {
     updatedAt: now,
   };
   await store.createCall(callRecord);
+  if (agent.webhookUrl) {
+    try {
+      sendAgentWebhook(agent, "call_started", callRecord);
+    } catch (e) {
+      // non-fatal
+    }
+  }
 }
 
 async function handleJob(workspace, job) {
