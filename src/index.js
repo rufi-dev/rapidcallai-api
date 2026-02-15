@@ -341,9 +341,19 @@ app.post("/api/livekit/webhook", express.raw({ type: "application/webhook+json" 
         billedSecondsTotal += billedSec;
       }
       participants[identity] = { ...(participants[identity] || {}), joinedAtMs: null, lastSeenAtMs: tsMs };
+
+      // User hung up: SIP participant left — end call and send webhooks immediately
+      if (USE_DB && String(identity).startsWith("sip-") && call.to !== "webtest" && !call.endedAt) {
+        logger.info({ callId: call.id, roomName, identity }, "[livekit.webhook] SIP participant left, ending call");
+        endTelephonyCallFromWebhook(call, "user_hangup").catch((e2) => {
+          logger.warn({ err: String(e2?.message || e2), callId: call.id }, "[livekit.webhook] end call on SIP left failed");
+        });
+      }
     }
 
     if (eventName === "room_finished") {
+      logger.info({ roomName, callId: call?.id, callTo: call?.to, endedAt: call?.endedAt }, "[livekit.webhook] room_finished received");
+
       // Close any still-joined participants at room end.
       for (const pid of Object.keys(participants)) {
         const p = participants[pid] && typeof participants[pid] === "object" ? participants[pid] : {};
@@ -376,106 +386,12 @@ app.post("/api/livekit/webhook", express.raw({ type: "application/webhook+json" 
         }
       }
 
-      // End telephony call and send call_ended / call_analyzed when user hung up (room ended but call not yet ended)
+      // End telephony call when room ended (fallback if participant_left didn’t fire or call wasn’t ended yet)
       if (USE_DB && call.to !== "webtest" && !call.endedAt) {
-        try {
-          const callNow = Date.now();
-          const endedAt = callNow;
-          const durationSec = Math.max(0, Math.round((endedAt - call.startedAt) / 1000));
-          const transcriptToStore = call.transcript && call.transcript.length > 0 ? call.transcript : [];
-          const patch = { endedAt, durationSec, outcome: "user_hangup", transcript: transcriptToStore };
-
-          if (call.agentId && call.workspaceId && transcriptToStore.length > 0) {
-            try {
-              const agent = await store.getAgent(call.workspaceId, call.agentId);
-              const items = Array.isArray(agent?.postCallDataExtraction) ? agent.postCallDataExtraction : [];
-              if (items.length > 0) {
-                const apiKey = String(process.env.OPENAI_API_KEY || "").trim();
-                if (apiKey) {
-                  const model =
-                    String(agent?.postCallExtractionModel || "").trim() ||
-                    String(process.env.OPENAI_EVAL_MODEL || process.env.OPENAI_GENERATE_MODEL || "gpt-4.1-mini").trim();
-                  const transcriptText = transcriptToStore
-                    .map((t) => `${t.role === "user" ? "USER" : "AGENT"}: ${String(t.text || "").trim()}`)
-                    .filter(Boolean)
-                    .join("\n");
-                  const results = await runPostCallExtraction({
-                    apiKey,
-                    model,
-                    transcriptText,
-                    extractionItems: items.map((it) => ({
-                      name: it.name || "",
-                      type: it.type,
-                      description: it.description || it.name,
-                      options: it.options,
-                    })),
-                  });
-                  patch.analysisStatus = "completed";
-                  patch.postCallExtractionResults = results;
-                }
-              }
-            } catch (eExt) {
-              logger.warn({ callId: call.id, err: String(eExt?.message || eExt) }, "[livekit.webhook] room_finished extraction failed");
-            }
-          }
-
-          const updated = await store.updateCall(call.id, patch);
-
-          try {
-            callsEndedTotal.inc({ source: "telephony", outcome: "user_hangup" });
-            callDurationSeconds.observe({ source: "telephony", outcome: "user_hangup" }, Number(durationSec || 0));
-            inProgressCallsGaugeValue = Math.max(0, inProgressCallsGaugeValue - 1);
-          } catch {
-            // ignore
-          }
-
-          try {
-            await finalizeBillingForCall({ store, call: updated });
-          } catch (eBilling) {
-            logger.warn({ callId: call.id, err: String(eBilling?.message || eBilling) }, "[livekit.webhook] room_finished billing failed");
-          }
-
-          const c = await store.getCallById(call.id);
-          if (c?.recording?.kind === "egress_s3" && c.recording.egressId) {
-            const egressId = c.recording.egressId;
-            await store.updateCall(call.id, { recording: { ...c.recording, status: "stopping" } });
-            setTimeout(async () => {
-              try {
-                await stopEgress(egressId);
-              } catch {
-                // ignore
-              }
-            }, 0);
-          }
-
-          if (updated.agentId && updated.workspaceId) {
-            try {
-              const agent = await store.getAgent(updated.workspaceId, updated.agentId);
-              if (agent) {
-                sendAgentWebhook(agent, "call_ended", updated);
-                if (updated.analysisStatus || (updated.postCallExtractionResults && updated.postCallExtractionResults.length > 0)) {
-                  sendAgentWebhook(agent, "call_analyzed", updated);
-                }
-              }
-            } catch (eWh) {
-              logger.warn({ callId: call.id, err: String(eWh?.message || eWh) }, "[livekit.webhook] room_finished webhooks failed");
-            }
-          }
-
-          try {
-            if (updated.to && updated.to !== "webtest" && /^\+?[1-9]\d{6,14}$/.test(updated.to)) {
-              const phone = updated.to.startsWith("+") ? updated.to : `+${updated.to}`;
-              const source = updated.metrics?.normalized?.source === "outbound" ? "outbound" : "inbound";
-              await contactStore.upsertContactFromCall(updated.workspaceId, phone, "", source);
-            }
-          } catch {
-            // ignore
-          }
-
-          logger.info({ callId: call.id, roomName }, "[livekit.webhook] telephony call ended via room_finished");
-        } catch (e2) {
+        logger.info({ callId: call.id, roomName }, "[livekit.webhook] ending telephony call (room_finished)");
+        endTelephonyCallFromWebhook(call, "user_hangup").catch((e2) => {
           logger.warn({ err: String(e2?.message || e2), callId: call.id, roomName }, "[livekit.webhook] end telephony call on room_finished failed");
-        }
+        });
       }
     }
 
@@ -745,6 +661,98 @@ async function disconnectSipParticipantForCall(call) {
   } catch (e) {
     logger.warn({ callId: call?.id, roomName, err: String(e?.message || e) }, "[internal.calls.end] disconnect SIP failed");
   }
+}
+
+/**
+ * End a telephony call from LiveKit webhook (room_finished or participant_left when SIP user hung up).
+ * Idempotent: if call already has endedAt, no-op. Updates call, runs extraction, sends webhooks.
+ */
+async function endTelephonyCallFromWebhook(call, outcome) {
+  if (!USE_DB || !call?.id) return;
+  const current = await store.getCallById(call.id);
+  if (!current || current.endedAt) return;
+  const now = Date.now();
+  const endedAt = now;
+  const durationSec = Math.max(0, Math.round((endedAt - current.startedAt) / 1000));
+  const transcriptToStore = current.transcript && current.transcript.length > 0 ? current.transcript : [];
+  const patch = { endedAt, durationSec, outcome, transcript: transcriptToStore };
+
+  if (current.agentId && current.workspaceId && transcriptToStore.length > 0) {
+    try {
+      const agent = await store.getAgent(current.workspaceId, current.agentId);
+      const items = Array.isArray(agent?.postCallDataExtraction) ? agent.postCallDataExtraction : [];
+      if (items.length > 0) {
+        const apiKey = String(process.env.OPENAI_API_KEY || "").trim();
+        if (apiKey) {
+          const model =
+            String(agent?.postCallExtractionModel || "").trim() ||
+            String(process.env.OPENAI_EVAL_MODEL || process.env.OPENAI_GENERATE_MODEL || "gpt-4.1-mini").trim();
+          const transcriptText = transcriptToStore
+            .map((t) => `${t.role === "user" ? "USER" : "AGENT"}: ${String(t.text || "").trim()}`)
+            .filter(Boolean)
+            .join("\n");
+          const results = await runPostCallExtraction({
+            apiKey,
+            model,
+            transcriptText,
+            extractionItems: items.map((it) => ({
+              name: it.name || "",
+              type: it.type,
+              description: it.description || it.name,
+              options: it.options,
+            })),
+          });
+          patch.analysisStatus = "completed";
+          patch.postCallExtractionResults = results;
+        }
+      }
+    } catch (eExt) {
+      logger.warn({ callId: call.id, err: String(eExt?.message || eExt) }, "[livekit.webhook] extraction failed");
+    }
+  }
+
+  const updated = await store.updateCall(call.id, patch);
+  try {
+    callsEndedTotal.inc({ source: "telephony", outcome: String(outcome || "user_hangup") });
+    callDurationSeconds.observe({ source: "telephony", outcome: String(outcome || "user_hangup") }, Number(durationSec || 0));
+    inProgressCallsGaugeValue = Math.max(0, inProgressCallsGaugeValue - 1);
+  } catch {
+    // ignore
+  }
+  try {
+    await finalizeBillingForCall({ store, call: updated });
+  } catch (eBilling) {
+    logger.warn({ callId: call.id, err: String(eBilling?.message || eBilling) }, "[livekit.webhook] billing failed");
+  }
+  const c = await store.getCallById(call.id);
+  if (c?.recording?.kind === "egress_s3" && c.recording.egressId) {
+    const egressId = c.recording.egressId;
+    await store.updateCall(call.id, { recording: { ...c.recording, status: "stopping" } });
+    setTimeout(async () => { try { await stopEgress(egressId); } catch { /* ignore */ } }, 0);
+  }
+  if (updated.agentId && updated.workspaceId) {
+    try {
+      const agent = await store.getAgent(updated.workspaceId, updated.agentId);
+      if (agent) {
+        sendAgentWebhook(agent, "call_ended", updated);
+        if (updated.analysisStatus || (updated.postCallExtractionResults && updated.postCallExtractionResults.length > 0)) {
+          sendAgentWebhook(agent, "call_analyzed", updated);
+        }
+      }
+    } catch (eWh) {
+      logger.warn({ callId: call.id, err: String(eWh?.message || eWh) }, "[livekit.webhook] webhooks failed");
+    }
+  }
+  try {
+    if (updated.to && updated.to !== "webtest" && /^\+?[1-9]\d{6,14}$/.test(updated.to)) {
+      const phone = updated.to.startsWith("+") ? updated.to : `+${updated.to}`;
+      const source = updated.metrics?.normalized?.source === "outbound" ? "outbound" : "inbound";
+      await contactStore.upsertContactFromCall(updated.workspaceId, phone, "", source);
+    }
+  } catch {
+    // ignore
+  }
+  logger.info({ callId: call.id, outcome }, "[livekit.webhook] telephony call ended");
 }
 
 function getPublicApiBaseUrl(req) {
