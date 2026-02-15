@@ -3208,37 +3208,56 @@ app.get("/api/twilio/workspaces/:id/recent-call-ips", requireAuth, async (req, r
 });
 
 // --- Outbound Jobs (MVP) ---
-// When creating a job, pass metadata to override agent default dynamic variables (e.g. metadata: { Forename: "John", "Job Titles": "Engineer" }) for {{Forename}}, {{Job Titles}} in the prompt.
+// Accept either (agentId, phoneE164, metadata) or Retell-style (from_number, to_number, agent_id, rapidcall_llm_dynamic_variables).
+// Dynamic variables are used for {{VarName}} in the agent prompt and sent in webhooks as rapidcall_llm_dynamic_variables.
 app.post("/api/outbound/jobs", requireAuth, async (req, res) => {
   if (!USE_DB) return res.status(400).json({ error: "Outbound jobs require Postgres mode" });
   const schema = z.object({
-    agentId: z.string().min(1).max(40),
+    agentId: z.string().min(1).max(40).optional(),
+    agent_id: z.string().min(1).max(40).optional(),
     leadName: z.string().max(120).optional(),
-    phoneE164: z.string().min(6).max(20),
+    phoneE164: z.string().min(6).max(20).optional(),
+    to_number: z.string().min(6).max(20).optional(),
+    from_number: z.string().max(20).optional(),
     timezone: z.string().max(60).optional(),
     maxAttempts: z.number().int().min(1).max(10).optional(),
     recordingEnabled: z.boolean().optional(),
-    metadata: z.record(z.string(), z.unknown()).optional(), // keys match {{VarName}} in prompt; overrides agent default values
+    metadata: z.record(z.string(), z.unknown()).optional(),
+    rapidcall_llm_dynamic_variables: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])).optional(),
   });
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "Validation failed", details: parsed.error.flatten() });
 
-  const phone = String(parsed.data.phoneE164 || "").trim();
+  const agentId = parsed.data.agentId ?? parsed.data.agent_id;
+  const phoneRaw = parsed.data.phoneE164 ?? parsed.data.to_number;
+  if (!agentId) return res.status(400).json({ error: "agent_id or agentId is required" });
+  if (!phoneRaw) return res.status(400).json({ error: "to_number or phoneE164 is required" });
+
+  const phone = String(phoneRaw).trim();
   if (!/^\+?[1-9]\d{6,14}$/.test(phone)) {
-    return res.status(400).json({ error: "phoneE164 must be in E.164 format" });
+    return res.status(400).json({ error: "to_number / phoneE164 must be in E.164 format" });
   }
 
-  const agent = await store.getAgent(req.workspace.id, parsed.data.agentId);
+  const agent = await store.getAgent(req.workspace.id, agentId);
   if (!agent) return res.status(404).json({ error: "Agent not found" });
+
+  const dynamicVars = parsed.data.rapidcall_llm_dynamic_variables ?? {};
+  const metadata = { ...(typeof parsed.data.metadata === "object" && parsed.data.metadata ? parsed.data.metadata : {}) };
+  if (parsed.data.from_number != null && String(parsed.data.from_number).trim()) {
+    metadata.fromNumber = String(parsed.data.from_number).trim();
+  }
+  for (const [k, v] of Object.entries(dynamicVars)) {
+    if (k !== "fromNumber") metadata[k] = v;
+  }
 
   const job = await store.createOutboundJob(req.workspace.id, {
     leadName: parsed.data.leadName ?? "",
     phoneE164: phone,
     timezone: parsed.data.timezone ?? "UTC",
     maxAttempts: parsed.data.maxAttempts ?? 3,
-    agentId: parsed.data.agentId,
+    agentId,
     recordingEnabled: Boolean(parsed.data.recordingEnabled),
-    metadata: parsed.data.metadata ?? {},
+    metadata,
   });
   await store.addOutboundJobLog(req.workspace.id, job.id, {
     level: "info",

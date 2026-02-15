@@ -296,6 +296,8 @@ async function createCallRecord({ workspaceId, job, callId, roomName, agent }) {
     return;
   }
 
+  const outboundMeta = job.metadata && typeof job.metadata === "object" ? job.metadata : {};
+  const { fromNumber: _fn, ...rapidcallVars } = outboundMeta;
   const callRecord = {
     id: callId,
     workspaceId,
@@ -310,7 +312,14 @@ async function createCallRecord({ workspaceId, job, callId, roomName, agent }) {
     costUsd: null,
     transcript: [],
     recording: null,
-    metrics: { normalized: { source: "outbound" }, outbound: { jobId: job.id } },
+    metrics: {
+      normalized: { source: "outbound" },
+      outbound: {
+        jobId: job.id,
+        from_number: outboundMeta.fromNumber || "",
+        rapidcall_llm_dynamic_variables: rapidcallVars,
+      },
+    },
     createdAt: now,
     updatedAt: now,
   };

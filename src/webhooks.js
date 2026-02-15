@@ -30,8 +30,15 @@ function toDisconnectionReason(outcome, direction) {
 function buildCallPayload(call, agent, options = {}) {
   const direction = call.to === "webtest" ? "inbound" : (call.metrics?.normalized?.source === "outbound" ? "outbound" : "inbound");
   const callType = call.to === "webtest" ? "webtest" : "phone_call";
-  const fromNumber = direction === "inbound" ? (call.metrics?.telephony?.from || "") : "";
+  const fromNumber =
+    direction === "inbound"
+      ? (call.metrics?.telephony?.from || "")
+      : (call.metrics?.outbound?.from_number || "");
   const toNumber = call.to || "";
+  const rapidcallVars =
+    call.rapidcall_llm_dynamic_variables ||
+    call.metrics?.outbound?.rapidcall_llm_dynamic_variables ||
+    {};
 
   const base = {
     call_type: callType,
@@ -43,7 +50,7 @@ function buildCallPayload(call, agent, options = {}) {
     agent_name: call.agentName || "",
     call_status: options.status || (call.endedAt ? "ended" : "registered"),
     metadata: call.metadata || {},
-    rapidcall_llm_dynamic_variables: call.rapidcall_llm_dynamic_variables || {},
+    rapidcall_llm_dynamic_variables: rapidcallVars,
     start_timestamp: call.startedAt,
   };
 
