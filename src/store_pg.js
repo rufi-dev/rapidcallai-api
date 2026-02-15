@@ -32,12 +32,19 @@ function rowToAgent(r) {
     knowledgeFolderIds: Array.isArray(r.knowledge_folder_ids) ? r.knowledge_folder_ids : (r.knowledge_folder_ids ?? []),
     maxCallSeconds: Number(r.max_call_seconds || 0),
     defaultDynamicVariables: r.default_dynamic_variables && typeof r.default_dynamic_variables === "object" ? r.default_dynamic_variables : {},
+    callSettings: r.call_settings && typeof r.call_settings === "object" ? r.call_settings : {},
+    fallbackVoice: r.fallback_voice && typeof r.fallback_voice === "object" ? r.fallback_voice : null,
+    postCallDataExtraction: Array.isArray(r.post_call_extraction) ? r.post_call_extraction : [],
+    postCallExtractionModel: r.post_call_extraction_model != null ? String(r.post_call_extraction_model) : "",
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   };
 }
 
 function rowToCall(r) {
+  const rawResults = r.post_call_extraction_results;
+  const postCallExtractionResults =
+    Array.isArray(rawResults) ? rawResults : rawResults != null && typeof rawResults === "object" ? [rawResults] : [];
   return {
     id: r.id,
     workspaceId: r.workspace_id ?? null,
@@ -53,6 +60,8 @@ function rowToCall(r) {
     transcript: r.transcript ?? [],
     recording: r.recording ?? null,
     metrics: r.metrics ?? null,
+    analysisStatus: r.analysis_status ?? null,
+    postCallExtractionResults,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   };
@@ -545,8 +554,8 @@ async function createAgent({
 
   const { rows } = await p.query(
     `
-    INSERT INTO agents (id, workspace_id, name, prompt_draft, prompt_published, published_at, welcome, voice, llm_model, auto_eval_enabled, knowledge_folder_ids, max_call_seconds, default_dynamic_variables, created_at, updated_at)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+    INSERT INTO agents (id, workspace_id, name, prompt_draft, prompt_published, published_at, welcome, voice, llm_model, auto_eval_enabled, knowledge_folder_ids, max_call_seconds, default_dynamic_variables, call_settings, fallback_voice, post_call_extraction, post_call_extraction_model, created_at, updated_at)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
     RETURNING *
   `,
     [
@@ -563,6 +572,10 @@ async function createAgent({
       JSON.stringify(Array.isArray(knowledgeFolderIds) ? knowledgeFolderIds : []),
       Math.max(0, Math.round(Number(maxCallSeconds || 0))),
       JSON.stringify(defVars),
+      JSON.stringify({}),
+      null,
+      JSON.stringify([]),
+      "",
       now,
       now,
     ]
@@ -579,7 +592,7 @@ async function getAgent(workspaceId, id) {
 async function updateAgent(
   workspaceId,
   id,
-  { name, promptDraft, publish, welcome, voice, backgroundAudio, enabledTools, toolConfigs, backchannelEnabled, llmModel, autoEvalEnabled, knowledgeFolderIds, maxCallSeconds, defaultDynamicVariables }
+  { name, promptDraft, publish, welcome, voice, backgroundAudio, enabledTools, toolConfigs, backchannelEnabled, llmModel, autoEvalEnabled, knowledgeFolderIds, maxCallSeconds, defaultDynamicVariables, callSettings, fallbackVoice, postCallDataExtraction, postCallExtractionModel }
 ) {
   const p = getPool();
   const current = await getAgent(workspaceId, id);
@@ -624,6 +637,23 @@ async function updateAgent(
       ? (defaultDynamicVariables && typeof defaultDynamicVariables === "object" ? defaultDynamicVariables : {})
       : (current.defaultDynamicVariables ?? {});
 
+  const nextCallSettings =
+    callSettings !== undefined
+      ? (callSettings && typeof callSettings === "object" ? callSettings : {})
+      : (current.callSettings ?? {});
+  const nextFallbackVoice =
+    fallbackVoice !== undefined
+      ? (fallbackVoice && typeof fallbackVoice === "object" ? fallbackVoice : null)
+      : (current.fallbackVoice ?? null);
+  const nextPostCallExtraction =
+    postCallDataExtraction !== undefined
+      ? (Array.isArray(postCallDataExtraction) ? postCallDataExtraction : [])
+      : (current.postCallDataExtraction ?? []);
+  const nextPostCallExtractionModel =
+    postCallExtractionModel !== undefined
+      ? String(postCallExtractionModel || "").trim()
+      : (current.postCallExtractionModel ?? "");
+
   const updatedAt = Date.now();
   const { rows } = await p.query(
     `
@@ -639,8 +669,12 @@ async function updateAgent(
         knowledge_folder_ids=$10,
         max_call_seconds=$11,
         default_dynamic_variables=$12,
-        updated_at=$13
-    WHERE workspace_id=$14 AND id=$1
+        call_settings=$13,
+        fallback_voice=$14,
+        post_call_extraction=$15,
+        post_call_extraction_model=$16,
+        updated_at=$17
+    WHERE workspace_id=$18 AND id=$1
     RETURNING *
   `,
     [
@@ -656,6 +690,10 @@ async function updateAgent(
       JSON.stringify(nextKbFolderIds),
       nextMaxCallSeconds,
       JSON.stringify(nextDefaultVars),
+      JSON.stringify(nextCallSettings),
+      nextFallbackVoice ? JSON.stringify(nextFallbackVoice) : null,
+      JSON.stringify(nextPostCallExtraction),
+      nextPostCallExtractionModel,
       updatedAt,
       workspaceId,
     ]
@@ -849,7 +887,9 @@ async function updateCall(callId, patch) {
         transcript=$11,
         recording=$12,
         metrics=$13,
-        updated_at=$14
+        analysis_status=$14,
+        post_call_extraction_results=$15,
+        updated_at=$16
     WHERE id=$1
   `,
     [
@@ -866,6 +906,8 @@ async function updateCall(callId, patch) {
       JSON.stringify(next.transcript ?? []),
       next.recording ? JSON.stringify(next.recording) : null,
       next.metrics ? JSON.stringify(next.metrics) : null,
+      next.analysisStatus ?? null,
+      next.postCallExtractionResults != null ? JSON.stringify(next.postCallExtractionResults) : null,
       next.updatedAt,
     ]
   );

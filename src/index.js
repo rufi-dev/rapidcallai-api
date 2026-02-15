@@ -471,6 +471,36 @@ const LlmModelSchema = z
 const MaxCallSecondsSchema = z.number().int().min(0).max(24 * 60 * 60).optional(); // up to 24h
 const KnowledgeFolderIdsSchema = z.array(z.string().min(1).max(40)).max(50).optional();
 
+const CallSettingsSchema = z
+  .object({
+    voicemailDetectionEnabled: z.boolean().optional(),
+    voicemailResponse: z.enum(["hang_up", "leave_message"]).optional(),
+    voicemailMessageType: z.enum(["prompt", "static"]).optional(),
+    voicemailPrompt: z.string().max(8000).optional(),
+    voicemailStaticMessage: z.string().max(8000).optional(),
+  })
+  .optional();
+
+const FallbackVoiceSchema = z
+  .object({
+    provider: z.enum(["elevenlabs", "cartesia"]).optional(),
+    voiceId: z.string().min(1).max(120).optional(),
+    model: z.string().max(120).optional(),
+  })
+  .nullable()
+  .optional();
+
+const PostCallExtractionItemSchema = z.object({
+  type: z.enum(["text", "selector", "boolean", "number"]),
+  name: z.string().min(1).max(120),
+  description: z.string().max(2000).optional(),
+  optional: z.boolean().optional(),
+  formatExample: z.string().max(500).optional(),
+  options: z.array(z.string().max(200)).max(50).optional(),
+});
+const PostCallDataExtractionSchema = z.array(PostCallExtractionItemSchema).max(50).optional();
+const PostCallExtractionModelSchema = z.string().max(120).optional();
+
 // Allow one or many origins. Use comma-separated list in CLIENT_ORIGIN, e.g.:
 // CLIENT_ORIGIN=https://dashboard.rapidcall.ai,http://localhost:5173
 // Use "*" to allow any origin (not recommended for production).
@@ -1261,6 +1291,12 @@ app.post("/api/internal/calls/:id/end", requireAgentSecret, async (req, res) => 
         })
       )
       .optional(),
+    analysisStatus: z.string().max(120).optional(),
+    postCallExtractionResults: z.array(z.object({
+      name: z.string(),
+      value: z.union([z.string(), z.number(), z.boolean(), z.null()]).optional(),
+      description: z.string().optional(),
+    })).max(100).optional(),
   });
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "Validation failed", details: parsed.error.flatten() });
@@ -1274,12 +1310,15 @@ app.post("/api/internal/calls/:id/end", requireAgentSecret, async (req, res) => 
   const durationSec = Math.max(0, Math.round((endedAt - current.startedAt) / 1000));
 
   const outcomeToStore = parsed.data.outcome ?? (current.outcome === "in_progress" ? "completed" : current.outcome);
-  const updated = await store.updateCall(id, {
+  const patch = {
     endedAt,
     durationSec,
     outcome: outcomeToStore,
     transcript: parsed.data.transcript ? parsed.data.transcript : current.transcript,
-  });
+  };
+  if (parsed.data.analysisStatus !== undefined) patch.analysisStatus = parsed.data.analysisStatus;
+  if (parsed.data.postCallExtractionResults !== undefined) patch.postCallExtractionResults = parsed.data.postCallExtractionResults;
+  const updated = await store.updateCall(id, patch);
 
   // Billing finalization (trial debit / OpenMeter event). Best-effort.
   try {
@@ -1752,6 +1791,10 @@ app.put("/api/agents/:id", requireAuth, async (req, res) => {
     knowledgeFolderIds: KnowledgeFolderIdsSchema,
     maxCallSeconds: MaxCallSecondsSchema,
     defaultDynamicVariables: z.record(z.string(), z.string()).optional(),
+    callSettings: CallSettingsSchema,
+    fallbackVoice: FallbackVoiceSchema,
+    postCallDataExtraction: PostCallDataExtractionSchema,
+    postCallExtractionModel: PostCallExtractionModelSchema,
   });
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) {
@@ -1803,6 +1846,22 @@ app.put("/api/agents/:id", requireAuth, async (req, res) => {
       parsed.data.defaultDynamicVariables !== undefined
         ? (parsed.data.defaultDynamicVariables && typeof parsed.data.defaultDynamicVariables === "object" ? parsed.data.defaultDynamicVariables : {})
         : (current.defaultDynamicVariables ?? {}),
+    callSettings:
+      parsed.data.callSettings !== undefined
+        ? (parsed.data.callSettings && typeof parsed.data.callSettings === "object" ? parsed.data.callSettings : {})
+        : (current.callSettings ?? {}),
+    fallbackVoice:
+      parsed.data.fallbackVoice !== undefined
+        ? (parsed.data.fallbackVoice && typeof parsed.data.fallbackVoice === "object" ? parsed.data.fallbackVoice : null)
+        : (current.fallbackVoice ?? null),
+    postCallDataExtraction:
+      parsed.data.postCallDataExtraction !== undefined
+        ? (Array.isArray(parsed.data.postCallDataExtraction) ? parsed.data.postCallDataExtraction : [])
+        : (current.postCallDataExtraction ?? []),
+    postCallExtractionModel:
+      parsed.data.postCallExtractionModel !== undefined
+        ? String(parsed.data.postCallExtractionModel || "").trim()
+        : (current.postCallExtractionModel ?? ""),
     updatedAt: Date.now(),
   };
   delete next.prompt;
@@ -3338,6 +3397,11 @@ app.post("/api/agents/:id/start", requireAuth, async (req, res) => {
         maxCallSeconds,
         knowledgeFolderIds: Array.isArray(agent.knowledgeFolderIds) ? agent.knowledgeFolderIds : [],
         variant: variantChosen ? { id: variantChosen.id, name: variantChosen.name } : null,
+        defaultDynamicVariables: agent.defaultDynamicVariables ?? {},
+        callSettings: agent.callSettings ?? {},
+        fallbackVoice: agent.fallbackVoice ?? null,
+        postCallDataExtraction: Array.isArray(agent.postCallDataExtraction) ? agent.postCallDataExtraction : [],
+        postCallExtractionModel: agent.postCallExtractionModel ?? "",
       },
       welcome,
     }),

@@ -260,6 +260,11 @@ async function ensureRoomWithMetadata({ roomName, job, agent, callId }) {
       llmModel: String(agent.llmModel || "").trim(),
       maxCallSeconds: Number(agent.maxCallSeconds || 0),
       knowledgeFolderIds: Array.isArray(agent.knowledgeFolderIds) ? agent.knowledgeFolderIds : [],
+      defaultDynamicVariables: agent.defaultDynamicVariables ?? {},
+      callSettings: agent.callSettings ?? {},
+      fallbackVoice: agent.fallbackVoice ?? null,
+      postCallDataExtraction: Array.isArray(agent.postCallDataExtraction) ? agent.postCallDataExtraction : [],
+      postCallExtractionModel: agent.postCallExtractionModel ?? "",
     },
     welcome: agent.welcome ?? {},
     outbound: {

@@ -120,6 +120,13 @@ async function initSchema() {
   await p.query(`ALTER TABLE agents ADD COLUMN IF NOT EXISTS knowledge_folder_ids JSONB NOT NULL DEFAULT '[]'::jsonb;`);
   await p.query(`ALTER TABLE agents ADD COLUMN IF NOT EXISTS max_call_seconds INT NOT NULL DEFAULT 0;`);
   await p.query(`ALTER TABLE agents ADD COLUMN IF NOT EXISTS default_dynamic_variables JSONB NOT NULL DEFAULT '{}'::jsonb;`);
+  await p.query(`ALTER TABLE agents ADD COLUMN IF NOT EXISTS call_settings JSONB NULL;`);
+  await p.query(`ALTER TABLE agents ADD COLUMN IF NOT EXISTS fallback_voice JSONB NULL;`);
+  await p.query(`ALTER TABLE agents ADD COLUMN IF NOT EXISTS post_call_extraction JSONB NULL;`);
+  await p.query(`ALTER TABLE agents ADD COLUMN IF NOT EXISTS post_call_extraction_model TEXT NULL;`);
+
+  await p.query(`ALTER TABLE calls ADD COLUMN IF NOT EXISTS analysis_status TEXT NULL;`);
+  await p.query(`ALTER TABLE calls ADD COLUMN IF NOT EXISTS post_call_extraction_results JSONB NULL;`);
   await p.query(`CREATE INDEX IF NOT EXISTS agents_workspace_idx ON agents(workspace_id, created_at DESC);`);
 
   // Knowledge Base (folders + documents)
