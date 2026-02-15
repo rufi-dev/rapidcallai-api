@@ -9,6 +9,7 @@ if (require.main === module) {
 const { nanoid } = require("./id");
 const { logger } = require("./logger");
 const store = require("./store_pg");
+const { substituteDynamicVariables } = require("./promptSubstitute");
 const { roomService, agentDispatchService, sipClient, addNumberToOutboundTrunk, createOutboundTrunkForWorkspace, ensureOutboundTrunkUsesTls, ensureOutboundTrunkTransport, ensureOutboundTrunkAddress, isTrunkNotFoundError } = require("./livekit");
 const tw = require("./twilio");
 
@@ -236,10 +237,18 @@ async function ensureRoomWithMetadata({ roomName, job, agent, callId }) {
   const rs = roomService();
   const promptDraft = agent.promptDraft ?? agent.prompt ?? "";
   const promptPublished = agent.promptPublished ?? "";
-  const promptUsed = (promptDraft && String(promptDraft).trim()) ? promptDraft : promptPublished;
+  let promptUsed = (promptDraft && String(promptDraft).trim()) ? promptDraft : promptPublished;
   if (!promptUsed || String(promptUsed).trim().length === 0) {
     throw new Error("Agent prompt is empty. Set a prompt before dialing.");
   }
+  // Merge agent default dynamic variables with per-call variables from job.metadata (e.g. Forename, Job Titles)
+  const defaults = agent.defaultDynamicVariables && typeof agent.defaultDynamicVariables === "object" ? agent.defaultDynamicVariables : {};
+  const overrides = job.metadata && typeof job.metadata === "object" ? job.metadata : {};
+  const vars = { ...defaults };
+  for (const [k, v] of Object.entries(overrides)) {
+    if (typeof v === "string" || (v != null && typeof v === "number")) vars[k] = String(v);
+  }
+  promptUsed = substituteDynamicVariables(promptUsed, vars);
 
   const metadata = {
     call: { id: callId, to: job.phoneE164, direction: "outbound", jobId: job.id },

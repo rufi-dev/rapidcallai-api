@@ -31,6 +31,7 @@ function rowToAgent(r) {
     autoEvalEnabled: Boolean(r.auto_eval_enabled),
     knowledgeFolderIds: Array.isArray(r.knowledge_folder_ids) ? r.knowledge_folder_ids : (r.knowledge_folder_ids ?? []),
     maxCallSeconds: Number(r.max_call_seconds || 0),
+    defaultDynamicVariables: r.default_dynamic_variables && typeof r.default_dynamic_variables === "object" ? r.default_dynamic_variables : {},
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   };
@@ -517,6 +518,7 @@ async function createAgent({
   autoEvalEnabled = false,
   knowledgeFolderIds = [],
   maxCallSeconds = 0,
+  defaultDynamicVariables = null,
 }) {
   const p = getPool();
   const now = Date.now();
@@ -539,10 +541,12 @@ async function createAgent({
     backgroundAudio: {},
   };
 
+  const defVars = defaultDynamicVariables && typeof defaultDynamicVariables === "object" ? defaultDynamicVariables : {};
+
   const { rows } = await p.query(
     `
-    INSERT INTO agents (id, workspace_id, name, prompt_draft, prompt_published, published_at, welcome, voice, llm_model, auto_eval_enabled, knowledge_folder_ids, max_call_seconds, created_at, updated_at)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+    INSERT INTO agents (id, workspace_id, name, prompt_draft, prompt_published, published_at, welcome, voice, llm_model, auto_eval_enabled, knowledge_folder_ids, max_call_seconds, default_dynamic_variables, created_at, updated_at)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
     RETURNING *
   `,
     [
@@ -558,6 +562,7 @@ async function createAgent({
       Boolean(autoEvalEnabled),
       JSON.stringify(Array.isArray(knowledgeFolderIds) ? knowledgeFolderIds : []),
       Math.max(0, Math.round(Number(maxCallSeconds || 0))),
+      JSON.stringify(defVars),
       now,
       now,
     ]
@@ -574,7 +579,7 @@ async function getAgent(workspaceId, id) {
 async function updateAgent(
   workspaceId,
   id,
-  { name, promptDraft, publish, welcome, voice, backgroundAudio, enabledTools, toolConfigs, backchannelEnabled, llmModel, autoEvalEnabled, knowledgeFolderIds, maxCallSeconds }
+  { name, promptDraft, publish, welcome, voice, backgroundAudio, enabledTools, toolConfigs, backchannelEnabled, llmModel, autoEvalEnabled, knowledgeFolderIds, maxCallSeconds, defaultDynamicVariables }
 ) {
   const p = getPool();
   const current = await getAgent(workspaceId, id);
@@ -614,6 +619,10 @@ async function updateAgent(
   const nextMaxCallSeconds =
     maxCallSeconds == null ? Number(current.maxCallSeconds || 0) : Math.max(0, Math.round(Number(maxCallSeconds || 0)));
   const nextAutoEvalEnabled = autoEvalEnabled == null ? Boolean(current.autoEvalEnabled) : Boolean(autoEvalEnabled);
+  const nextDefaultVars =
+    defaultDynamicVariables !== undefined
+      ? (defaultDynamicVariables && typeof defaultDynamicVariables === "object" ? defaultDynamicVariables : {})
+      : (current.defaultDynamicVariables ?? {});
 
   const updatedAt = Date.now();
   const { rows } = await p.query(
@@ -629,8 +638,9 @@ async function updateAgent(
         auto_eval_enabled=$9,
         knowledge_folder_ids=$10,
         max_call_seconds=$11,
-        updated_at=$12
-    WHERE workspace_id=$13 AND id=$1
+        default_dynamic_variables=$12,
+        updated_at=$13
+    WHERE workspace_id=$14 AND id=$1
     RETURNING *
   `,
     [
@@ -645,6 +655,7 @@ async function updateAgent(
       nextAutoEvalEnabled,
       JSON.stringify(nextKbFolderIds),
       nextMaxCallSeconds,
+      JSON.stringify(nextDefaultVars),
       updatedAt,
       workspaceId,
     ]

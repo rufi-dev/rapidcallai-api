@@ -119,6 +119,7 @@ async function initSchema() {
   await p.query(`ALTER TABLE agents ADD COLUMN IF NOT EXISTS auto_eval_enabled BOOLEAN NOT NULL DEFAULT false;`);
   await p.query(`ALTER TABLE agents ADD COLUMN IF NOT EXISTS knowledge_folder_ids JSONB NOT NULL DEFAULT '[]'::jsonb;`);
   await p.query(`ALTER TABLE agents ADD COLUMN IF NOT EXISTS max_call_seconds INT NOT NULL DEFAULT 0;`);
+  await p.query(`ALTER TABLE agents ADD COLUMN IF NOT EXISTS default_dynamic_variables JSONB NOT NULL DEFAULT '{}'::jsonb;`);
   await p.query(`CREATE INDEX IF NOT EXISTS agents_workspace_idx ON agents(workspace_id, created_at DESC);`);
 
   // Knowledge Base (folders + documents)

@@ -41,6 +41,7 @@ const { getPool, initSchema } = require("./db");
 const store = require("./store_pg");
 const { roomService, agentDispatchService, createParticipantToken, sipClient, addNumberToInboundTrunk, addNumberToOutboundTrunk, removeNumberFromInboundTrunk, removeNumberFromOutboundTrunk, createInboundTrunkForWorkspace, createOutboundTrunkForWorkspace, ensureOutboundTrunkUsesTls, ensureOutboundTrunkTransport, ensureOutboundTrunkAddress, deleteOutboundTrunk, getOutboundTrunkInfo, isTrunkNotFoundError, parseConflictingInboundTrunkId } = require("./livekit");
 const outboundWorker = require("./outbound_worker");
+const { substituteDynamicVariables } = require("./promptSubstitute");
 const { startCallEgress, stopEgress, getEgressInfo } = require("./egress");
 const { getObject, headObject } = require("./s3");
 const tw = require("./twilio");
@@ -1744,6 +1745,7 @@ app.put("/api/agents/:id", requireAuth, async (req, res) => {
     autoEvalEnabled: z.boolean().optional(),
     knowledgeFolderIds: KnowledgeFolderIdsSchema,
     maxCallSeconds: MaxCallSecondsSchema,
+    defaultDynamicVariables: z.record(z.string(), z.string()).optional(),
   });
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) {
@@ -1791,6 +1793,10 @@ app.put("/api/agents/:id", requireAuth, async (req, res) => {
       parsed.data.maxCallSeconds == null
         ? (current.maxCallSeconds ?? 0)
         : Math.max(0, Math.round(Number(parsed.data.maxCallSeconds || 0))),
+    defaultDynamicVariables:
+      parsed.data.defaultDynamicVariables !== undefined
+        ? (parsed.data.defaultDynamicVariables && typeof parsed.data.defaultDynamicVariables === "object" ? parsed.data.defaultDynamicVariables : {})
+        : (current.defaultDynamicVariables ?? {}),
     updatedAt: Date.now(),
   };
   delete next.prompt;
@@ -2974,6 +2980,7 @@ app.get("/api/twilio/workspaces/:id/recent-call-ips", requireAuth, async (req, r
 });
 
 // --- Outbound Jobs (MVP) ---
+// When creating a job, pass metadata to override agent default dynamic variables (e.g. metadata: { Forename: "John", "Job Titles": "Engineer" }) for {{Forename}}, {{Job Titles}} in the prompt.
 app.post("/api/outbound/jobs", requireAuth, async (req, res) => {
   if (!USE_DB) return res.status(400).json({ error: "Outbound jobs require Postgres mode" });
   const schema = z.object({
@@ -2983,7 +2990,7 @@ app.post("/api/outbound/jobs", requireAuth, async (req, res) => {
     timezone: z.string().max(60).optional(),
     maxAttempts: z.number().int().min(1).max(10).optional(),
     recordingEnabled: z.boolean().optional(),
-    metadata: z.record(z.string(), z.unknown()).optional(),
+    metadata: z.record(z.string(), z.unknown()).optional(), // keys match {{VarName}} in prompt; overrides agent default values
   });
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "Validation failed", details: parsed.error.flatten() });
@@ -3241,6 +3248,8 @@ app.post("/api/agents/:id/start", requireAuth, async (req, res) => {
   if (!basePrompt || String(basePrompt).trim().length === 0) {
     return res.status(400).json({ error: "Agent prompt is empty. Set a prompt before starting a session." });
   }
+  // Apply default dynamic variables ({{VarName}} -> fallback values when not provided per-call)
+  promptUsed = substituteDynamicVariables(promptUsed, agent.defaultDynamicVariables ?? {});
 
   const welcome = {
     mode: startParsed?.data?.welcome?.mode ?? agent.welcome?.mode ?? "user",
@@ -3419,29 +3428,44 @@ app.get("/api/calls", requireAuth, async (req, res) => {
     }
 
     return res.json({
-      calls: calls.map((c) => ({
-        ...c,
-        costUsd: typeof c.costUsd === "number" ? c.costUsd : null,
-      })),
+      calls: calls.map((c) => {
+        const norm = normalizeDurationSec({
+          durationSecStored: c.durationSec,
+          startedAtMs: c.startedAt,
+          endedAtMs: c.endedAt,
+        });
+        return {
+          ...c,
+          durationSec: norm.durationSec,
+          costUsd: typeof c.costUsd === "number" ? c.costUsd : null,
+        };
+      }),
     });
   }
   const calls = readCalls();
   return res.json({
-    calls: calls.map((c) => ({
-      id: c.id,
-      agentId: c.agentId,
-      agentName: c.agentName,
-      to: c.to,
-      roomName: c.roomName,
-      startedAt: c.startedAt,
-      endedAt: c.endedAt,
-      durationSec: c.durationSec,
-      outcome: c.outcome,
-      costUsd: typeof c.costUsd === "number" ? c.costUsd : null,
-      recordingUrl: c.recording?.url ?? null,
-      createdAt: c.createdAt,
-      updatedAt: c.updatedAt,
-    })),
+    calls: calls.map((c) => {
+      const norm = normalizeDurationSec({
+        durationSecStored: c.durationSec,
+        startedAtMs: c.startedAt,
+        endedAtMs: c.endedAt,
+      });
+      return {
+        id: c.id,
+        agentId: c.agentId,
+        agentName: c.agentName,
+        to: c.to,
+        roomName: c.roomName,
+        startedAt: c.startedAt,
+        endedAt: c.endedAt,
+        durationSec: norm.durationSec,
+        outcome: c.outcome,
+        costUsd: typeof c.costUsd === "number" ? c.costUsd : null,
+        recordingUrl: c.recording?.url ?? null,
+        createdAt: c.createdAt,
+        updatedAt: c.updatedAt,
+      };
+    }),
   });
 });
 
