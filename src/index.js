@@ -1329,14 +1329,20 @@ app.post("/api/internal/calls/:id/end", requireAgentSecret, async (req, res) => 
                   // ignore
                 }
                 let durationSec = c2.durationSec;
+                let recordingDurationSec = null;
                 const startedAt = Number(info?.startedAt ?? info?.started_at ?? 0);
                 const endedAt = Number(info?.endedAt ?? info?.ended_at ?? 0);
                 if (startedAt > 0 && endedAt >= startedAt) {
-                  const recordingSec = Math.max(0, Math.round((endedAt - startedAt) / 1000));
-                  durationSec = recordingSec;
+                  recordingDurationSec = Math.max(0, Math.round((endedAt - startedAt) / 1000));
+                  durationSec = recordingDurationSec;
                 }
                 await store.updateCall(id, {
-                  recording: { ...c2.recording, status: "ready", sizeBytes },
+                  recording: {
+                    ...c2.recording,
+                    status: "ready",
+                    sizeBytes,
+                    ...(recordingDurationSec != null ? { durationSec: recordingDurationSec } : {}),
+                  },
                   ...(durationSec != null ? { durationSec } : {}),
                 });
               }
@@ -3478,7 +3484,12 @@ app.get("/api/calls/:id", requireAuth, async (req, res) => {
     startedAtMs: call.startedAt,
     endedAtMs: call.endedAt,
   });
-  res.json({ call: { ...call, durationSec: norm.durationSec } });
+  // Prefer recording duration when available so UI matches the recording player.
+  const durationSec =
+    call.recording?.durationSec != null && Number.isFinite(Number(call.recording.durationSec))
+      ? Number(call.recording.durationSec)
+      : norm.durationSec;
+  res.json({ call: { ...call, durationSec } });
 });
 
 // Export call data (transcript + metrics) for QA/review
@@ -4352,11 +4363,18 @@ app.post("/api/calls/:id/end", requireAuth, async (req, res) => {
                 let durationSec = c.durationSec;
                 const startedAt = Number(info?.startedAt ?? info?.started_at ?? 0);
                 const endedAt = Number(info?.endedAt ?? info?.ended_at ?? 0);
+                let recordingDurationSec = null;
                 if (startedAt > 0 && endedAt >= startedAt) {
-                  durationSec = Math.max(0, Math.round((endedAt - startedAt) / 1000));
+                  recordingDurationSec = Math.max(0, Math.round((endedAt - startedAt) / 1000));
+                  durationSec = recordingDurationSec;
                 }
                 await store.updateCall(id, {
-                  recording: { ...c.recording, status: "ready", sizeBytes },
+                  recording: {
+                    ...c.recording,
+                    status: "ready",
+                    sizeBytes,
+                    ...(recordingDurationSec != null ? { durationSec: recordingDurationSec } : {}),
+                  },
                   ...(durationSec != null ? { durationSec } : {}),
                 });
               }
