@@ -823,6 +823,26 @@ async function requireAuth(req, res, next) {
   const token = getAuthToken(req);
   if (!token) return res.status(401).json({ error: "Missing auth token" });
 
+  // API key auth: token must start with rck_
+  if (token.startsWith("rck_")) {
+    const key = await store.getApiKeyByRawKey(token);
+    if (key) {
+      const workspace = await store.getWorkspace(key.workspaceId);
+      if (!workspace) return res.status(401).json({ error: "Workspace not found" });
+      req.user = null;
+      req.workspace = workspace;
+      req.apiKey = key;
+      req.sessionToken = null;
+      try {
+        await store.touchApiKeyLastUsed(key.id);
+      } catch (e) {
+        logger.warn({ requestId: req.requestId, err: String(e?.message || e) }, "[auth] touchApiKeyLastUsed failed");
+      }
+      return next();
+    }
+    return res.status(401).json({ error: "Invalid API key" });
+  }
+
   const session = await store.getSession(token);
   if (!session) return res.status(401).json({ error: "Invalid session" });
   if (session.expiresAt && session.expiresAt < Date.now()) {
@@ -956,6 +976,30 @@ app.post("/api/auth/logout", requireAuth, async (req, res) => {
 
 app.get("/api/me", requireAuth, async (req, res) => {
   return res.json({ user: req.user, workspace: req.workspace });
+});
+
+// --- API Keys (workspace-scoped; auth via session or API key) ---
+app.get("/api/api-keys", requireAuth, async (req, res) => {
+  if (!USE_DB) return res.status(400).json({ error: "API keys require Postgres mode" });
+  const keys = await store.listApiKeys(req.workspace.id);
+  return res.json({ apiKeys: keys });
+});
+
+app.post("/api/api-keys", requireAuth, async (req, res) => {
+  if (!USE_DB) return res.status(400).json({ error: "API keys require Postgres mode" });
+  const schema = z.object({ name: z.string().min(1).max(80) });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "Validation failed", details: parsed.error.flatten() });
+  const created = await store.createApiKey(req.workspace.id, parsed.data.name);
+  return res.status(201).json({ apiKey: created });
+});
+
+app.delete("/api/api-keys/:id", requireAuth, async (req, res) => {
+  if (!USE_DB) return res.status(400).json({ error: "API keys require Postgres mode" });
+  const id = String(req.params.id || "").trim();
+  const revoked = await store.revokeApiKey(req.workspace.id, id);
+  if (!revoked) return res.status(404).json({ error: "API key not found" });
+  return res.json({ ok: true });
 });
 
 // --- Knowledge Base (folders + docs) ---

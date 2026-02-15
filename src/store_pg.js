@@ -1,5 +1,14 @@
+const crypto = require("crypto");
 const { nanoid } = require("./id");
 const { getPool } = require("./db");
+
+const API_KEY_PREFIX = "rck_";
+const API_KEY_SECRET_LENGTH = 32;
+const API_KEY_DISPLAY_PREFIX_LENGTH = 12;
+
+function hashApiKey(key) {
+  return crypto.createHash("sha256").update(key, "utf8").digest("hex");
+}
 
 function rowToUser(r) {
   return {
@@ -353,6 +362,65 @@ async function getSession(token) {
 async function deleteSession(token) {
   const p = getPool();
   await p.query(`DELETE FROM sessions WHERE token=$1`, [token]);
+}
+
+async function createApiKey(workspaceId, name) {
+  const p = getPool();
+  const secret = nanoid(API_KEY_SECRET_LENGTH);
+  const rawKey = `${API_KEY_PREFIX}${secret}`;
+  const keyHash = hashApiKey(rawKey);
+  const keyPrefix = rawKey.slice(0, API_KEY_DISPLAY_PREFIX_LENGTH);
+  const id = nanoid(12);
+  const now = Date.now();
+  await p.query(
+    `INSERT INTO api_keys (id, workspace_id, name, key_prefix, key_hash, created_at) VALUES ($1,$2,$3,$4,$5,$6)`,
+    [id, workspaceId, String(name || "").trim() || "API Key", keyPrefix, keyHash, now]
+  );
+  return {
+    id,
+    name: String(name || "").trim() || "API Key",
+    keyPrefix: keyPrefix + "…",
+    createdAt: now,
+    rawKey,
+  };
+}
+
+async function listApiKeys(workspaceId) {
+  const p = getPool();
+  const { rows } = await p.query(
+    `SELECT id, workspace_id, name, key_prefix, created_at, last_used_at FROM api_keys WHERE workspace_id=$1 ORDER BY created_at DESC`,
+    [workspaceId]
+  );
+  return rows.map((r) => ({
+    id: r.id,
+    workspaceId: r.workspace_id,
+    name: r.name,
+    keyPrefix: r.key_prefix + "…",
+    createdAt: r.created_at,
+    lastUsedAt: r.last_used_at,
+  }));
+}
+
+async function revokeApiKey(workspaceId, id) {
+  const p = getPool();
+  const { rowCount } = await p.query(`DELETE FROM api_keys WHERE workspace_id=$1 AND id=$2`, [workspaceId, id]);
+  return rowCount > 0;
+}
+
+async function getApiKeyByRawKey(rawKey) {
+  const p = getPool();
+  if (!rawKey || typeof rawKey !== "string" || !rawKey.startsWith(API_KEY_PREFIX)) return null;
+  const keyHash = hashApiKey(rawKey.trim());
+  const { rows } = await p.query(
+    `SELECT id, workspace_id, name, key_prefix FROM api_keys WHERE key_hash=$1`,
+    [keyHash]
+  );
+  return rows[0] ? { id: rows[0].id, workspaceId: rows[0].workspace_id, name: rows[0].name, keyPrefix: rows[0].key_prefix } : null;
+}
+
+async function touchApiKeyLastUsed(id) {
+  const p = getPool();
+  await p.query(`UPDATE api_keys SET last_used_at=$2 WHERE id=$1`, [id, Date.now()]);
 }
 
 async function getWorkspaceForUser(userId) {
@@ -1429,6 +1497,11 @@ module.exports = {
   createSession,
   getSession,
   deleteSession,
+  createApiKey,
+  listApiKeys,
+  revokeApiKey,
+  getApiKeyByRawKey,
+  touchApiKeyLastUsed,
   getWorkspaceForUser,
   ensureWorkspaceForUser,
 

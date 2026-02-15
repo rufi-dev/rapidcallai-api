@@ -130,6 +130,20 @@ async function initSchema() {
   await p.query(`ALTER TABLE calls ADD COLUMN IF NOT EXISTS post_call_extraction_results JSONB NULL;`);
   await p.query(`CREATE INDEX IF NOT EXISTS agents_workspace_idx ON agents(workspace_id, created_at DESC);`);
 
+  await p.query(`
+    CREATE TABLE IF NOT EXISTS api_keys (
+      id TEXT PRIMARY KEY,
+      workspace_id TEXT NOT NULL,
+      name TEXT NOT NULL DEFAULT '',
+      key_prefix TEXT NOT NULL,
+      key_hash TEXT NOT NULL UNIQUE,
+      created_at BIGINT NOT NULL,
+      last_used_at BIGINT NULL
+    );
+  `);
+  await p.query(`CREATE INDEX IF NOT EXISTS api_keys_workspace_idx ON api_keys(workspace_id);`);
+  await p.query(`CREATE INDEX IF NOT EXISTS api_keys_key_hash_idx ON api_keys(key_hash);`);
+
   // Knowledge Base (folders + documents)
   await p.query(`
     CREATE TABLE IF NOT EXISTS kb_folders (
