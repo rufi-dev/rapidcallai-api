@@ -1327,7 +1327,17 @@ app.post("/api/internal/calls/:id/end", requireAgentSecret, async (req, res) => 
                 } catch {
                   // ignore
                 }
-                await store.updateCall(id, { recording: { ...c2.recording, status: "ready", sizeBytes } });
+                let durationSec = c2.durationSec;
+                const startedAt = Number(info?.startedAt ?? info?.started_at ?? 0);
+                const endedAt = Number(info?.endedAt ?? info?.ended_at ?? 0);
+                if (startedAt > 0 && endedAt >= startedAt) {
+                  const recordingSec = Math.max(0, Math.round((endedAt - startedAt) / 1000));
+                  durationSec = recordingSec;
+                }
+                await store.updateCall(id, {
+                  recording: { ...c2.recording, status: "ready", sizeBytes },
+                  ...(durationSec != null ? { durationSec } : {}),
+                });
               }
               return;
             }
@@ -4294,7 +4304,7 @@ app.post("/api/calls/:id/end", requireAuth, async (req, res) => {
           const info = await getEgressInfo(egressId);
           const status = info?.status;
           if (status === 3) {
-            // EGRESS_COMPLETE
+            // EGRESS_COMPLETE — align stored duration with actual recording length
             if (USE_DB) {
               const c = await store.getCallById(id);
               if (c?.recording?.kind === "egress_s3") {
@@ -4305,7 +4315,16 @@ app.post("/api/calls/:id/end", requireAuth, async (req, res) => {
                 } catch {
                   // ignore
                 }
-                await store.updateCall(id, { recording: { ...c.recording, status: "ready", sizeBytes } });
+                let durationSec = c.durationSec;
+                const startedAt = Number(info?.startedAt ?? info?.started_at ?? 0);
+                const endedAt = Number(info?.endedAt ?? info?.ended_at ?? 0);
+                if (startedAt > 0 && endedAt >= startedAt) {
+                  durationSec = Math.max(0, Math.round((endedAt - startedAt) / 1000));
+                }
+                await store.updateCall(id, {
+                  recording: { ...c.recording, status: "ready", sizeBytes },
+                  ...(durationSec != null ? { durationSec } : {}),
+                });
               }
             } else {
               const calls3 = readCalls();
