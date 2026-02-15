@@ -3449,7 +3449,12 @@ app.get("/api/calls/:id", requireAuth, async (req, res) => {
   const { id } = req.params;
   const call = USE_DB ? await store.getCall(req.workspace.id, id) : readCalls().find((c) => c.id === id);
   if (!call) return res.status(404).json({ error: "Call not found" });
-  res.json({ call });
+  const norm = normalizeDurationSec({
+    durationSecStored: call.durationSec,
+    startedAtMs: call.startedAt,
+    endedAtMs: call.endedAt,
+  });
+  res.json({ call: { ...call, durationSec: norm.durationSec } });
 });
 
 // Export call data (transcript + metrics) for QA/review
@@ -3458,6 +3463,11 @@ app.get("/api/calls/:id/export", requireAuth, async (req, res) => {
   if (!id) return res.status(400).json({ error: "Missing call id" });
   const call = USE_DB ? await store.getCall(req.workspace.id, id) : readCalls().find((c) => c.id === id);
   if (!call) return res.status(404).json({ error: "Call not found" });
+  const norm = normalizeDurationSec({
+    durationSecStored: call.durationSec,
+    startedAtMs: call.startedAt,
+    endedAtMs: call.endedAt,
+  });
   return res.json({
     call: {
       id: call.id,
@@ -3467,7 +3477,7 @@ app.get("/api/calls/:id/export", requireAuth, async (req, res) => {
       to: call.to,
       startedAt: call.startedAt,
       endedAt: call.endedAt,
-      durationSec: call.durationSec,
+      durationSec: norm.durationSec,
       outcome: call.outcome,
       metrics: call.metrics ?? null,
       transcript: call.transcript ?? [],
