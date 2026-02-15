@@ -1332,6 +1332,16 @@ async function getOutboundJobByProviderCallId(workspaceId, providerCallId) {
   return rows[0] ? rowToOutboundJob(rows[0]) : null;
 }
 
+async function getOutboundJobByRoomName(workspaceId, roomName) {
+  if (!roomName || typeof roomName !== "string") return null;
+  const p = getPool();
+  const { rows } = await p.query(
+    `SELECT * FROM outbound_jobs WHERE workspace_id=$1 AND room_name=$2 ORDER BY created_at DESC LIMIT 1`,
+    [workspaceId, roomName.trim()]
+  );
+  return rows[0] ? rowToOutboundJob(rows[0]) : null;
+}
+
 async function updateOutboundJob(workspaceId, id, patch) {
   const p = getPool();
   const current = await getOutboundJob(workspaceId, id);
@@ -1560,6 +1570,7 @@ module.exports = {
   createOutboundJob,
   getOutboundJob,
   getOutboundJobByProviderCallId,
+  getOutboundJobByRoomName,
   listOutboundJobs,
   updateOutboundJob,
   countOutboundActive,

@@ -375,6 +375,108 @@ app.post("/api/livekit/webhook", express.raw({ type: "application/webhook+json" 
           logger.warn({ err: String(e2?.message || e2), roomName }, "[outbound] failed to complete job on room_finished");
         }
       }
+
+      // End telephony call and send call_ended / call_analyzed when user hung up (room ended but call not yet ended)
+      if (USE_DB && call.to !== "webtest" && !call.endedAt) {
+        try {
+          const callNow = Date.now();
+          const endedAt = callNow;
+          const durationSec = Math.max(0, Math.round((endedAt - call.startedAt) / 1000));
+          const transcriptToStore = call.transcript && call.transcript.length > 0 ? call.transcript : [];
+          const patch = { endedAt, durationSec, outcome: "user_hangup", transcript: transcriptToStore };
+
+          if (call.agentId && call.workspaceId && transcriptToStore.length > 0) {
+            try {
+              const agent = await store.getAgent(call.workspaceId, call.agentId);
+              const items = Array.isArray(agent?.postCallDataExtraction) ? agent.postCallDataExtraction : [];
+              if (items.length > 0) {
+                const apiKey = String(process.env.OPENAI_API_KEY || "").trim();
+                if (apiKey) {
+                  const model =
+                    String(agent?.postCallExtractionModel || "").trim() ||
+                    String(process.env.OPENAI_EVAL_MODEL || process.env.OPENAI_GENERATE_MODEL || "gpt-4.1-mini").trim();
+                  const transcriptText = transcriptToStore
+                    .map((t) => `${t.role === "user" ? "USER" : "AGENT"}: ${String(t.text || "").trim()}`)
+                    .filter(Boolean)
+                    .join("\n");
+                  const results = await runPostCallExtraction({
+                    apiKey,
+                    model,
+                    transcriptText,
+                    extractionItems: items.map((it) => ({
+                      name: it.name || "",
+                      type: it.type,
+                      description: it.description || it.name,
+                      options: it.options,
+                    })),
+                  });
+                  patch.analysisStatus = "completed";
+                  patch.postCallExtractionResults = results;
+                }
+              }
+            } catch (eExt) {
+              logger.warn({ callId: call.id, err: String(eExt?.message || eExt) }, "[livekit.webhook] room_finished extraction failed");
+            }
+          }
+
+          const updated = await store.updateCall(call.id, patch);
+
+          try {
+            callsEndedTotal.inc({ source: "telephony", outcome: "user_hangup" });
+            callDurationSeconds.observe({ source: "telephony", outcome: "user_hangup" }, Number(durationSec || 0));
+            inProgressCallsGaugeValue = Math.max(0, inProgressCallsGaugeValue - 1);
+          } catch {
+            // ignore
+          }
+
+          try {
+            await finalizeBillingForCall({ store, call: updated });
+          } catch (eBilling) {
+            logger.warn({ callId: call.id, err: String(eBilling?.message || eBilling) }, "[livekit.webhook] room_finished billing failed");
+          }
+
+          const c = await store.getCallById(call.id);
+          if (c?.recording?.kind === "egress_s3" && c.recording.egressId) {
+            const egressId = c.recording.egressId;
+            await store.updateCall(call.id, { recording: { ...c.recording, status: "stopping" } });
+            setTimeout(async () => {
+              try {
+                await stopEgress(egressId);
+              } catch {
+                // ignore
+              }
+            }, 0);
+          }
+
+          if (updated.agentId && updated.workspaceId) {
+            try {
+              const agent = await store.getAgent(updated.workspaceId, updated.agentId);
+              if (agent) {
+                sendAgentWebhook(agent, "call_ended", updated);
+                if (updated.analysisStatus || (updated.postCallExtractionResults && updated.postCallExtractionResults.length > 0)) {
+                  sendAgentWebhook(agent, "call_analyzed", updated);
+                }
+              }
+            } catch (eWh) {
+              logger.warn({ callId: call.id, err: String(eWh?.message || eWh) }, "[livekit.webhook] room_finished webhooks failed");
+            }
+          }
+
+          try {
+            if (updated.to && updated.to !== "webtest" && /^\+?[1-9]\d{6,14}$/.test(updated.to)) {
+              const phone = updated.to.startsWith("+") ? updated.to : `+${updated.to}`;
+              const source = updated.metrics?.normalized?.source === "outbound" ? "outbound" : "inbound";
+              await contactStore.upsertContactFromCall(updated.workspaceId, phone, "", source);
+            }
+          } catch {
+            // ignore
+          }
+
+          logger.info({ callId: call.id, roomName }, "[livekit.webhook] telephony call ended via room_finished");
+        } catch (e2) {
+          logger.warn({ err: String(e2?.message || e2), callId: call.id, roomName }, "[livekit.webhook] end telephony call on room_finished failed");
+        }
+      }
     }
 
     const participantMinutesBilled = round4(billedSecondsTotal / 60);
@@ -612,6 +714,37 @@ async function updateCallMetricsById(callId, patchMetrics) {
   calls[idx] = { ...cur, metrics: nextMetrics, updatedAt: Date.now() };
   writeCalls(calls);
   return calls[idx];
+}
+
+/**
+ * Disconnect the SIP participant for a telephony call so the phone actually hangs up.
+ * Outbound: remove participant by identity sip-{phoneE164} from job. Inbound: list participants and remove first sip-*.
+ */
+async function disconnectSipParticipantForCall(call) {
+  if (!call?.roomName || call.to === "webtest") return;
+  const roomName = String(call.roomName).trim();
+  const workspaceId = call.workspaceId;
+  try {
+    const rs = roomService();
+    const isOutbound = call.metrics?.normalized?.source === "outbound";
+    if (isOutbound && workspaceId && typeof store.getOutboundJobByRoomName === "function") {
+      const job = await store.getOutboundJobByRoomName(workspaceId, roomName);
+      if (job?.phoneE164) {
+        const identity = `sip-${job.phoneE164}`;
+        await rs.removeParticipant(roomName, identity);
+        logger.info({ callId: call.id, roomName, identity }, "[internal.calls.end] SIP participant removed (outbound)");
+        return;
+      }
+    }
+    const participants = await rs.listParticipants(roomName);
+    const sipParticipant = participants.find((p) => p.identity && String(p.identity).startsWith("sip-"));
+    if (sipParticipant?.identity) {
+      await rs.removeParticipant(roomName, sipParticipant.identity);
+      logger.info({ callId: call.id, roomName, identity: sipParticipant.identity }, "[internal.calls.end] SIP participant removed (inbound)");
+    }
+  } catch (e) {
+    logger.warn({ callId: call?.id, roomName, err: String(e?.message || e) }, "[internal.calls.end] disconnect SIP failed");
+  }
 }
 
 function getPublicApiBaseUrl(req) {
@@ -1360,15 +1493,64 @@ app.post("/api/internal/calls/:id/end", requireAgentSecret, async (req, res) => 
   const durationSec = Math.max(0, Math.round((endedAt - current.startedAt) / 1000));
 
   const outcomeToStore = parsed.data.outcome ?? (current.outcome === "in_progress" ? "completed" : current.outcome);
+  const transcriptToStore = parsed.data.transcript ? parsed.data.transcript : current.transcript;
   const patch = {
     endedAt,
     durationSec,
     outcome: outcomeToStore,
-    transcript: parsed.data.transcript ? parsed.data.transcript : current.transcript,
+    transcript: transcriptToStore,
   };
   if (parsed.data.analysisStatus !== undefined) patch.analysisStatus = parsed.data.analysisStatus;
   if (parsed.data.postCallExtractionResults !== undefined) patch.postCallExtractionResults = parsed.data.postCallExtractionResults;
+
+  // Post-call extraction (same as public /api/calls/:id/end) when agent has extraction items and we have transcript
+  if (
+    current.agentId &&
+    current.workspaceId &&
+    transcriptToStore &&
+    transcriptToStore.length > 0 &&
+    patch.analysisStatus === undefined &&
+    patch.postCallExtractionResults === undefined
+  ) {
+    try {
+      const agent = await store.getAgent(current.workspaceId, current.agentId);
+      const items = Array.isArray(agent?.postCallDataExtraction) ? agent.postCallDataExtraction : [];
+      if (items.length > 0) {
+        const apiKey = String(process.env.OPENAI_API_KEY || "").trim();
+        if (apiKey) {
+          const model =
+            String(agent?.postCallExtractionModel || "").trim() ||
+            String(process.env.OPENAI_EVAL_MODEL || process.env.OPENAI_GENERATE_MODEL || "gpt-4.1-mini").trim();
+          const transcriptText = transcriptToStore
+            .map((t) => `${t.role === "user" ? "USER" : "AGENT"}: ${String(t.text || "").trim()}`)
+            .filter(Boolean)
+            .join("\n");
+          const results = await runPostCallExtraction({
+            apiKey,
+            model,
+            transcriptText,
+            extractionItems: items.map((it) => ({
+              name: it.name || "",
+              type: it.type,
+              description: it.description || it.name,
+              options: it.options,
+            })),
+          });
+          patch.analysisStatus = "completed";
+          patch.postCallExtractionResults = results;
+        }
+      }
+    } catch (e) {
+      logger.warn({ requestId: req.requestId, err: String(e?.message || e) }, "[internal.calls.end] post-call extraction failed");
+      patch.analysisStatus = "failed";
+      patch.postCallExtractionResults = [];
+    }
+  }
+
   const updated = await store.updateCall(id, patch);
+
+  // Hang up the phone leg so the carrier actually disconnects (agent said goodbye / end_call tool)
+  await disconnectSipParticipantForCall(updated);
 
   // Billing finalization (trial debit / OpenMeter event). Best-effort.
   try {
@@ -1469,7 +1651,12 @@ app.post("/api/internal/calls/:id/end", requireAgentSecret, async (req, res) => 
   if (updated.agentId && updated.workspaceId && USE_DB) {
     try {
       const agent = await store.getAgent(updated.workspaceId, updated.agentId);
-      if (agent) sendAgentWebhook(agent, "call_ended", updated);
+      if (agent) {
+        sendAgentWebhook(agent, "call_ended", updated);
+        if (updated.analysisStatus || (updated.postCallExtractionResults && updated.postCallExtractionResults.length > 0)) {
+          sendAgentWebhook(agent, "call_analyzed", updated);
+        }
+      }
     } catch (e) {
       logger.warn({ requestId: req.requestId, err: String(e?.message || e) }, "[internal.calls.end] webhook send failed");
     }
