@@ -678,19 +678,25 @@ async function endTelephonyCallFromWebhook(call, outcome) {
   const patch = { endedAt, durationSec, outcome, transcript: transcriptToStore };
 
   if (current.agentId && current.workspaceId && transcriptToStore.length > 0) {
-    try {
-      const agent = await store.getAgent(current.workspaceId, current.agentId);
-      const items = Array.isArray(agent?.postCallDataExtraction) ? agent.postCallDataExtraction : [];
-      if (items.length > 0) {
-        const apiKey = String(process.env.OPENAI_API_KEY || "").trim();
-        if (apiKey) {
+    const transcriptText = transcriptToStore
+      .map((t) => `${t.role === "user" ? "USER" : "AGENT"}: ${String(t.text || "").trim()}`)
+      .filter(Boolean)
+      .join("\n");
+    const apiKey = String(process.env.OPENAI_API_KEY || "").trim();
+    const modelDefault = String(process.env.OPENAI_EVAL_MODEL || process.env.OPENAI_GENERATE_MODEL || "gpt-4.1-mini").trim();
+    if (apiKey) {
+      try {
+        const presetResult = await runPresetAnalysis({ apiKey, model: modelDefault, transcriptText, outcome });
+        patch.metrics = { ...(current.metrics && typeof current.metrics === "object" ? current.metrics : {}), preset_analysis: presetResult };
+      } catch (ePre) {
+        logger.warn({ callId: call.id, err: String(ePre?.message || ePre) }, "[livekit.webhook] preset analysis failed");
+      }
+      try {
+        const agent = await store.getAgent(current.workspaceId, current.agentId);
+        const items = Array.isArray(agent?.postCallDataExtraction) ? agent.postCallDataExtraction : [];
+        if (items.length > 0) {
           const model =
-            String(agent?.postCallExtractionModel || "").trim() ||
-            String(process.env.OPENAI_EVAL_MODEL || process.env.OPENAI_GENERATE_MODEL || "gpt-4.1-mini").trim();
-          const transcriptText = transcriptToStore
-            .map((t) => `${t.role === "user" ? "USER" : "AGENT"}: ${String(t.text || "").trim()}`)
-            .filter(Boolean)
-            .join("\n");
+            String(agent?.postCallExtractionModel || "").trim() || modelDefault;
           const results = await runPostCallExtraction({
             apiKey,
             model,
@@ -705,9 +711,9 @@ async function endTelephonyCallFromWebhook(call, outcome) {
           patch.analysisStatus = "completed";
           patch.postCallExtractionResults = results;
         }
+      } catch (eExt) {
+        logger.warn({ callId: call.id, err: String(eExt?.message || eExt) }, "[livekit.webhook] extraction failed");
       }
-    } catch (eExt) {
-      logger.warn({ callId: call.id, err: String(eExt?.message || eExt) }, "[livekit.webhook] extraction failed");
     }
   }
 
@@ -735,7 +741,7 @@ async function endTelephonyCallFromWebhook(call, outcome) {
       const agent = await store.getAgent(updated.workspaceId, updated.agentId);
       if (agent) {
         sendAgentWebhook(agent, "call_ended", updated);
-        if (updated.analysisStatus || (updated.postCallExtractionResults && updated.postCallExtractionResults.length > 0)) {
+        if (updated.metrics?.preset_analysis || updated.analysisStatus || (updated.postCallExtractionResults && updated.postCallExtractionResults.length > 0)) {
           sendAgentWebhook(agent, "call_analyzed", updated);
         }
       }
@@ -1511,7 +1517,25 @@ app.post("/api/internal/calls/:id/end", requireAgentSecret, async (req, res) => 
   if (parsed.data.analysisStatus !== undefined) patch.analysisStatus = parsed.data.analysisStatus;
   if (parsed.data.postCallExtractionResults !== undefined) patch.postCallExtractionResults = parsed.data.postCallExtractionResults;
 
-  // Post-call extraction (same as public /api/calls/:id/end) when agent has extraction items and we have transcript
+  // Preset analysis (call_summary, in_voicemail, user_sentiment, call_successful) for every call with transcript
+  if (transcriptToStore && transcriptToStore.length > 0) {
+    const apiKey = String(process.env.OPENAI_API_KEY || "").trim();
+    if (apiKey) {
+      try {
+        const transcriptText = transcriptToStore
+          .map((t) => `${t.role === "user" ? "USER" : "AGENT"}: ${String(t.text || "").trim()}`)
+          .filter(Boolean)
+          .join("\n");
+        const modelDefault = String(process.env.OPENAI_EVAL_MODEL || process.env.OPENAI_GENERATE_MODEL || "gpt-4.1-mini").trim();
+        const presetResult = await runPresetAnalysis({ apiKey, model: modelDefault, transcriptText, outcome: outcomeToStore });
+        patch.metrics = { ...(current.metrics && typeof current.metrics === "object" ? current.metrics : {}), preset_analysis: presetResult };
+      } catch (ePre) {
+        logger.warn({ requestId: req.requestId, err: String(ePre?.message || ePre) }, "[internal.calls.end] preset analysis failed");
+      }
+    }
+  }
+
+  // Post-call extraction (agent-configured items) when we have transcript
   if (
     current.agentId &&
     current.workspaceId &&
@@ -1661,7 +1685,7 @@ app.post("/api/internal/calls/:id/end", requireAgentSecret, async (req, res) => 
       const agent = await store.getAgent(updated.workspaceId, updated.agentId);
       if (agent) {
         sendAgentWebhook(agent, "call_ended", updated);
-        if (updated.analysisStatus || (updated.postCallExtractionResults && updated.postCallExtractionResults.length > 0)) {
+        if (updated.metrics?.preset_analysis || updated.analysisStatus || (updated.postCallExtractionResults && updated.postCallExtractionResults.length > 0)) {
           sendAgentWebhook(agent, "call_analyzed", updated);
         }
       }
@@ -1968,6 +1992,95 @@ function runPostCallExtraction({ apiKey, model, transcriptText, extractionItems 
       }
     );
     req.on("error", reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+/**
+ * Run preset analysis for every call with transcript: call_summary, in_voicemail, user_sentiment, call_successful.
+ * Stored in call.metrics.preset_analysis and used in webhooks + UI. No agent config required.
+ * @returns {Promise<{ call_summary: string, in_voicemail: boolean, user_sentiment: string|null, call_successful: boolean }>}
+ */
+function runPresetAnalysis({ apiKey, model, transcriptText, outcome }) {
+  if (!apiKey || !transcriptText || transcriptText.length < 10) {
+    return Promise.resolve({
+      call_summary: "",
+      in_voicemail: false,
+      user_sentiment: null,
+      call_successful: false,
+    });
+  }
+  const systemContent =
+    "You analyze a call transcript. Return ONLY a JSON object with exactly these keys: " +
+    "call_summary (string, 1-3 sentence summary of what happened), " +
+    "in_voicemail (boolean, true if the call reached voicemail or left a message), " +
+    "user_sentiment (string, one of: positive, negative, neutral, or null if unclear), " +
+    "call_successful (boolean, true if the call achieved a reasonable outcome e.g. completed conversation, left message, or resolved intent). " +
+    "No other keys. Use the exact key names.";
+  const userContent = `Outcome: ${outcome || "unknown"}\n\nTranscript:\n${transcriptText.slice(0, 10000)}`;
+
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify({
+      model: model || "gpt-4.1-mini",
+      temperature: 0.2,
+      messages: [
+        { role: "system", content: systemContent },
+        { role: "user", content: userContent },
+      ],
+    });
+    const req = https.request(
+      {
+        hostname: "api.openai.com",
+        path: "/v1/chat/completions",
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${apiKey}`,
+          "content-type": "application/json",
+          "content-length": Buffer.byteLength(body),
+        },
+      },
+      (res) => {
+        let data = "";
+        res.on("data", (c) => (data += c));
+        res.on("end", () => {
+          try {
+            if (res.statusCode < 200 || res.statusCode >= 300) {
+              return resolve({ call_summary: "", in_voicemail: false, user_sentiment: null, call_successful: false });
+            }
+            const parsed = JSON.parse(data);
+            const txt =
+              parsed?.choices?.[0]?.message?.content != null ? String(parsed.choices[0].message.content).trim() : "";
+            if (!txt) {
+              return resolve({ call_summary: "", in_voicemail: false, user_sentiment: null, call_successful: false });
+            }
+            let obj;
+            try {
+              obj = JSON.parse(txt);
+            } catch {
+              const start = txt.indexOf("{");
+              const end = txt.lastIndexOf("}");
+              if (start !== -1 && end > start) obj = JSON.parse(txt.slice(start, end + 1));
+            }
+            if (!obj || typeof obj !== "object") {
+              return resolve({ call_summary: "", in_voicemail: false, user_sentiment: null, call_successful: false });
+            }
+            resolve({
+              call_summary: typeof obj.call_summary === "string" ? obj.call_summary.trim().slice(0, 2000) : "",
+              in_voicemail: Boolean(obj.in_voicemail),
+              user_sentiment:
+                obj.user_sentiment === "positive" || obj.user_sentiment === "negative" || obj.user_sentiment === "neutral"
+                  ? obj.user_sentiment
+                  : null,
+              call_successful: Boolean(obj.call_successful),
+            });
+          } catch (e) {
+            resolve({ call_summary: "", in_voicemail: false, user_sentiment: null, call_successful: false });
+          }
+        });
+      }
+    );
+    req.on("error", () => resolve({ call_summary: "", in_voicemail: false, user_sentiment: null, call_successful: false }));
     req.write(body);
     req.end();
   });
@@ -4906,6 +5019,24 @@ app.post("/api/calls/:id/end", requireAuth, async (req, res) => {
       recording: next.recording ?? null,
     };
 
+    // Preset analysis (call_summary, in_voicemail, user_sentiment, call_successful) for every call with transcript
+    if (next.transcript && next.transcript.length > 0) {
+      const apiKey = String(process.env.OPENAI_API_KEY || "").trim();
+      if (apiKey) {
+        try {
+          const transcriptText = next.transcript
+            .map((t) => `${t.role === "user" ? "USER" : "AGENT"}: ${String(t.text || "").trim()}`)
+            .filter(Boolean)
+            .join("\n");
+          const modelDefault = String(process.env.OPENAI_EVAL_MODEL || process.env.OPENAI_GENERATE_MODEL || "gpt-4.1-mini").trim();
+          const presetResult = await runPresetAnalysis({ apiKey, model: modelDefault, transcriptText, outcome: outcomeToStore });
+          updatePayload.metrics = { ...(current.metrics && typeof current.metrics === "object" ? current.metrics : {}), preset_analysis: presetResult };
+        } catch (ePre) {
+          logger.warn({ requestId: req.requestId, err: String(ePre?.message || ePre) }, "[calls.end] preset analysis failed");
+        }
+      }
+    }
+
     // Post-call data extraction: if agent has extraction items and we have transcript, run LLM extraction.
     const extractionItems =
       current.agentId && next.transcript && next.transcript.length > 0
@@ -4955,7 +5086,7 @@ app.post("/api/calls/:id/end", requireAuth, async (req, res) => {
         const agent = await store.getAgent(updated.workspaceId, updated.agentId);
         if (agent) {
           sendAgentWebhook(agent, "call_ended", updated);
-          if (extractionResult && (updated.analysisStatus || (updated.postCallExtractionResults && updated.postCallExtractionResults.length > 0))) {
+          if (updated.metrics?.preset_analysis || (extractionResult && (updated.analysisStatus || (updated.postCallExtractionResults && updated.postCallExtractionResults.length > 0)))) {
             sendAgentWebhook(agent, "call_analyzed", updated);
           }
         }

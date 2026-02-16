@@ -107,16 +107,20 @@ function buildCallEndedPayload(call, agent) {
 function buildCallAnalyzedPayload(call, agent) {
   const payload = buildCallPayload(call, agent, { status: "ended", includeRecordingUrl: true });
   payload.agent_version = 1;
+  const preset = call.metrics?.preset_analysis && typeof call.metrics.preset_analysis === "object" ? call.metrics.preset_analysis : null;
   payload.call_analysis = {
-    call_summary: "",
-    in_voicemail: false,
-    user_sentiment: null,
-    call_successful: (call.outcome || "").toLowerCase() === "completed" || (call.outcome || "").toLowerCase() === "ended",
+    call_summary: preset?.call_summary ?? "",
+    in_voicemail: Boolean(preset?.in_voicemail),
+    user_sentiment: preset?.user_sentiment ?? null,
+    call_successful: preset?.call_successful ?? ((call.outcome || "").toLowerCase() === "completed" || (call.outcome || "").toLowerCase() === "ended"),
     custom_analysis_data: {},
   };
   if (Array.isArray(call.postCallExtractionResults) && call.postCallExtractionResults.length > 0) {
     for (const r of call.postCallExtractionResults) {
       payload.call_analysis.custom_analysis_data[r.name] = r.value;
+      if (r.name === "call_summary" && (r.value !== undefined && r.value !== null && String(r.value).trim())) {
+        payload.call_analysis.call_summary = String(r.value).trim().slice(0, 2000);
+      }
     }
   }
   if (call.analysisStatus) {
