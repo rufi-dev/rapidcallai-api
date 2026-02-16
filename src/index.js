@@ -1782,20 +1782,21 @@ app.post("/api/internal/calls/:id/end", requireAgentSecret, async (req, res) => 
   return res.json({ call: updated });
 });
 
-// Transcript item: utterance (speaker/role/text) or tool_invocation / tool_result (Retell-style)
+// Transcript item: utterance (speaker/role/text) or tool_invocation / tool_result (Retell-style). Zod 4: z.record(key, value).
+const transcriptRecordSchema = z.record(z.string(), z.unknown());
 const TranscriptItemSchema = z.union([
   z.object({ speaker: z.string().min(1).max(120), role: z.enum(["agent", "user"]), text: z.string().min(1).max(5000) }),
   z.object({
     kind: z.literal("tool_invocation"),
     toolCallId: z.string().min(1).max(80),
     toolName: z.string().min(1).max(80),
-    input: z.record(z.unknown()),
+    input: transcriptRecordSchema,
   }),
   z.object({
     kind: z.literal("tool_result"),
     toolCallId: z.string().min(1).max(80),
     toolName: z.string().max(80).optional(),
-    result: z.record(z.unknown()),
+    result: transcriptRecordSchema,
   }),
 ]);
 
@@ -1812,19 +1813,27 @@ function transcriptToTextForAnalysis(transcript) {
     .join("\n");
 }
 
-// --- Internal: agent pushes transcript during call (so when user hangs up we have it for analysis) ---
+// --- Internal: agent pushes transcript during call and on shutdown (so when user hangs up we have it) ---
 app.post("/api/internal/calls/:id/transcript", requireAgentSecret, async (req, res) => {
   const { id } = req.params;
+  if (!USE_DB) return res.status(400).json({ error: "Internal endpoints require Postgres mode" });
+  const current = await store.getCallById(id);
+  if (!current) return res.status(404).json({ error: "Call not found" });
+
   const schema = z.object({
     transcript: z.array(TranscriptItemSchema).max(500),
   });
-  const parsed = schema.safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: "Validation failed", details: parsed.error.flatten() });
-  if (!USE_DB) return res.status(400).json({ error: "Internal endpoints require Postgres mode" });
-
-  const current = await store.getCallById(id);
-  if (!current) return res.status(404).json({ error: "Call not found" });
-  if (current.endedAt) return res.status(400).json({ error: "Call already ended" });
+  let parsed;
+  try {
+    parsed = schema.safeParse(req.body);
+  } catch (parseErr) {
+    logger.warn({ callId: id, err: String(parseErr?.message || parseErr) }, "[internal.transcript] parse threw");
+    return res.status(400).json({ error: "Invalid transcript payload" });
+  }
+  if (!parsed.success) {
+    logger.warn({ callId: id, error: parsed.error.flatten() }, "[internal.transcript] validation failed");
+    return res.status(400).json({ error: "Validation failed", details: parsed.error.flatten() });
+  }
 
   await store.updateCall(id, { transcript: parsed.data.transcript });
   return res.json({ ok: true });
@@ -1885,12 +1894,13 @@ app.post("/api/internal/calls/:id/transfer", requireAgentSecret, async (req, res
       "[internal.transfer] participants listed"
     );
 
-    // SIP participant: identity usually "sip-..." or kind === 2 (SIP) in some SDKs
-    const sipParticipant = participants.find(
-      (p) =>
-        (p.kind === 2 || (typeof p.kind === "string" && String(p.kind).toUpperCase() === "SIP")) ||
-        (p.identity && String(p.identity).toLowerCase().startsWith("sip"))
-    );
+    // Prefer participant whose identity starts with "sip" (the actual SIP trunk leg). Fallback to kind === 2.
+    const sipParticipant =
+      participants.find((p) => p.identity && String(p.identity).toLowerCase().startsWith("sip")) ||
+      participants.find(
+        (p) =>
+          p.kind === 2 || (typeof p.kind === "string" && String(p.kind).toUpperCase() === "SIP")
+      );
     if (!sipParticipant?.identity) {
       logger.warn(
         { callId: id, roomName, participantIdentities: participants.map((p) => p.identity), participantSummary },
