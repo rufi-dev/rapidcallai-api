@@ -1499,6 +1499,39 @@ app.post(
   // call_started webhook is sent only after the call is answered (when SIP participant joins the room), not on dial.
   console.log("[internal.telephony.inbound.start] call created, agent will join", { callId, roomName: parsed.data.roomName, to, from, agentId: agent.id });
 
+  // Update LiveKit room metadata so the Python agent reads prompt, voice, tools, etc. (same shape as webtest).
+  const enabledTools = Array.isArray(agent.enabledTools) ? agent.enabledTools : ["end_call"];
+  const toolConfigs = agent.toolConfigs && typeof agent.toolConfigs === "object" ? agent.toolConfigs : {};
+  const inboundMetadata = {
+    call: { id: callId, to: from || "unknown", direction: "inbound" },
+    agent: {
+      id: agent.id,
+      name: agent.name,
+      prompt: promptUsed,
+      voice: agent.voice ?? {},
+      enabledTools,
+      toolConfigs,
+      backchannelEnabled: Boolean(agent.backchannelEnabled),
+      backgroundAudio: agent.backgroundAudio ?? {},
+      llmModel: String(agent.llmModel || "").trim(),
+      maxCallSeconds: Number(agent.maxCallSeconds || 0),
+      knowledgeFolderIds: Array.isArray(agent.knowledgeFolderIds) ? agent.knowledgeFolderIds : [],
+      defaultDynamicVariables: agent.defaultDynamicVariables ?? {},
+      callSettings: agent.callSettings ?? {},
+      fallbackVoice: agent.fallbackVoice ?? null,
+      postCallDataExtraction: Array.isArray(agent.postCallDataExtraction) ? agent.postCallDataExtraction : [],
+      postCallExtractionModel: agent.postCallExtractionModel ?? "",
+    },
+    welcome: agent.welcome ?? {},
+  };
+  try {
+    const rs = roomService();
+    await rs.updateRoomMetadata(parsed.data.roomName, JSON.stringify(inboundMetadata));
+    console.log("[internal.telephony.inbound.start] room metadata updated for agent config");
+  } catch (metaErr) {
+    logger.warn({ requestId: req.requestId, err: String(metaErr?.message || metaErr), roomName: parsed.data.roomName }, "[internal.telephony.inbound.start] failed to update room metadata");
+  }
+
   // Start recording (egress) if configured.
   try {
     const e = await startCallEgress({ roomName: callRecord.roomName, callId });
@@ -1528,6 +1561,13 @@ app.post(
     llmModel: String(agent.llmModel || ""),
     maxCallSeconds: Number(agent.maxCallSeconds || 0),
     knowledgeFolderIds: Array.isArray(agent.knowledgeFolderIds) ? agent.knowledgeFolderIds : [],
+    enabledTools,
+    toolConfigs,
+    callSettings: agent.callSettings ?? {},
+    backchannelEnabled: Boolean(agent.backchannelEnabled),
+    fallbackVoice: agent.fallbackVoice ?? null,
+    postCallDataExtraction: Array.isArray(agent.postCallDataExtraction) ? agent.postCallDataExtraction : [],
+    postCallExtractionModel: agent.postCallExtractionModel ?? "",
     phoneNumber: { id: phoneRow.id, e164: phoneRow.e164 },
   });
   }

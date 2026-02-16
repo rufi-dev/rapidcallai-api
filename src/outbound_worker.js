@@ -252,6 +252,8 @@ async function ensureRoomWithMetadata({ roomName, job, agent, callId }) {
   }
   promptUsed = substituteDynamicVariables(promptUsed, vars);
 
+  const enabledTools = Array.isArray(agent.enabledTools) ? agent.enabledTools : ["end_call"];
+  const toolConfigs = agent.toolConfigs && typeof agent.toolConfigs === "object" ? agent.toolConfigs : {};
   const metadata = {
     call: { id: callId, to: job.phoneE164, direction: "outbound", jobId: job.id },
     agent: {
@@ -259,6 +261,9 @@ async function ensureRoomWithMetadata({ roomName, job, agent, callId }) {
       name: agent.name,
       prompt: promptUsed,
       voice: agent.voice ?? {},
+      enabledTools,
+      toolConfigs,
+      backchannelEnabled: Boolean(agent.backchannelEnabled),
       llmModel: String(agent.llmModel || "").trim(),
       maxCallSeconds: Number(agent.maxCallSeconds || 0),
       knowledgeFolderIds: Array.isArray(agent.knowledgeFolderIds) ? agent.knowledgeFolderIds : [],

@@ -137,7 +137,7 @@ For inbound calls to work you need:
    In Phone Numbers, open the number and set **Inbound agent** to your voice agent. If this is not set, the API returns a fallback prompt and the agent will say “This number is not configured for inbound calls…”; set it to get your real agent prompt and voice.
 
 **Important — numbers on the SIP trunk:**  
-When a phone number is associated with the Twilio SIP trunk (for outbound), Twilio **ignores** that number’s “Voice URL”. Inbound calls go straight to the trunk’s **Origination URI** (your LiveKit SIP endpoint). So you will **not** see `[twilio-inbound]` in API logs for those calls. You will see `[internal.telephony.inbound.start]` when the agent joins and calls the API. Audio depends on: LiveKit dispatch rule, agent env (`SERVER_BASE_URL`, `AGENT_SHARED_SECRET`, `LIVEKIT_AGENT_NAME`), and (optionally) Inbound agent set in the dashboard.
+When a phone number is associated with the Twilio SIP trunk (for outbound), Twilio **ignores** that number’s “Voice URL”. Inbound calls go straight to the trunk’s **Origination URI** (your LiveKit SIP endpoint). So you will **not** see `[twilio-inbound]` in API logs for those calls. You will see `[internal.telephony.inbound.start]` when the agent joins and calls the API (or when LiveKit calls your Request URL, if configured). The API creates the call record and updates the LiveKit room metadata with your agent's prompt, voice, tools (e.g. transfer), and settings so the agent uses them. Audio depends on: LiveKit dispatch rule, agent env (`SERVER_BASE_URL`, `AGENT_SHARED_SECRET`, `LIVEKIT_AGENT_NAME`), and (optionally) Inbound agent set in the dashboard.
 
 **After migrating to a new Twilio account:**
 
