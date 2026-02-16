@@ -772,13 +772,8 @@ async function endTelephonyCallFromWebhook(call, outcome) {
                 // ignore
               }
               let durationSec = c2.durationSec;
-              const startedAt = Number(info?.startedAt ?? info?.started_at ?? 0);
-              const endedAt = Number(info?.endedAt ?? info?.ended_at ?? 0);
-              let recordingDurationSec = null;
-              if (startedAt > 0 && endedAt >= startedAt) {
-                recordingDurationSec = Math.max(0, Math.round((endedAt - startedAt) / 1000));
-                durationSec = recordingDurationSec;
-              }
+              const recordingDurationSec = egressDiffToDurationSec(info?.startedAt ?? info?.started_at, info?.endedAt ?? info?.ended_at);
+              if (recordingDurationSec != null) durationSec = recordingDurationSec;
               await store.updateCall(call.id, {
                 recording: {
                   ...c2.recording,
@@ -826,6 +821,17 @@ async function endTelephonyCallFromWebhook(call, outcome) {
     // ignore
   }
   logger.info({ callId: call.id, outcome }, "[livekit.webhook] telephony call ended");
+}
+
+/** Convert egress startedAt/endedAt diff to seconds (LiveKit may return seconds or milliseconds). */
+function egressDiffToDurationSec(startedAt, endedAt) {
+  const s = Number(startedAt ?? 0);
+  const e = Number(endedAt ?? 0);
+  if (s <= 0 || e < s) return null;
+  const diff = e - s;
+  if (diff < 7200) return Math.max(0, Math.round(diff));
+  if (diff < 1e12) return Math.max(0, Math.round(diff / 1000));
+  return Math.max(0, Math.round(diff / 1e9));
 }
 
 function getPublicApiBaseUrl(req) {
@@ -1717,13 +1723,8 @@ app.post("/api/internal/calls/:id/end", requireAgentSecret, async (req, res) => 
                   // ignore
                 }
                 let durationSec = c2.durationSec;
-                let recordingDurationSec = null;
-                const startedAt = Number(info?.startedAt ?? info?.started_at ?? 0);
-                const endedAt = Number(info?.endedAt ?? info?.ended_at ?? 0);
-                if (startedAt > 0 && endedAt >= startedAt) {
-                  recordingDurationSec = Math.max(0, Math.round((endedAt - startedAt) / 1000));
-                  durationSec = recordingDurationSec;
-                }
+                const recordingDurationSec = egressDiffToDurationSec(info?.startedAt ?? info?.started_at, info?.endedAt ?? info?.ended_at);
+                if (recordingDurationSec != null) durationSec = recordingDurationSec;
                 await store.updateCall(id, {
                   recording: {
                     ...c2.recording,
@@ -1916,6 +1917,15 @@ app.post("/api/internal/calls/:id/transfer", requireAgentSecret, async (req, res
     const sip = sipClient();
     await sip.transferSipParticipant(roomName, sipParticipant.identity, transferTo, { playDialtone: false });
     logger.info({ callId: id, roomName, identity: sipParticipant.identity, transferTo }, "[internal.transfer] transferred");
+    // End the call record with outcome "transferred" and stop egress so recording length matches (no 20+ sec tail).
+    const callForEnd = await store.getCallById(id);
+    if (callForEnd && !callForEnd.endedAt) {
+      try {
+        await endTelephonyCallFromWebhook(callForEnd, "transferred");
+      } catch (eEnd) {
+        logger.warn({ callId: id, err: String(eEnd?.message || eEnd) }, "[internal.transfer] endTelephonyCallFromWebhook failed");
+      }
+    }
     return res.json({ ok: true, status: "transferred" });
   } catch (e) {
     const code = e?.metadata?.["sip_status_code"] ?? e?.code;
@@ -4282,10 +4292,12 @@ app.get("/api/calls/:id", requireAuth, async (req, res) => {
     startedAtMs: call.startedAt,
     endedAtMs: call.endedAt,
   });
-  // Prefer recording duration when available so UI matches the recording player.
+  // Prefer recording duration when available; reject implausible values (e.g. ms stored as sec).
+  const MAX_REASONABLE_DURATION_SEC = 6 * 60 * 60;
+  const rawRec = call.recording?.durationSec != null ? Number(call.recording.durationSec) : NaN;
   const durationSec =
-    call.recording?.durationSec != null && Number.isFinite(Number(call.recording.durationSec))
-      ? Number(call.recording.durationSec)
+    Number.isFinite(rawRec) && rawRec >= 0 && rawRec <= MAX_REASONABLE_DURATION_SEC
+      ? Math.round(rawRec)
       : norm.durationSec;
   res.json({ call: { ...call, durationSec } });
 });
@@ -5154,13 +5166,8 @@ app.post("/api/calls/:id/end", requireAuth, async (req, res) => {
                   // ignore
                 }
                 let durationSec = c.durationSec;
-                const startedAt = Number(info?.startedAt ?? info?.started_at ?? 0);
-                const endedAt = Number(info?.endedAt ?? info?.ended_at ?? 0);
-                let recordingDurationSec = null;
-                if (startedAt > 0 && endedAt >= startedAt) {
-                  recordingDurationSec = Math.max(0, Math.round((endedAt - startedAt) / 1000));
-                  durationSec = recordingDurationSec;
-                }
+                const recordingDurationSec = egressDiffToDurationSec(info?.startedAt ?? info?.started_at, info?.endedAt ?? info?.ended_at);
+                if (recordingDurationSec != null) durationSec = recordingDurationSec;
                 await store.updateCall(id, {
                   recording: {
                     ...c.recording,
