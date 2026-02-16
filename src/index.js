@@ -1834,27 +1834,57 @@ app.post("/api/internal/calls/:id/transcript", requireAgentSecret, async (req, r
 // LiveKit SIP participant: identity often "sip-<number>"; kind may be 2 (SIP) in ParticipantInfo.
 app.post("/api/internal/calls/:id/transfer", requireAgentSecret, async (req, res) => {
   const { id } = req.params;
+  const bodyTransferTo = typeof req.body?.transferTo === "string" ? req.body.transferTo.trim() : "";
+  logger.info(
+    { callId: id, bodyTransferTo: bodyTransferTo || "(empty)", hasBody: !!req.body },
+    "[internal.transfer] request received"
+  );
+
   const schema = z.object({ transferTo: z.string().min(1).max(80) });
   const parsed = schema.safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: "Validation failed", details: parsed.error.flatten() });
-  if (!USE_DB) return res.status(400).json({ error: "Internal endpoints require Postgres mode" });
+  if (!parsed.success) {
+    logger.warn({ callId: id, validation: parsed.error.flatten() }, "[internal.transfer] validation failed");
+    return res.status(400).json({ error: "Validation failed", details: parsed.error.flatten() });
+  }
+  if (!USE_DB) {
+    logger.warn({ callId: id }, "[internal.transfer] rejected: Postgres mode required");
+    return res.status(400).json({ error: "Internal endpoints require Postgres mode" });
+  }
 
   const call = await store.getCallById(id);
-  if (!call) return res.status(404).json({ error: "Call not found" });
-  if (call.endedAt) return res.status(400).json({ error: "Call already ended" });
-  if (call.to === "webtest") return res.status(400).json({ error: "Transfer not available on web calls" });
+  if (!call) {
+    logger.warn({ callId: id }, "[internal.transfer] call not found");
+    return res.status(404).json({ error: "Call not found" });
+  }
+  if (call.endedAt) {
+    logger.warn({ callId: id, endedAt: call.endedAt }, "[internal.transfer] rejected: call already ended");
+    return res.status(400).json({ error: "Call already ended" });
+  }
+  if (call.to === "webtest") {
+    logger.warn({ callId: id, to: call.to }, "[internal.transfer] rejected: web call");
+    return res.status(400).json({ error: "Transfer not available on web calls" });
+  }
 
   const roomName = call.roomName;
-  if (!roomName) return res.status(400).json({ error: "No room for this call" });
+  if (!roomName) {
+    logger.warn({ callId: id, roomName: roomName }, "[internal.transfer] rejected: no room for call");
+    return res.status(400).json({ error: "No room for this call" });
+  }
 
   let transferTo = parsed.data.transferTo.trim();
   if (!transferTo.startsWith("tel:") && !transferTo.startsWith("sip:")) transferTo = `tel:${transferTo}`;
 
-  logger.info({ callId: id, roomName, transferTo }, "[internal.transfer] transfer attempt");
+  logger.info({ callId: id, roomName, transferTo }, "[internal.transfer] attempt: resolving SIP participant");
 
   try {
     const rs = roomService();
     const participants = await rs.listParticipants(roomName);
+    const participantSummary = participants.map((p) => ({ identity: p.identity, kind: p.kind }));
+    logger.info(
+      { callId: id, roomName, participantCount: participants.length, participants: participantSummary },
+      "[internal.transfer] participants listed"
+    );
+
     // SIP participant: identity usually "sip-..." or kind === 2 (SIP) in some SDKs
     const sipParticipant = participants.find(
       (p) =>
@@ -1862,10 +1892,17 @@ app.post("/api/internal/calls/:id/transfer", requireAgentSecret, async (req, res
         (p.identity && String(p.identity).toLowerCase().startsWith("sip"))
     );
     if (!sipParticipant?.identity) {
-      logger.warn({ callId: id, roomName, participantIdentities: participants.map((p) => p.identity) }, "[internal.transfer] no SIP participant in room");
+      logger.warn(
+        { callId: id, roomName, participantIdentities: participants.map((p) => p.identity), participantSummary },
+        "[internal.transfer] no SIP participant in room"
+      );
       return res.status(400).json({ error: "No SIP participant in room", participantCount: participants.length });
     }
 
+    logger.info(
+      { callId: id, roomName, sipIdentity: sipParticipant.identity, transferTo },
+      "[internal.transfer] calling LiveKit transferSipParticipant"
+    );
     const sip = sipClient();
     await sip.transferSipParticipant(roomName, sipParticipant.identity, transferTo, { playDialtone: false });
     logger.info({ callId: id, roomName, identity: sipParticipant.identity, transferTo }, "[internal.transfer] transferred");
@@ -1873,7 +1910,17 @@ app.post("/api/internal/calls/:id/transfer", requireAgentSecret, async (req, res
   } catch (e) {
     const code = e?.metadata?.["sip_status_code"] ?? e?.code;
     const msg = e?.message || String(e);
-    logger.warn({ callId: id, roomName, transferTo, err: msg, sipCode: code }, "[internal.transfer] transfer failed");
+    const errDetail = {
+      callId: id,
+      roomName,
+      transferTo,
+      err: msg,
+      sipCode: code,
+      errName: e?.name,
+      errStack: e?.stack ? String(e.stack).slice(0, 500) : undefined,
+      metadata: e?.metadata,
+    };
+    logger.warn(errDetail, "[internal.transfer] transfer failed (LiveKit or SIP error)");
     return res.status(500).json({ error: "Transfer failed", message: msg, sipStatusCode: code });
   }
 });
