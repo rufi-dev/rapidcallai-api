@@ -694,10 +694,7 @@ async function endTelephonyCallFromWebhook(call, outcome) {
   const patch = { endedAt, durationSec, outcome, transcript: transcriptToStore };
 
   if (current.agentId && current.workspaceId && transcriptToStore.length > 0) {
-    const transcriptText = transcriptToStore
-      .map((t) => `${t.role === "user" ? "USER" : "AGENT"}: ${String(t.text || "").trim()}`)
-      .filter(Boolean)
-      .join("\n");
+    const transcriptText = transcriptToTextForAnalysis(transcriptToStore);
     const apiKey = String(process.env.OPENAI_API_KEY || "").trim();
     const modelDefault = String(process.env.OPENAI_EVAL_MODEL || process.env.OPENAI_GENERATE_MODEL || "gpt-4.1-mini").trim();
     if (apiKey) {
@@ -1540,17 +1537,7 @@ app.post("/api/internal/calls/:id/end", requireAgentSecret, async (req, res) => 
   const { id } = req.params;
   const schema = z.object({
     outcome: z.string().min(1).max(80).optional(),
-    transcript: z
-      .array(
-        z.object({
-          speaker: z.string().min(1).max(120),
-          role: z.enum(["agent", "user"]),
-          text: z.string().min(1).max(5000),
-          final: z.boolean().optional(),
-          firstReceivedTime: z.number().optional(),
-        })
-      )
-      .optional(),
+    transcript: z.array(TranscriptItemSchema).max(500).optional(),
     analysisStatus: z.string().max(120).optional(),
     postCallExtractionResults: z.array(z.object({
       name: z.string(),
@@ -1586,10 +1573,7 @@ app.post("/api/internal/calls/:id/end", requireAgentSecret, async (req, res) => 
     const apiKey = String(process.env.OPENAI_API_KEY || "").trim();
     if (apiKey) {
       try {
-        const transcriptText = transcriptToStore
-          .map((t) => `${t.role === "user" ? "USER" : "AGENT"}: ${String(t.text || "").trim()}`)
-          .filter(Boolean)
-          .join("\n");
+        const transcriptText = transcriptToTextForAnalysis(transcriptToStore);
         const modelDefault = String(process.env.OPENAI_EVAL_MODEL || process.env.OPENAI_GENERATE_MODEL || "gpt-4.1-mini").trim();
         const presetResult = await runPresetAnalysis({ apiKey, model: modelDefault, transcriptText, outcome: outcomeToStore });
         patch.metrics = { ...(current.metrics && typeof current.metrics === "object" ? current.metrics : {}), preset_analysis: presetResult };
@@ -1617,10 +1601,7 @@ app.post("/api/internal/calls/:id/end", requireAgentSecret, async (req, res) => 
           const model =
             String(agent?.postCallExtractionModel || "").trim() ||
             String(process.env.OPENAI_EVAL_MODEL || process.env.OPENAI_GENERATE_MODEL || "gpt-4.1-mini").trim();
-          const transcriptText = transcriptToStore
-            .map((t) => `${t.role === "user" ? "USER" : "AGENT"}: ${String(t.text || "").trim()}`)
-            .filter(Boolean)
-            .join("\n");
+          const transcriptText = transcriptToTextForAnalysis(transcriptToStore);
           const results = await runPostCallExtraction({
             apiKey,
             model,
@@ -1761,17 +1742,41 @@ app.post("/api/internal/calls/:id/end", requireAgentSecret, async (req, res) => 
   return res.json({ call: updated });
 });
 
+// Transcript item: utterance (speaker/role/text) or tool_invocation / tool_result (Retell-style)
+const TranscriptItemSchema = z.union([
+  z.object({ speaker: z.string().min(1).max(120), role: z.enum(["agent", "user"]), text: z.string().min(1).max(5000) }),
+  z.object({
+    kind: z.literal("tool_invocation"),
+    toolCallId: z.string().min(1).max(80),
+    toolName: z.string().min(1).max(80),
+    input: z.record(z.unknown()),
+  }),
+  z.object({
+    kind: z.literal("tool_result"),
+    toolCallId: z.string().min(1).max(80),
+    toolName: z.string().max(80).optional(),
+    result: z.record(z.unknown()),
+  }),
+]);
+
+/** Build plain text from transcript for LLM analysis (utterances + brief tool lines). */
+function transcriptToTextForAnalysis(transcript) {
+  if (!transcript || !Array.isArray(transcript)) return "";
+  return transcript
+    .map((t) => {
+      if (t.kind === "tool_invocation") return `[Tool invoked: ${t.toolName}]`;
+      if (t.kind === "tool_result") return `[Tool result: ${t.toolName || "?"}]`;
+      return `${t.role === "user" ? "USER" : "AGENT"}: ${String(t.text || "").trim()}`;
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
 // --- Internal: agent pushes transcript during call (so when user hangs up we have it for analysis) ---
 app.post("/api/internal/calls/:id/transcript", requireAgentSecret, async (req, res) => {
   const { id } = req.params;
   const schema = z.object({
-    transcript: z.array(
-      z.object({
-        speaker: z.string().min(1).max(120),
-        role: z.enum(["agent", "user"]),
-        text: z.string().min(1).max(5000),
-      })
-    ).max(500),
+    transcript: z.array(TranscriptItemSchema).max(500),
   });
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "Validation failed", details: parsed.error.flatten() });
@@ -1783,6 +1788,42 @@ app.post("/api/internal/calls/:id/transcript", requireAgentSecret, async (req, r
 
   await store.updateCall(id, { transcript: parsed.data.transcript });
   return res.json({ ok: true });
+});
+
+// --- Internal: agent requests cold transfer (SIP REFER) for a phone call ---
+app.post("/api/internal/calls/:id/transfer", requireAgentSecret, async (req, res) => {
+  const { id } = req.params;
+  const schema = z.object({ transferTo: z.string().min(1).max(80) });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "Validation failed", details: parsed.error.flatten() });
+  if (!USE_DB) return res.status(400).json({ error: "Internal endpoints require Postgres mode" });
+
+  const call = await store.getCallById(id);
+  if (!call) return res.status(404).json({ error: "Call not found" });
+  if (call.endedAt) return res.status(400).json({ error: "Call already ended" });
+  if (call.to === "webtest") return res.status(400).json({ error: "Transfer not available on web calls" });
+
+  const roomName = call.roomName;
+  if (!roomName) return res.status(400).json({ error: "No room for this call" });
+
+  let transferTo = parsed.data.transferTo.trim();
+  if (!transferTo.startsWith("tel:") && !transferTo.startsWith("sip:")) transferTo = `tel:${transferTo}`;
+
+  try {
+    const rs = roomService();
+    const participants = await rs.listParticipants(roomName);
+    const sipParticipant = participants.find((p) => p.identity && String(p.identity).startsWith("sip-"));
+    if (!sipParticipant?.identity) return res.status(400).json({ error: "No SIP participant in room" });
+
+    const sip = sipClient();
+    await sip.transferSipParticipant(roomName, sipParticipant.identity, transferTo, { playDialtone: false });
+    return res.json({ ok: true, status: "transferred" });
+  } catch (e) {
+    const code = e?.metadata?.["sip_status_code"] ?? e?.code;
+    const msg = e?.message || String(e);
+    logger.warn({ callId: id, err: msg, sipCode: code }, "[internal.transfer] transfer failed");
+    return res.status(500).json({ error: "Transfer failed", message: msg, sipStatusCode: code });
+  }
 });
 
 // --- Internal KB search (for the LiveKit agent tools) ---
@@ -4204,11 +4245,7 @@ app.post("/api/calls/:id/auto-evaluate", requireAuth, async (req, res) => {
   const model = String(process.env.OPENAI_EVAL_MODEL || process.env.OPENAI_GENERATE_MODEL || "gpt-4.1-mini").trim();
 
   const agent = await store.getAgent(req.workspace.id, call.agentId);
-  const transcriptText = call.transcript
-    .map((t) => `${t.role === "user" ? "USER" : "AGENT"}: ${String(t.text || "").trim()}`)
-    .filter(Boolean)
-    .join("\n")
-    .slice(0, 9000);
+  const transcriptText = transcriptToTextForAnalysis(call.transcript).slice(0, 9000);
 
   try {
     const raw = await openaiAutoEvaluateCall({
@@ -5089,10 +5126,7 @@ app.post("/api/calls/:id/end", requireAuth, async (req, res) => {
       const apiKey = String(process.env.OPENAI_API_KEY || "").trim();
       if (apiKey) {
         try {
-          const transcriptText = next.transcript
-            .map((t) => `${t.role === "user" ? "USER" : "AGENT"}: ${String(t.text || "").trim()}`)
-            .filter(Boolean)
-            .join("\n");
+          const transcriptText = transcriptToTextForAnalysis(next.transcript);
           const modelDefault = String(process.env.OPENAI_EVAL_MODEL || process.env.OPENAI_GENERATE_MODEL || "gpt-4.1-mini").trim();
           const presetResult = await runPresetAnalysis({ apiKey, model: modelDefault, transcriptText, outcome: outcomeToStore });
           updatePayload.metrics = { ...(current.metrics && typeof current.metrics === "object" ? current.metrics : {}), preset_analysis: presetResult };
@@ -5115,10 +5149,7 @@ app.post("/api/calls/:id/end", requireAuth, async (req, res) => {
               const model =
                 String(agent?.postCallExtractionModel || "").trim() ||
                 String(process.env.OPENAI_EVAL_MODEL || process.env.OPENAI_GENERATE_MODEL || "gpt-4.1-mini").trim();
-              const transcriptText = next.transcript
-                .map((t) => `${t.role === "user" ? "USER" : "AGENT"}: ${String(t.text || "").trim()}`)
-                .filter(Boolean)
-                .join("\n");
+              const transcriptText = transcriptToTextForAnalysis(next.transcript);
               const results = await runPostCallExtraction({
                 apiKey,
                 model,
@@ -5176,11 +5207,7 @@ app.post("/api/calls/:id/end", requireAuth, async (req, res) => {
           if (!agent?.autoEvalEnabled) return;
           const apiKey = String(process.env.OPENAI_API_KEY || "").trim();
           if (!apiKey) return;
-          const transcriptText = (updated.transcript ?? [])
-            .map((t) => `${t.role === "user" ? "USER" : "AGENT"}: ${String(t.text || "").trim()}`)
-            .filter(Boolean)
-            .join("\n")
-            .slice(0, 9000);
+          const transcriptText = transcriptToTextForAnalysis(updated.transcript ?? []).slice(0, 9000);
           if (!transcriptText) return;
           const existing = await store.listCallEvaluations(req.workspace.id, updated.id);
           if (existing.some((e) => e.source === "auto")) return;
