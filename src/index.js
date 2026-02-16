@@ -747,12 +747,13 @@ async function endTelephonyCallFromWebhook(call, outcome) {
   if (c?.recording?.kind === "egress_s3" && c.recording.egressId) {
     const egressId = c.recording.egressId;
     await store.updateCall(call.id, { recording: { ...c.recording, status: "stopping" } });
+    // Stop egress immediately so recording length matches call end (no 20+ sec tail).
+    try {
+      await stopEgress(egressId);
+    } catch (eStop) {
+      logger.warn({ callId: call.id, egressId, err: String(eStop?.message || eStop) }, "[livekit.webhook] stopEgress failed");
+    }
     setTimeout(async () => {
-      try {
-        await stopEgress(egressId);
-      } catch {
-        // ignore
-      }
       const started = Date.now();
       const maxMs = 90_000;
       const intervalMs = 2000;
@@ -1692,13 +1693,12 @@ app.post("/api/internal/calls/:id/end", requireAgentSecret, async (req, res) => 
     if (c?.recording?.kind === "egress_s3" && c.recording.egressId) {
       const egressId = c.recording.egressId;
       await store.updateCall(id, { recording: { ...c.recording, status: "stopping" } });
-
+      try {
+        await stopEgress(egressId);
+      } catch (eStop) {
+        logger.warn({ callId: id, egressId, err: String(eStop?.message || eStop) }, "[internal.calls.end] stopEgress failed");
+      }
       setTimeout(async () => {
-        try {
-          await stopEgress(egressId);
-        } catch {
-          // ignore
-        }
         const started = Date.now();
         const maxMs = 90_000;
         const intervalMs = 2000;
@@ -5066,18 +5066,16 @@ app.post("/api/calls/:id/end", requireAuth, async (req, res) => {
     // ignore
   }
 
-  // Stop egress recording if it is running; finalize status in the background.
+  // Stop egress recording immediately so recording length matches call end; then poll for ready/failed.
   if (next.recording && next.recording.kind === "egress_s3" && next.recording.egressId) {
     const egressId = next.recording.egressId;
     next.recording = { ...next.recording, status: "stopping" };
-
-    // Background poll to update status to ready/failed.
+    try {
+      await stopEgress(egressId);
+    } catch (eStop) {
+      logger.warn({ callId: id, egressId, err: String(eStop?.message || eStop) }, "[calls.end] stopEgress failed");
+    }
     setTimeout(async () => {
-      try {
-        await stopEgress(egressId);
-      } catch {
-        // ignore
-      }
       const started = Date.now();
       const maxMs = 90_000;
       const intervalMs = 2000;
