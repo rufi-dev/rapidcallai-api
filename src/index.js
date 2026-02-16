@@ -329,6 +329,22 @@ app.post("/api/livekit/webhook", express.raw({ type: "application/webhook+json" 
       } else {
         participants[identity] = { ...p, lastSeenAtMs: tsMs };
       }
+      // Phone calls: send call_started only after the call is answered (when SIP participant joins).
+      if (eventName === "participant_joined" && String(identity).startsWith("sip-") && call.to !== "webtest" && !call.endedAt) {
+        const metrics = call.metrics && typeof call.metrics === "object" ? call.metrics : {};
+        if (!metrics.call_started_webhook_sent) {
+          try {
+            await store.updateCall(call.id, { metrics: { ...metrics, call_started_webhook_sent: true }, updatedAt: nowMs });
+            const updated = await store.getCallById(call.id);
+            if (updated?.agentId && updated.workspaceId) {
+              const agent = await store.getAgent(updated.workspaceId, updated.agentId);
+              if (agent?.webhookUrl) sendAgentWebhook(agent, "call_started", updated);
+            }
+          } catch (e) {
+            logger.warn({ callId: call.id, err: String(e?.message || e) }, "[livekit.webhook] call_started failed");
+          }
+        }
+      }
     }
 
     if ((eventName === "participant_left" || eventName === "participant_connection_aborted") && identity) {
@@ -387,8 +403,8 @@ app.post("/api/livekit/webhook", express.raw({ type: "application/webhook+json" 
       }
 
       // End telephony call when room ended (fallback if participant_left didn’t fire or call wasn’t ended yet)
-      if (USE_DB && call.to !== "webtest" && !call.endedAt) {
-        logger.info({ callId: call.id, roomName }, "[livekit.webhook] ending telephony call (room_finished)");
+      if (USE_DB && !call.endedAt) {
+        logger.info({ callId: call.id, roomName, to: call.to }, "[livekit.webhook] ending call (room_finished)");
         endTelephonyCallFromWebhook(call, "user_hangup").catch((e2) => {
           logger.warn({ err: String(e2?.message || e2), callId: call.id, roomName }, "[livekit.webhook] end telephony call on room_finished failed");
         });
@@ -734,7 +750,60 @@ async function endTelephonyCallFromWebhook(call, outcome) {
   if (c?.recording?.kind === "egress_s3" && c.recording.egressId) {
     const egressId = c.recording.egressId;
     await store.updateCall(call.id, { recording: { ...c.recording, status: "stopping" } });
-    setTimeout(async () => { try { await stopEgress(egressId); } catch { /* ignore */ } }, 0);
+    setTimeout(async () => {
+      try {
+        await stopEgress(egressId);
+      } catch {
+        // ignore
+      }
+      const started = Date.now();
+      const maxMs = 90_000;
+      const intervalMs = 2000;
+      while (Date.now() - started < maxMs) {
+        try {
+          const info = await getEgressInfo(egressId);
+          const status = info?.status;
+          if (status === 3) {
+            const c2 = await store.getCallById(call.id);
+            if (c2?.recording?.kind === "egress_s3") {
+              let sizeBytes = c2.recording.sizeBytes ?? null;
+              try {
+                const h = await headObject({ bucket: c2.recording.bucket, key: c2.recording.key });
+                if (typeof h?.ContentLength === "number" && Number.isFinite(h.ContentLength)) sizeBytes = h.ContentLength;
+              } catch {
+                // ignore
+              }
+              let durationSec = c2.durationSec;
+              const startedAt = Number(info?.startedAt ?? info?.started_at ?? 0);
+              const endedAt = Number(info?.endedAt ?? info?.ended_at ?? 0);
+              let recordingDurationSec = null;
+              if (startedAt > 0 && endedAt >= startedAt) {
+                recordingDurationSec = Math.max(0, Math.round((endedAt - startedAt) / 1000));
+                durationSec = recordingDurationSec;
+              }
+              await store.updateCall(call.id, {
+                recording: {
+                  ...c2.recording,
+                  status: "ready",
+                  sizeBytes,
+                  ...(recordingDurationSec != null ? { durationSec: recordingDurationSec } : {}),
+                },
+                ...(durationSec != null ? { durationSec } : {}),
+              });
+            }
+            return;
+          }
+          if (status === 4 || status === 5) {
+            const c2 = await store.getCallById(call.id);
+            if (c2?.recording?.kind === "egress_s3") await store.updateCall(call.id, { recording: { ...c2.recording, status: "failed" } });
+            return;
+          }
+        } catch {
+          // ignore and keep polling
+        }
+        await new Promise((r) => setTimeout(r, intervalMs));
+      }
+    }, 0);
   }
   if (updated.agentId && updated.workspaceId) {
     try {
@@ -1430,13 +1499,7 @@ app.post(
   };
 
   await store.createCall(callRecord);
-  if (agent.webhookUrl) {
-    try {
-      sendAgentWebhook(agent, "call_started", callRecord);
-    } catch (e) {
-      logger.warn({ requestId: req.requestId, err: String(e?.message || e) }, "[internal.telephony.inbound.start] webhook call_started failed");
-    }
-  }
+  // call_started webhook is sent only after the call is answered (when SIP participant joins the room), not on dial.
   console.log("[internal.telephony.inbound.start] call created, agent will join", { callId, roomName: parsed.data.roomName, to, from, agentId: agent.id });
 
   // Start recording (egress) if configured.
@@ -1506,7 +1569,8 @@ app.post("/api/internal/calls/:id/end", requireAgentSecret, async (req, res) => 
   const endedAt = current.endedAt ?? now;
   const durationSec = Math.max(0, Math.round((endedAt - current.startedAt) / 1000));
 
-  const outcomeToStore = parsed.data.outcome ?? (current.outcome === "in_progress" ? "completed" : current.outcome);
+  let outcomeToStore = parsed.data.outcome ?? (current.outcome === "in_progress" ? "agent_hangup" : current.outcome);
+  if (outcomeToStore === "ended" || outcomeToStore === "completed") outcomeToStore = "agent_hangup";
   const transcriptToStore = parsed.data.transcript ? parsed.data.transcript : current.transcript;
   const patch = {
     endedAt,
@@ -4893,7 +4957,8 @@ app.post("/api/calls/:id/end", requireAuth, async (req, res) => {
   const endedAt = current.endedAt ?? now;
   const durationSec = Math.max(0, Math.round((endedAt - current.startedAt) / 1000));
 
-  const outcomeToStore = parsed.data.outcome ?? (current.outcome === "in_progress" ? "completed" : current.outcome);
+  let outcomeToStore = parsed.data.outcome ?? (current.outcome === "in_progress" ? "agent_hangup" : current.outcome);
+  if (outcomeToStore === "ended" || outcomeToStore === "completed") outcomeToStore = "agent_hangup";
   const next = {
     ...current,
     endedAt,

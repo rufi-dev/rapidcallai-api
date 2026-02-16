@@ -325,13 +325,7 @@ async function createCallRecord({ workspaceId, job, callId, roomName, agent }) {
     updatedAt: now,
   };
   await store.createCall(callRecord);
-  if (agent.webhookUrl) {
-    try {
-      sendAgentWebhook(agent, "call_started", callRecord);
-    } catch (e) {
-      // non-fatal
-    }
-  }
+  // call_started webhook is sent only after the call is answered (when SIP participant joins the room), not on dial.
 }
 
 async function handleJob(workspace, job) {
