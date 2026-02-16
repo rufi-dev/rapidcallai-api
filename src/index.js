@@ -1831,6 +1831,7 @@ app.post("/api/internal/calls/:id/transcript", requireAgentSecret, async (req, r
 });
 
 // --- Internal: agent requests cold transfer (SIP REFER) for a phone call ---
+// LiveKit SIP participant: identity often "sip-<number>"; kind may be 2 (SIP) in ParticipantInfo.
 app.post("/api/internal/calls/:id/transfer", requireAgentSecret, async (req, res) => {
   const { id } = req.params;
   const schema = z.object({ transferTo: z.string().min(1).max(80) });
@@ -1849,19 +1850,30 @@ app.post("/api/internal/calls/:id/transfer", requireAgentSecret, async (req, res
   let transferTo = parsed.data.transferTo.trim();
   if (!transferTo.startsWith("tel:") && !transferTo.startsWith("sip:")) transferTo = `tel:${transferTo}`;
 
+  logger.info({ callId: id, roomName, transferTo }, "[internal.transfer] transfer attempt");
+
   try {
     const rs = roomService();
     const participants = await rs.listParticipants(roomName);
-    const sipParticipant = participants.find((p) => p.identity && String(p.identity).startsWith("sip-"));
-    if (!sipParticipant?.identity) return res.status(400).json({ error: "No SIP participant in room" });
+    // SIP participant: identity usually "sip-..." or kind === 2 (SIP) in some SDKs
+    const sipParticipant = participants.find(
+      (p) =>
+        (p.kind === 2 || (typeof p.kind === "string" && String(p.kind).toUpperCase() === "SIP")) ||
+        (p.identity && String(p.identity).toLowerCase().startsWith("sip"))
+    );
+    if (!sipParticipant?.identity) {
+      logger.warn({ callId: id, roomName, participantIdentities: participants.map((p) => p.identity) }, "[internal.transfer] no SIP participant in room");
+      return res.status(400).json({ error: "No SIP participant in room", participantCount: participants.length });
+    }
 
     const sip = sipClient();
     await sip.transferSipParticipant(roomName, sipParticipant.identity, transferTo, { playDialtone: false });
+    logger.info({ callId: id, roomName, identity: sipParticipant.identity, transferTo }, "[internal.transfer] transferred");
     return res.json({ ok: true, status: "transferred" });
   } catch (e) {
     const code = e?.metadata?.["sip_status_code"] ?? e?.code;
     const msg = e?.message || String(e);
-    logger.warn({ callId: id, err: msg, sipCode: code }, "[internal.transfer] transfer failed");
+    logger.warn({ callId: id, roomName, transferTo, err: msg, sipCode: code }, "[internal.transfer] transfer failed");
     return res.status(500).json({ error: "Transfer failed", message: msg, sipStatusCode: code });
   }
 });
