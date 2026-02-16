@@ -1673,6 +1673,30 @@ app.post("/api/internal/calls/:id/end", requireAgentSecret, async (req, res) => 
   return res.json({ call: updated });
 });
 
+// --- Internal: agent pushes transcript during call (so when user hangs up we have it for analysis) ---
+app.post("/api/internal/calls/:id/transcript", requireAgentSecret, async (req, res) => {
+  const { id } = req.params;
+  const schema = z.object({
+    transcript: z.array(
+      z.object({
+        speaker: z.string().min(1).max(120),
+        role: z.enum(["agent", "user"]),
+        text: z.string().min(1).max(5000),
+      })
+    ).max(500),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "Validation failed", details: parsed.error.flatten() });
+  if (!USE_DB) return res.status(400).json({ error: "Internal endpoints require Postgres mode" });
+
+  const current = await store.getCallById(id);
+  if (!current) return res.status(404).json({ error: "Call not found" });
+  if (current.endedAt) return res.status(400).json({ error: "Call already ended" });
+
+  await store.updateCall(id, { transcript: parsed.data.transcript });
+  return res.json({ ok: true });
+});
+
 // --- Internal KB search (for the LiveKit agent tools) ---
 app.post("/api/internal/kb/search", requireAgentSecret, async (req, res) => {
   const schema = z.object({

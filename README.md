@@ -206,6 +206,23 @@ curl -s -o /dev/null -w "%{http_code}" -X POST "https://api.rapidcall.ai/api/int
 - It must register with the **same name** as in your LiveKit dispatch rule (e.g. `LIVEKIT_AGENT_NAME=VoiceAgent` if the rule's "Agents" is `VoiceAgent`).
 - When the agent is dispatched you should see in **agent logs**: `Job received for room call-...`. If you never see that when you call, LiveKit is not dispatching the agent (see dispatch rule checklist below).
 
+**Phone call stuck "in progress" or outcome "stale_timeout" / no transcript or recording**
+
+If a **phone** call shows outcome `in_progress` or `stale_timeout` after the user (or agent) hung up, or you get no transcript/recording/analysis:
+
+1. **LiveKit webhook**  
+   In LiveKit Cloud → your project → **Webhooks** (or Settings), set the webhook URL to your API:  
+   `https://api.rapidcall.ai/api/livekit/webhook`  
+   The API uses this to detect when the SIP participant leaves (user hung up) and when the room ends, so it can close the call with outcome `user_hangup` and send `call_ended` / `call_analyzed`. Without the webhook, calls are never closed and after 15 minutes become `stale_timeout`.
+
+2. **Recording**  
+   Outbound phone calls start egress (recording to S3) when the call is answered, if `EGRESS_S3_BUCKET`, `EGRESS_S3_REGION`, and credentials are set. Inbound calls already start egress when the call is created.
+
+3. **Transcript and call analysis**  
+   The voice agent must send the transcript when it ends the call (`POST /api/internal/calls/:id/end` with `transcript`). The Python agent does this when it uses the end_call tool (it collects conversation items and posts them). So for transcript and analysis: have the agent say goodbye and use end_call; then the server receives the transcript, runs post-call extraction, and sends `call_analyzed`. If the **user** hangs up before the agent ends, the server closes the call but has no transcript unless the agent had sent it earlier.
+
+See **API_REFERENCE.md** → "Call outcomes and phone call data" for outcome meanings and data flow.
+
 **Dispatch rule checklist (agent never joins)**
 
 In **LiveKit Cloud** → your project → **Telephony** → **Dispatch rules** ([docs](https://docs.livekit.io/telephony/accepting-calls/dispatch-rule/)):

@@ -13,6 +13,7 @@ const { substituteDynamicVariables } = require("./promptSubstitute");
 const { roomService, agentDispatchService, sipClient, addNumberToOutboundTrunk, createOutboundTrunkForWorkspace, ensureOutboundTrunkUsesTls, ensureOutboundTrunkTransport, ensureOutboundTrunkAddress, isTrunkNotFoundError } = require("./livekit");
 const tw = require("./twilio");
 const { sendAgentWebhook } = require("./webhooks");
+const { startCallEgress } = require("./egress");
 
 const USE_DB = Boolean(process.env.DATABASE_URL);
 const WORKER_ID = `outbound-worker-${nanoid(6)}`;
@@ -494,6 +495,25 @@ async function handleJob(workspace, job) {
       message: "Call answered",
       meta: { sipParticipantId: sipParticipant?.sipParticipantId },
     });
+
+    // Start recording (egress to S3) for outbound so transcript/recording are available after the call
+    try {
+      const e = await startCallEgress({ roomName, callId });
+      if (e && e.enabled) {
+        const recording = {
+          kind: "egress_s3",
+          egressId: e.egressId,
+          bucket: e.bucket,
+          key: e.key,
+          status: "recording",
+          url: `/api/calls/${encodeURIComponent(callId)}/recording`,
+        };
+        await store.updateCall(callId, { recording });
+        logger.info({ jobId: job.id, callId }, "[outbound] egress started");
+      }
+    } catch (eEgress) {
+      logger.warn({ err: String(eEgress?.message || eEgress), jobId: job.id }, "[outbound] egress start failed");
+    }
 
   } catch (e) {
     const errMsg = String(e?.message || e);
