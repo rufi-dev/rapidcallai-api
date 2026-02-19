@@ -3218,16 +3218,100 @@ app.post("/api/phone-numbers", requireAuth, async (req, res) => {
     }
 
     try {
-      const phoneNumber = await store.createPhoneNumber({
+      let e164 = String(parsed.data.e164).trim();
+      if (!e164.startsWith("+")) e164 = `+${e164}`;
+
+      let phoneNumber = await store.createPhoneNumber({
         workspaceId,
-        e164: parsed.data.e164,
+        e164,
         label: parsed.data.label ?? "",
         provider: parsed.data.provider ?? "twilio",
         status: "unconfigured",
         allowedInboundCountries: ["all"],
         allowedOutboundCountries: ["all"],
       });
-      return res.status(201).json({ phoneNumber });
+
+      // Auto-add to LiveKit inbound and outbound trunks (no Twilio changes).
+      const ws = req.workspace;
+      const inboundTrunkIdEnv = String(process.env.SIP_INBOUND_TRUNK_ID || "").trim();
+      const outboundTrunkIdEnv = String(process.env.SIP_OUTBOUND_TRUNK_ID || "").trim();
+      let effectiveInboundTrunkId = ws.livekitInboundTrunkId || inboundTrunkIdEnv || null;
+      let effectiveOutboundTrunkId = ws.livekitOutboundTrunkId || outboundTrunkIdEnv || null;
+      const provisionErrors = [];
+
+      if (!effectiveInboundTrunkId) {
+        try {
+          const inboundResult = await createInboundTrunkForWorkspace({
+            workspaceId,
+            numbers: [e164],
+          });
+          effectiveInboundTrunkId = inboundResult.trunkId;
+          await store.updateWorkspace(ws.id, { livekitInboundTrunkId: effectiveInboundTrunkId });
+        } catch (e) {
+          const existingTrunkId = parseConflictingInboundTrunkId(e);
+          if (existingTrunkId) {
+            effectiveInboundTrunkId = existingTrunkId;
+            await store.updateWorkspace(ws.id, { livekitInboundTrunkId: effectiveInboundTrunkId });
+            try {
+              await addNumberToInboundTrunk(effectiveInboundTrunkId, e164);
+            } catch (addErr) {
+              provisionErrors.push(`Inbound add: ${addErr?.message || addErr}`);
+            }
+          } else {
+            provisionErrors.push(`Inbound trunk: ${e?.message || e}`);
+          }
+        }
+      } else {
+        try {
+          await addNumberToInboundTrunk(effectiveInboundTrunkId, e164);
+        } catch (e) {
+          const msg = String(e?.message ?? e?.error ?? e ?? "").toLowerCase();
+          const isTrunkMissing = isTrunkNotFoundError(e) || e?.code === "TRUNK_NOT_FOUND" || msg.includes("object cannot be found") || (msg.includes("twirp") && msg.includes("not found"));
+          if (isTrunkMissing) {
+            try {
+              const inboundResult = await createInboundTrunkForWorkspace({ workspaceId, numbers: [e164] });
+              effectiveInboundTrunkId = inboundResult.trunkId;
+              await store.updateWorkspace(ws.id, { livekitInboundTrunkId: effectiveInboundTrunkId });
+            } catch (createErr) {
+              const existingTrunkId = parseConflictingInboundTrunkId(createErr);
+              if (existingTrunkId) {
+                effectiveInboundTrunkId = existingTrunkId;
+                await store.updateWorkspace(ws.id, { livekitInboundTrunkId: effectiveInboundTrunkId });
+              } else {
+                provisionErrors.push(`Inbound trunk: ${createErr?.message || createErr}`);
+              }
+            }
+          } else {
+            provisionErrors.push(`Inbound trunk: ${msg}`);
+          }
+        }
+      }
+
+      if (effectiveOutboundTrunkId) {
+        try {
+          await addNumberToOutboundTrunk(effectiveOutboundTrunkId, e164);
+        } catch (e) {
+          provisionErrors.push(`Outbound trunk: ${e?.message || e}`);
+        }
+      } else {
+        provisionErrors.push("Outbound trunk: no workspace or env outbound trunk configured");
+      }
+
+      const newStatus = provisionErrors.length === 0 ? "active" : "partial";
+      phoneNumber = await store.updatePhoneNumber(phoneNumber.id, {
+        status: newStatus,
+        livekitInboundTrunkId: effectiveInboundTrunkId || null,
+        livekitOutboundTrunkId: effectiveOutboundTrunkId || null,
+      });
+
+      if (provisionErrors.length > 0) {
+        logger.warn({ phoneNumberId: phoneNumber.id, e164, provisionErrors }, "[phone-numbers] auto-add to LiveKit trunks had errors");
+      }
+
+      return res.status(201).json({
+        phoneNumber,
+        provisionErrors: provisionErrors.length > 0 ? provisionErrors : undefined,
+      });
     } catch (e) {
       const msg = e instanceof Error ? e.message : "Create phone number failed";
       return res.status(400).json({ error: msg });
@@ -3253,144 +3337,6 @@ app.post("/api/phone-numbers", requireAuth, async (req, res) => {
   };
   writePhoneNumbers([phoneNumber, ...rows]);
   return res.status(201).json({ phoneNumber });
-});
-
-app.post("/api/phone-numbers/import", requireAuth, async (req, res) => {
-  if (!USE_DB) return res.status(400).json({ error: "Import via SIP requires Postgres mode" });
-
-  const schema = z.object({
-    e164: z.string().min(3).max(32),
-    terminationUri: z.string().min(1).max(512),
-    sipTrunkUsername: z.string().max(256).optional(),
-    sipTrunkPassword: z.string().max(256).optional(),
-    nickname: z.string().max(120).optional(),
-    outboundTransport: z.enum(["tcp", "udp", "tls"]).optional(),
-  });
-  const parsed = schema.safeParse(req.body);
-  if (!parsed.success) {
-    return res.status(400).json({ error: "Validation failed", details: parsed.error.flatten() });
-  }
-
-  let e164 = String(parsed.data.e164).trim();
-  if (!e164.startsWith("+")) e164 = `+${e164}`;
-
-  const workspaceId = req.workspace.id;
-  const ws = req.workspace;
-
-  try {
-    assertCanBuyNumber(ws, getBillingConfig());
-  } catch (e) {
-    return res.status(Number(e?.status || 402)).json({ error: e?.message || "Billing gating" });
-  }
-
-  const existing = await store.getPhoneNumberByE164(e164);
-  if (existing && existing.workspaceId === workspaceId) {
-    return res.status(400).json({ error: "This number is already added to your workspace" });
-  }
-
-  const terminationUri = String(parsed.data.terminationUri).trim();
-  const sipTrunkUsername = parsed.data.sipTrunkUsername ? String(parsed.data.sipTrunkUsername).trim() : null;
-  const sipTrunkPassword = parsed.data.sipTrunkPassword ? String(parsed.data.sipTrunkPassword).trim() : null;
-  const nickname = parsed.data.nickname ? String(parsed.data.nickname).trim() : "";
-  const outboundTransport = parsed.data.outboundTransport || "tcp";
-
-  let phoneNumber = await store.createPhoneNumber({
-    workspaceId,
-    e164,
-    label: nickname,
-    provider: "sip",
-    status: "unconfigured",
-    twilioNumberSid: null,
-    livekitInboundTrunkId: null,
-    livekitOutboundTrunkId: null,
-    livekitSipUsername: sipTrunkUsername,
-    livekitSipPassword: sipTrunkPassword,
-    sipTerminationUri: terminationUri,
-    sipOutboundTransport: outboundTransport,
-    allowedInboundCountries: ["all"],
-    allowedOutboundCountries: ["all"],
-  });
-
-  const provisionErrors = [];
-  const inboundTrunkIdEnv = String(process.env.SIP_INBOUND_TRUNK_ID || "").trim();
-  let effectiveInboundTrunkId = ws.livekitInboundTrunkId || inboundTrunkIdEnv || null;
-
-  if (!effectiveInboundTrunkId) {
-    try {
-      const inboundResult = await createInboundTrunkForWorkspace({
-        workspaceId,
-        numbers: [e164],
-      });
-      effectiveInboundTrunkId = inboundResult.trunkId;
-      await store.updateWorkspace(ws.id, { livekitInboundTrunkId: effectiveInboundTrunkId });
-    } catch (e) {
-      const existingTrunkId = parseConflictingInboundTrunkId(e);
-      if (existingTrunkId) {
-        effectiveInboundTrunkId = existingTrunkId;
-        await store.updateWorkspace(ws.id, { livekitInboundTrunkId: effectiveInboundTrunkId });
-        try {
-          await addNumberToInboundTrunk(effectiveInboundTrunkId, e164);
-        } catch (addErr) {
-          provisionErrors.push(`Inbound add number: ${addErr?.message || addErr}`);
-        }
-      } else {
-        provisionErrors.push(`Inbound trunk: ${e?.message || e}`);
-      }
-    }
-  } else {
-    try {
-      await addNumberToInboundTrunk(effectiveInboundTrunkId, e164);
-    } catch (e) {
-      if (isTrunkNotFoundError(e) || e?.code === "TRUNK_NOT_FOUND") {
-        try {
-          const inboundResult = await createInboundTrunkForWorkspace({ workspaceId, numbers: [e164] });
-          effectiveInboundTrunkId = inboundResult.trunkId;
-          await store.updateWorkspace(ws.id, { livekitInboundTrunkId: effectiveInboundTrunkId });
-        } catch (createErr) {
-          const existingTrunkId = parseConflictingInboundTrunkId(createErr);
-          if (existingTrunkId) {
-            effectiveInboundTrunkId = existingTrunkId;
-            await store.updateWorkspace(ws.id, { livekitInboundTrunkId: effectiveInboundTrunkId });
-          } else {
-            provisionErrors.push(`Inbound trunk: ${createErr?.message || createErr}`);
-          }
-        }
-      } else {
-        provisionErrors.push(`Inbound add: ${e?.message || e}`);
-      }
-    }
-  }
-
-  let outboundTrunkId = null;
-  try {
-    const outboundResult = await createOutboundTrunkForSipImport({
-      name: `Imported ${e164}`,
-      address: terminationUri,
-      numbers: [e164],
-      authUsername: sipTrunkUsername || undefined,
-      authPassword: sipTrunkPassword || undefined,
-      transport: outboundTransport,
-    });
-    outboundTrunkId = outboundResult.trunkId;
-  } catch (e) {
-    provisionErrors.push(`Outbound trunk: ${e?.message || e}`);
-  }
-
-  const status = provisionErrors.length === 0 ? "active" : "partial";
-  phoneNumber = await store.updatePhoneNumber(phoneNumber.id, {
-    livekitInboundTrunkId: effectiveInboundTrunkId,
-    livekitOutboundTrunkId: outboundTrunkId,
-    status,
-  });
-
-  if (provisionErrors.length > 0) {
-    logger.warn({ phoneNumberId: phoneNumber.id, e164, provisionErrors }, "[phone-numbers/import] provisioned with errors");
-  }
-
-  return res.status(201).json({
-    phoneNumber,
-    provisionErrors: provisionErrors.length > 0 ? provisionErrors : undefined,
-  });
 });
 
 app.get("/api/phone-numbers/:id", requireAuth, async (req, res) => {
