@@ -159,6 +159,8 @@ function rowToPhoneNumber(r) {
     livekitOutboundTrunkId: r.livekit_outbound_trunk_id ?? null,
     livekitSipUsername: r.livekit_sip_username ?? null,
     livekitSipPassword: r.livekit_sip_password ?? null,
+    sipTerminationUri: r.sip_termination_uri ?? null,
+    sipOutboundTransport: r.sip_outbound_transport ?? null,
     inboundAgentId: r.inbound_agent_id ?? null,
     outboundAgentId: r.outbound_agent_id ?? null,
     allowedInboundCountries: r.allowed_inbound_countries ?? ["all"],
@@ -493,11 +495,11 @@ async function createPhoneNumber(input) {
     `
     INSERT INTO phone_numbers
       (id, workspace_id, e164, label, provider, status, twilio_number_sid, livekit_inbound_trunk_id, livekit_outbound_trunk_id,
-       livekit_sip_username, livekit_sip_password,
+       livekit_sip_username, livekit_sip_password, sip_termination_uri, sip_outbound_transport,
        inbound_agent_id, outbound_agent_id,
        allowed_inbound_countries, allowed_outbound_countries, created_at, updated_at)
     VALUES
-      ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+      ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
     RETURNING *
   `,
     [
@@ -512,6 +514,8 @@ async function createPhoneNumber(input) {
       input.livekitOutboundTrunkId ?? null,
       input.livekitSipUsername ?? null,
       input.livekitSipPassword ?? null,
+      input.sipTerminationUri ?? null,
+      input.sipOutboundTransport ?? null,
       input.inboundAgentId ?? null,
       input.outboundAgentId ?? null,
       JSON.stringify(allowedIn),
@@ -544,11 +548,13 @@ async function updatePhoneNumber(id, patch) {
         livekit_outbound_trunk_id=$6,
         livekit_sip_username=$7,
         livekit_sip_password=$8,
-        inbound_agent_id=$9,
-        outbound_agent_id=$10,
-        allowed_inbound_countries=$11,
-        allowed_outbound_countries=$12,
-        updated_at=$13
+        sip_termination_uri=$9,
+        sip_outbound_transport=$10,
+        inbound_agent_id=$11,
+        outbound_agent_id=$12,
+        allowed_inbound_countries=$13,
+        allowed_outbound_countries=$14,
+        updated_at=$15
     WHERE id=$1
     RETURNING *
   `,
@@ -561,6 +567,8 @@ async function updatePhoneNumber(id, patch) {
       next.livekitOutboundTrunkId ?? null,
       next.livekitSipUsername ?? null,
       next.livekitSipPassword ?? null,
+      next.sipTerminationUri ?? null,
+      next.sipOutboundTransport ?? null,
       next.inboundAgentId ?? null,
       next.outboundAgentId ?? null,
       JSON.stringify(allowedIn),

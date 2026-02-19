@@ -373,6 +373,31 @@ async function createOutboundTrunkForWorkspace({ workspaceId, twilioSipDomainNam
   return { trunkId: trunk.sipTrunkId };
 }
 
+/**
+ * Create a LiveKit SIP outbound trunk for an imported number (user's SIP carrier).
+ * address = termination URI (host:port or domain) where we send outbound SIP.
+ * transport: 'tcp' | 'udp' | 'tls' (default 'tcp').
+ */
+async function createOutboundTrunkForSipImport({ name, address, numbers, authUsername, authPassword, transport }) {
+  const sip = sipClient();
+  const transportLower = String(transport || "tcp").toLowerCase();
+  const transportMap = { udp: 1, tcp: 2, tls: 3 };
+  const transportEnum = transportMap[transportLower] ?? 2;
+
+  const trunk = await sip.createSipOutboundTrunk(
+    name || "Imported SIP",
+    address,
+    numbers || [],
+    {
+      authUsername: authUsername || undefined,
+      authPassword: authPassword || undefined,
+      transport: transportEnum,
+    }
+  );
+  console.log(`[createOutboundTrunkForSipImport] Created trunk ${trunk.sipTrunkId} for ${address} transport=${transportLower}`);
+  return { trunkId: trunk.sipTrunkId };
+}
+
 module.exports = {
   roomService,
   agentDispatchService,
@@ -384,6 +409,7 @@ module.exports = {
   removeNumberFromOutboundTrunk,
   createInboundTrunkForWorkspace,
   createOutboundTrunkForWorkspace,
+  createOutboundTrunkForSipImport,
   ensureOutboundTrunkUsesTls,
   ensureOutboundTrunkTransport,
   ensureOutboundTrunkAddress,

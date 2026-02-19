@@ -39,7 +39,7 @@ const {
 } = require("./storage");
 const { getPool, initSchema } = require("./db");
 const store = require("./store_pg");
-const { roomService, agentDispatchService, createParticipantToken, sipClient, addNumberToInboundTrunk, addNumberToOutboundTrunk, removeNumberFromInboundTrunk, removeNumberFromOutboundTrunk, createInboundTrunkForWorkspace, createOutboundTrunkForWorkspace, ensureOutboundTrunkUsesTls, ensureOutboundTrunkTransport, ensureOutboundTrunkAddress, deleteOutboundTrunk, getOutboundTrunkInfo, isTrunkNotFoundError, parseConflictingInboundTrunkId } = require("./livekit");
+const { roomService, agentDispatchService, createParticipantToken, sipClient, addNumberToInboundTrunk, addNumberToOutboundTrunk, removeNumberFromInboundTrunk, removeNumberFromOutboundTrunk, createInboundTrunkForWorkspace, createOutboundTrunkForWorkspace, createOutboundTrunkForSipImport, ensureOutboundTrunkUsesTls, ensureOutboundTrunkTransport, ensureOutboundTrunkAddress, deleteOutboundTrunk, getOutboundTrunkInfo, isTrunkNotFoundError, parseConflictingInboundTrunkId } = require("./livekit");
 const outboundWorker = require("./outbound_worker");
 const { substituteDynamicVariables } = require("./promptSubstitute");
 const { startCallEgress, stopEgress, getEgressInfo } = require("./egress");
@@ -3255,6 +3255,144 @@ app.post("/api/phone-numbers", requireAuth, async (req, res) => {
   return res.status(201).json({ phoneNumber });
 });
 
+app.post("/api/phone-numbers/import", requireAuth, async (req, res) => {
+  if (!USE_DB) return res.status(400).json({ error: "Import via SIP requires Postgres mode" });
+
+  const schema = z.object({
+    e164: z.string().min(3).max(32),
+    terminationUri: z.string().min(1).max(512),
+    sipTrunkUsername: z.string().max(256).optional(),
+    sipTrunkPassword: z.string().max(256).optional(),
+    nickname: z.string().max(120).optional(),
+    outboundTransport: z.enum(["tcp", "udp", "tls"]).optional(),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: "Validation failed", details: parsed.error.flatten() });
+  }
+
+  let e164 = String(parsed.data.e164).trim();
+  if (!e164.startsWith("+")) e164 = `+${e164}`;
+
+  const workspaceId = req.workspace.id;
+  const ws = req.workspace;
+
+  try {
+    assertCanBuyNumber(ws, getBillingConfig());
+  } catch (e) {
+    return res.status(Number(e?.status || 402)).json({ error: e?.message || "Billing gating" });
+  }
+
+  const existing = await store.getPhoneNumberByE164(e164);
+  if (existing && existing.workspaceId === workspaceId) {
+    return res.status(400).json({ error: "This number is already added to your workspace" });
+  }
+
+  const terminationUri = String(parsed.data.terminationUri).trim();
+  const sipTrunkUsername = parsed.data.sipTrunkUsername ? String(parsed.data.sipTrunkUsername).trim() : null;
+  const sipTrunkPassword = parsed.data.sipTrunkPassword ? String(parsed.data.sipTrunkPassword).trim() : null;
+  const nickname = parsed.data.nickname ? String(parsed.data.nickname).trim() : "";
+  const outboundTransport = parsed.data.outboundTransport || "tcp";
+
+  let phoneNumber = await store.createPhoneNumber({
+    workspaceId,
+    e164,
+    label: nickname,
+    provider: "sip",
+    status: "unconfigured",
+    twilioNumberSid: null,
+    livekitInboundTrunkId: null,
+    livekitOutboundTrunkId: null,
+    livekitSipUsername: sipTrunkUsername,
+    livekitSipPassword: sipTrunkPassword,
+    sipTerminationUri: terminationUri,
+    sipOutboundTransport: outboundTransport,
+    allowedInboundCountries: ["all"],
+    allowedOutboundCountries: ["all"],
+  });
+
+  const provisionErrors = [];
+  const inboundTrunkIdEnv = String(process.env.SIP_INBOUND_TRUNK_ID || "").trim();
+  let effectiveInboundTrunkId = ws.livekitInboundTrunkId || inboundTrunkIdEnv || null;
+
+  if (!effectiveInboundTrunkId) {
+    try {
+      const inboundResult = await createInboundTrunkForWorkspace({
+        workspaceId,
+        numbers: [e164],
+      });
+      effectiveInboundTrunkId = inboundResult.trunkId;
+      await store.updateWorkspace(ws.id, { livekitInboundTrunkId: effectiveInboundTrunkId });
+    } catch (e) {
+      const existingTrunkId = parseConflictingInboundTrunkId(e);
+      if (existingTrunkId) {
+        effectiveInboundTrunkId = existingTrunkId;
+        await store.updateWorkspace(ws.id, { livekitInboundTrunkId: effectiveInboundTrunkId });
+        try {
+          await addNumberToInboundTrunk(effectiveInboundTrunkId, e164);
+        } catch (addErr) {
+          provisionErrors.push(`Inbound add number: ${addErr?.message || addErr}`);
+        }
+      } else {
+        provisionErrors.push(`Inbound trunk: ${e?.message || e}`);
+      }
+    }
+  } else {
+    try {
+      await addNumberToInboundTrunk(effectiveInboundTrunkId, e164);
+    } catch (e) {
+      if (isTrunkNotFoundError(e) || e?.code === "TRUNK_NOT_FOUND") {
+        try {
+          const inboundResult = await createInboundTrunkForWorkspace({ workspaceId, numbers: [e164] });
+          effectiveInboundTrunkId = inboundResult.trunkId;
+          await store.updateWorkspace(ws.id, { livekitInboundTrunkId: effectiveInboundTrunkId });
+        } catch (createErr) {
+          const existingTrunkId = parseConflictingInboundTrunkId(createErr);
+          if (existingTrunkId) {
+            effectiveInboundTrunkId = existingTrunkId;
+            await store.updateWorkspace(ws.id, { livekitInboundTrunkId: effectiveInboundTrunkId });
+          } else {
+            provisionErrors.push(`Inbound trunk: ${createErr?.message || createErr}`);
+          }
+        }
+      } else {
+        provisionErrors.push(`Inbound add: ${e?.message || e}`);
+      }
+    }
+  }
+
+  let outboundTrunkId = null;
+  try {
+    const outboundResult = await createOutboundTrunkForSipImport({
+      name: `Imported ${e164}`,
+      address: terminationUri,
+      numbers: [e164],
+      authUsername: sipTrunkUsername || undefined,
+      authPassword: sipTrunkPassword || undefined,
+      transport: outboundTransport,
+    });
+    outboundTrunkId = outboundResult.trunkId;
+  } catch (e) {
+    provisionErrors.push(`Outbound trunk: ${e?.message || e}`);
+  }
+
+  const status = provisionErrors.length === 0 ? "active" : "partial";
+  phoneNumber = await store.updatePhoneNumber(phoneNumber.id, {
+    livekitInboundTrunkId: effectiveInboundTrunkId,
+    livekitOutboundTrunkId: outboundTrunkId,
+    status,
+  });
+
+  if (provisionErrors.length > 0) {
+    logger.warn({ phoneNumberId: phoneNumber.id, e164, provisionErrors }, "[phone-numbers/import] provisioned with errors");
+  }
+
+  return res.status(201).json({
+    phoneNumber,
+    provisionErrors: provisionErrors.length > 0 ? provisionErrors : undefined,
+  });
+});
+
 app.get("/api/phone-numbers/:id", requireAuth, async (req, res) => {
   const id = String(req.params.id);
   if (USE_DB) {
@@ -3279,6 +3417,8 @@ app.put("/api/phone-numbers/:id", requireAuth, async (req, res) => {
     livekitOutboundTrunkId: z.string().min(1).nullable().optional(),
     livekitSipUsername: z.string().min(1).nullable().optional(),
     livekitSipPassword: z.string().min(1).nullable().optional(),
+    sipTerminationUri: z.string().max(512).nullable().optional(),
+    sipOutboundTransport: z.enum(["tcp", "udp", "tls"]).nullable().optional(),
     allowedInboundCountries: z.union([z.array(z.string()), z.string()]).optional(),
     allowedOutboundCountries: z.union([z.array(z.string()), z.string()]).optional(),
   });
@@ -3297,6 +3437,8 @@ app.put("/api/phone-numbers/:id", requireAuth, async (req, res) => {
     livekitOutboundTrunkId: parsed.data.livekitOutboundTrunkId,
     livekitSipUsername: parsed.data.livekitSipUsername,
     livekitSipPassword: parsed.data.livekitSipPassword,
+    sipTerminationUri: parsed.data.sipTerminationUri,
+    sipOutboundTransport: parsed.data.sipOutboundTransport,
     allowedInboundCountries:
       parsed.data.allowedInboundCountries === undefined ? undefined : normalizeCountries(parsed.data.allowedInboundCountries),
     allowedOutboundCountries:
@@ -3339,8 +3481,14 @@ app.delete("/api/phone-numbers/:id", requireAuth, async (req, res) => {
       }
     }
     if (outTrunk && e164) {
-      try { await removeNumberFromOutboundTrunk(outTrunk, e164); } catch (e) {
-        logger.warn({ e164, err: String(e?.message || e) }, "[delete-number] failed to remove from outbound trunk");
+      if (existing.provider === "sip") {
+        try { await deleteOutboundTrunk(outTrunk); } catch (e) {
+          logger.warn({ e164, err: String(e?.message || e) }, "[delete-number] failed to delete SIP outbound trunk");
+        }
+      } else {
+        try { await removeNumberFromOutboundTrunk(outTrunk, e164); } catch (e) {
+          logger.warn({ e164, err: String(e?.message || e) }, "[delete-number] failed to remove from outbound trunk");
+        }
       }
     }
 
