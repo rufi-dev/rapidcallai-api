@@ -1917,7 +1917,10 @@ app.post("/api/internal/calls/:id/transfer", requireAgentSecret, async (req, res
     );
     const sip = sipClient();
     await sip.transferSipParticipant(roomName, sipParticipant.identity, transferTo, { playDialtone: false });
-    logger.info({ callId: id, roomName, identity: sipParticipant.identity, transferTo }, "[internal.transfer] transferred");
+    logger.info(
+      { callId: id, roomName, identity: sipParticipant.identity, transferTo },
+      "[internal.transfer] success: SIP transfer completed"
+    );
     // End the call record with outcome "transferred" and stop egress so recording length matches (no 20+ sec tail).
     const callForEnd = await store.getCallById(id);
     if (callForEnd && !callForEnd.endedAt) {
@@ -1952,12 +1955,19 @@ app.get("/api/internal/agents/config", requireAgentSecret, async (req, res) => {
   const workspaceId = (req.query.workspaceId || "").toString().trim();
   const agentId = (req.query.agentId || "").toString().trim();
   if (!workspaceId || !agentId) {
+    logger.warn({ workspaceId: workspaceId || "(empty)", agentId: agentId || "(empty)" }, "[internal.agents.config] missing workspaceId or agentId");
     return res.status(400).json({ error: "workspaceId and agentId query params required" });
   }
   const agent = await store.getAgent(workspaceId, agentId);
-  if (!agent) return res.status(404).json({ error: "Agent not found" });
+  if (!agent) {
+    logger.warn({ workspaceId, agentId }, "[internal.agents.config] agent not found");
+    return res.status(404).json({ error: "Agent not found" });
+  }
+  const toolConfigs = agent.toolConfigs && typeof agent.toolConfigs === "object" ? agent.toolConfigs : {};
+  const keys = Object.keys(toolConfigs);
+  logger.info({ agentId, workspaceId, toolConfigKeys: keys }, "[internal.agents.config] returning config");
   return res.json({
-    toolConfigs: agent.toolConfigs && typeof agent.toolConfigs === "object" ? agent.toolConfigs : {},
+    toolConfigs,
     enabledTools: Array.isArray(agent.enabledTools) ? agent.enabledTools : ["end_call"],
   });
 });
@@ -4086,6 +4096,12 @@ app.post("/api/agents/:id/start", requireAuth, async (req, res) => {
   const enabledTools = startParsed?.data?.enabledTools ?? agent.enabledTools ?? ["end_call"];
   const backgroundAudio = agent.backgroundAudio ?? {};
   const toolConfigs = agent.toolConfigs && typeof agent.toolConfigs === "object" ? agent.toolConfigs : {};
+  const toolConfigKeys = Object.keys(toolConfigs);
+  logger.info(
+    { agentId: id, workspaceId: req.workspace.id, toolConfigKeys, toolConfigKeysCount: toolConfigKeys.length },
+    "[agents.start] webtest room: agent config for metadata"
+  );
+
   const backchannelEnabled = Boolean(agent.backchannelEnabled);
   const llmModel = String(agent.llmModel || "").trim() || getBillingConfig().defaultLlmModel;
   const maxCallSeconds = Number(agent.maxCallSeconds || 0);
