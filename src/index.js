@@ -1561,7 +1561,8 @@ app.post(
 
   return res.status(201).json({
     callId,
-    agent: { id: agent.id, name: agent.name },
+    workspaceId: phoneRow.workspaceId,
+    agent: { id: agent.id, name: agent.name, workspaceId: phoneRow.workspaceId },
     prompt: promptUsed,
     welcome: agent.welcome ?? {},
     voice: { ...(agent.voice ?? {}), backgroundAudio: agent.backgroundAudio ?? {} },
