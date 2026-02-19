@@ -1950,22 +1950,28 @@ app.post("/api/internal/calls/:id/transfer", requireAgentSecret, async (req, res
 });
 
 // --- Internal: fetch agent config (toolConfigs, enabledTools) when room metadata has none ---
+// Supports workspaceId+agentId (preferred) or agentId only (fallback when room metadata is missing; e.g. webtest room name is call-{agentId}-{nanoid}).
 app.get("/api/internal/agents/config", requireAgentSecret, async (req, res) => {
   if (!USE_DB) return res.status(400).json({ error: "Internal endpoints require Postgres mode" });
   const workspaceId = (req.query.workspaceId || "").toString().trim();
   const agentId = (req.query.agentId || "").toString().trim();
-  if (!workspaceId || !agentId) {
-    logger.warn({ workspaceId: workspaceId || "(empty)", agentId: agentId || "(empty)" }, "[internal.agents.config] missing workspaceId or agentId");
-    return res.status(400).json({ error: "workspaceId and agentId query params required" });
+  if (!agentId) {
+    logger.warn({ workspaceId: workspaceId || "(empty)", agentId: agentId || "(empty)" }, "[internal.agents.config] missing agentId");
+    return res.status(400).json({ error: "agentId query param required" });
   }
-  const agent = await store.getAgent(workspaceId, agentId);
+  let agent = null;
+  if (workspaceId) {
+    agent = await store.getAgent(workspaceId, agentId);
+  } else {
+    agent = await store.getAgentById(agentId);
+  }
   if (!agent) {
-    logger.warn({ workspaceId, agentId }, "[internal.agents.config] agent not found");
+    logger.warn({ workspaceId: workspaceId || "(omit)", agentId }, "[internal.agents.config] agent not found");
     return res.status(404).json({ error: "Agent not found" });
   }
   const toolConfigs = agent.toolConfigs && typeof agent.toolConfigs === "object" ? agent.toolConfigs : {};
   const keys = Object.keys(toolConfigs);
-  logger.info({ agentId, workspaceId, toolConfigKeys: keys }, "[internal.agents.config] returning config");
+  logger.info({ agentId, workspaceId: workspaceId || "(from id)", toolConfigKeys: keys }, "[internal.agents.config] returning config");
   return res.json({
     toolConfigs,
     enabledTools: Array.isArray(agent.enabledTools) ? agent.enabledTools : ["end_call"],

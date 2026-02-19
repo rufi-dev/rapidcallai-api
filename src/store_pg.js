@@ -658,6 +658,13 @@ async function getAgent(workspaceId, id) {
   return rows[0] ? rowToAgent(rows[0]) : null;
 }
 
+/** Look up agent by id only (any workspace). Used when agent joins a room and metadata has no workspaceId. */
+async function getAgentById(agentId) {
+  const p = getPool();
+  const { rows } = await p.query(`SELECT * FROM agents WHERE id=$1 LIMIT 1`, [agentId]);
+  return rows[0] ? rowToAgent(rows[0]) : null;
+}
+
 async function updateAgent(
   workspaceId,
   id,
@@ -1532,6 +1539,7 @@ module.exports = {
   listAgents,
   createAgent,
   getAgent,
+  getAgentById,
   updateAgent,
   deleteAgent,
   // Knowledge Base
