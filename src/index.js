@@ -1513,6 +1513,7 @@ app.post(
     call: { id: callId, to: from || "unknown", direction: "inbound" },
     agent: {
       id: agent.id,
+      workspaceId: phoneRow.workspaceId,
       name: agent.name,
       prompt: promptUsed,
       voice: agent.voice ?? {},
@@ -1943,6 +1944,22 @@ app.post("/api/internal/calls/:id/transfer", requireAgentSecret, async (req, res
     logger.warn(errDetail, "[internal.transfer] transfer failed (LiveKit or SIP error)");
     return res.status(500).json({ error: "Transfer failed", message: msg, sipStatusCode: code });
   }
+});
+
+// --- Internal: fetch agent config (toolConfigs, enabledTools) when room metadata has none ---
+app.get("/api/internal/agents/config", requireAgentSecret, async (req, res) => {
+  if (!USE_DB) return res.status(400).json({ error: "Internal endpoints require Postgres mode" });
+  const workspaceId = (req.query.workspaceId || "").toString().trim();
+  const agentId = (req.query.agentId || "").toString().trim();
+  if (!workspaceId || !agentId) {
+    return res.status(400).json({ error: "workspaceId and agentId query params required" });
+  }
+  const agent = await store.getAgent(workspaceId, agentId);
+  if (!agent) return res.status(404).json({ error: "Agent not found" });
+  return res.json({
+    toolConfigs: agent.toolConfigs && typeof agent.toolConfigs === "object" ? agent.toolConfigs : {},
+    enabledTools: Array.isArray(agent.enabledTools) ? agent.enabledTools : ["end_call"],
+  });
 });
 
 // --- Internal KB search (for the LiveKit agent tools) ---
@@ -4135,6 +4152,7 @@ app.post("/api/agents/:id/start", requireAuth, async (req, res) => {
       call: { id: callId, to: "webtest" },
       agent: {
         id: agent.id,
+        workspaceId: req.workspace.id,
         name: agent.name,
         prompt: promptUsed,
         promptBase: basePrompt,
