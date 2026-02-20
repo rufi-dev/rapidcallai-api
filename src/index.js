@@ -3434,8 +3434,11 @@ app.post("/api/phone-numbers", requireAuth, async (req, res) => {
           await addNumberToInboundTrunk(effectiveInboundTrunkId, e164);
         } catch (e) {
           const msg = String(e?.message ?? e?.error ?? e ?? "").toLowerCase();
+          const isAlready = msg.includes("already") || msg.includes("duplicate");
           const isTrunkMissing = isTrunkNotFoundError(e) || e?.code === "TRUNK_NOT_FOUND" || msg.includes("object cannot be found") || (msg.includes("twirp") && msg.includes("not found"));
-          if (isTrunkMissing) {
+          if (isAlready) {
+            // Number already on trunk — ok (e.g. connect-via-SIP retry or manual add)
+          } else if (isTrunkMissing) {
             try {
               const inboundResult = await createInboundTrunkForWorkspace({ workspaceId, numbers: [e164] });
               effectiveInboundTrunkId = inboundResult.trunkId;
@@ -3519,6 +3522,79 @@ app.get("/api/phone-numbers/:id", requireAuth, async (req, res) => {
   if (!phoneNumber) return res.status(404).json({ error: "Not found" });
   if (phoneNumber.workspaceId !== req.workspace.id) return res.status(404).json({ error: "Not found" });
   return res.json({ phoneNumber });
+});
+
+// Ensure a phone number is on the LiveKit inbound trunk (for "connect via SIP" numbers where inbound was missing).
+app.post("/api/phone-numbers/:id/ensure-inbound", requireAuth, async (req, res) => {
+  if (!USE_DB) return res.status(400).json({ error: "Ensure-inbound requires Postgres mode" });
+  const id = String(req.params.id);
+  const phoneNumber = await store.getPhoneNumber(id);
+  if (!phoneNumber || phoneNumber.workspaceId !== req.workspace.id) return res.status(404).json({ error: "Not found" });
+  const e164 = String(phoneNumber.e164 || "").trim();
+  if (!e164) return res.status(400).json({ error: "Phone number has no E.164" });
+  const ws = req.workspace;
+  const workspaceId = ws.id;
+  const inboundTrunkIdEnv = String(process.env.SIP_INBOUND_TRUNK_ID || "").trim();
+  let effectiveInboundTrunkId = ws.livekitInboundTrunkId || inboundTrunkIdEnv || null;
+  const errors = [];
+  if (!effectiveInboundTrunkId) {
+    try {
+      const inboundResult = await createInboundTrunkForWorkspace({ workspaceId, numbers: [e164] });
+      effectiveInboundTrunkId = inboundResult.trunkId;
+      await store.updateWorkspace(ws.id, { livekitInboundTrunkId: effectiveInboundTrunkId });
+      logger.info({ e164, trunkId: effectiveInboundTrunkId }, "[ensure-inbound] created inbound trunk and added number");
+    } catch (e) {
+      const existingTrunkId = parseConflictingInboundTrunkId(e);
+      if (existingTrunkId) {
+        effectiveInboundTrunkId = existingTrunkId;
+        await store.updateWorkspace(ws.id, { livekitInboundTrunkId: effectiveInboundTrunkId });
+        try {
+          await addNumberToInboundTrunk(effectiveInboundTrunkId, e164);
+        } catch (addErr) {
+          errors.push(String(addErr?.message || addErr));
+        }
+      } else {
+        errors.push(String(e?.message || e));
+      }
+    }
+  } else {
+    try {
+      await addNumberToInboundTrunk(effectiveInboundTrunkId, e164);
+      logger.info({ e164, trunkId: effectiveInboundTrunkId }, "[ensure-inbound] added number to existing inbound trunk");
+    } catch (e) {
+      const msg = String(e?.message ?? e?.error ?? e ?? "").toLowerCase();
+      const isAlready = msg.includes("already") || msg.includes("duplicate");
+      const isTrunkMissing = isTrunkNotFoundError(e) || msg.includes("object cannot be found") || (msg.includes("twirp") && msg.includes("not found"));
+      if (isAlready) {
+        // Already on trunk — success
+      } else if (isTrunkMissing) {
+        try {
+          const inboundResult = await createInboundTrunkForWorkspace({ workspaceId, numbers: [e164] });
+          effectiveInboundTrunkId = inboundResult.trunkId;
+          await store.updateWorkspace(ws.id, { livekitInboundTrunkId: effectiveInboundTrunkId });
+          logger.info({ e164, trunkId: effectiveInboundTrunkId }, "[ensure-inbound] recreated inbound trunk and added number");
+        } catch (createErr) {
+          const existingTrunkId = parseConflictingInboundTrunkId(createErr);
+          if (existingTrunkId) {
+            effectiveInboundTrunkId = existingTrunkId;
+            await store.updateWorkspace(ws.id, { livekitInboundTrunkId: effectiveInboundTrunkId });
+          } else {
+            errors.push(String(createErr?.message || createErr));
+          }
+        }
+      } else {
+        errors.push(String(e?.message || e));
+      }
+    }
+  }
+  if (effectiveInboundTrunkId) {
+    await store.updatePhoneNumber(id, { livekitInboundTrunkId: effectiveInboundTrunkId });
+  }
+  const updated = await store.getPhoneNumber(id);
+  if (errors.length > 0) {
+    return res.status(207).json({ phoneNumber: updated, ok: false, errors });
+  }
+  return res.json({ phoneNumber: updated, ok: true });
 });
 
 app.put("/api/phone-numbers/:id", requireAuth, async (req, res) => {
