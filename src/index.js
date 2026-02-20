@@ -1582,6 +1582,79 @@ app.post(
   }
 );
 
+// Outbound telephony: agent joins room "out-<jobId>" with no SIP (to/from); look up call by room name and return agent config.
+app.post(
+  "/api/internal/telephony/outbound/start",
+  (req, _res, next) => {
+    console.log("[internal.telephony.outbound.start] request received", {
+      hasSecret: Boolean(req.headers["x-agent-secret"]),
+      bodyKeys: req.body && typeof req.body === "object" ? Object.keys(req.body) : [],
+    });
+    next();
+  },
+  requireAgentSecret,
+  async (req, res) => {
+    const schema = z.object({
+      roomName: z.string().min(1).max(200),
+    });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: "Validation failed", details: parsed.error.flatten() });
+    if (!USE_DB) return res.status(400).json({ error: "Internal endpoints require Postgres mode" });
+
+    const roomName = parsed.data.roomName.trim();
+    if (!roomName.startsWith("out-")) {
+      return res.status(400).json({ error: "Outbound start requires room name starting with out-" });
+    }
+
+    const call = await store.getCallByRoomName(roomName);
+    if (!call) {
+      console.log("[internal.telephony.outbound.start] call not found for room", { roomName });
+      return res.status(404).json({ error: "Call not found for this room" });
+    }
+    if (!call.agentId || !call.workspaceId) {
+      return res.status(404).json({ error: "Call has no agent" });
+    }
+
+    const agent = await store.getAgent(call.workspaceId, call.agentId);
+    if (!agent) {
+      console.log("[internal.telephony.outbound.start] agent not found", { agentId: call.agentId, workspaceId: call.workspaceId });
+      return res.status(404).json({ error: "Agent not found" });
+    }
+
+    const promptDraft = agent.promptDraft ?? "";
+    const promptPublished = agent.promptPublished ?? "";
+    const promptUsed = (promptDraft && String(promptDraft).trim()) ? promptDraft : promptPublished;
+    if (!promptUsed || String(promptUsed).trim().length === 0) {
+      return res.status(400).json({ error: "Agent prompt is empty" });
+    }
+
+    const enabledTools = Array.isArray(agent.enabledTools) ? agent.enabledTools : ["end_call"];
+    const toolConfigs = agent.toolConfigs && typeof agent.toolConfigs === "object" ? agent.toolConfigs : {};
+
+    console.log("[internal.telephony.outbound.start] returning config for outbound call", { callId: call.id, roomName, agentId: agent.id });
+
+    return res.status(200).json({
+      callId: call.id,
+      workspaceId: call.workspaceId,
+      agent: { id: agent.id, name: agent.name, workspaceId: call.workspaceId, to: call.to || "" },
+      prompt: promptUsed,
+      welcome: agent.welcome ?? {},
+      voice: { ...(agent.voice ?? {}), backgroundAudio: agent.backgroundAudio ?? {} },
+      backgroundAudio: agent.backgroundAudio ?? {},
+      llmModel: String(agent.llmModel || ""),
+      maxCallSeconds: Number(agent.maxCallSeconds || 0),
+      knowledgeFolderIds: Array.isArray(agent.knowledgeFolderIds) ? agent.knowledgeFolderIds : [],
+      enabledTools,
+      toolConfigs,
+      callSettings: agent.callSettings ?? {},
+      backchannelEnabled: Boolean(agent.backchannelEnabled),
+      fallbackVoice: agent.fallbackVoice ?? null,
+      postCallDataExtraction: Array.isArray(agent.postCallDataExtraction) ? agent.postCallDataExtraction : [],
+      postCallExtractionModel: agent.postCallExtractionModel ?? "",
+    });
+  }
+);
+
 app.post("/api/internal/calls/:id/end", requireAgentSecret, async (req, res) => {
   const { id } = req.params;
   const schema = z.object({

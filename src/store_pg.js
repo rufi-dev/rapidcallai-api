@@ -952,6 +952,16 @@ async function getCallById(id) {
   return rows[0] ? rowToCall(rows[0]) : null;
 }
 
+async function getCallByRoomName(roomName) {
+  if (!roomName || typeof roomName !== "string") return null;
+  const p = getPool();
+  const { rows } = await p.query(
+    `SELECT * FROM calls WHERE room_name=$1 ORDER BY started_at DESC LIMIT 1`,
+    [roomName.trim()]
+  );
+  return rows[0] ? rowToCall(rows[0]) : null;
+}
+
 async function updateCall(callId, patch) {
   const p = getPool();
   // Fetch existing to merge JSON fields safely.
@@ -1564,6 +1574,7 @@ module.exports = {
   listCalls,
   getCall,
   getCallById,
+  getCallByRoomName,
   upsertAgentForMigration,
   upsertCallForMigration,
 
