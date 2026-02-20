@@ -299,12 +299,31 @@ app.post("/api/livekit/webhook", express.raw({ type: "application/webhook+json" 
     if (!roomName) return res.status(200).json({ ok: true });
 
     // Map LiveKit room -> call record by room_name.
-    const call = await findCallByRoomName(roomName);
+    let call = await findCallByRoomName(roomName);
+    // Inbound phone: room is created by LiveKit when Twilio dials SIP; we have no call yet. When SIP participant
+    // joins, set room metadata (enabledTools, toolConfigs) so the agent sees the same config as webtest.
+    const eventName = String(ev?.event || "").trim();
+    const identity = String(ev?.participant?.identity || "").trim();
+    if (!call && eventName === "participant_joined" && identity.startsWith("sip-")) {
+      const attrs = ev.participant?.attributes && typeof ev.participant.attributes === "object" ? ev.participant.attributes : {};
+      const to = (attrs["sip.trunkPhoneNumber"] || attrs["sip_trunkPhoneNumber"] || "").trim();
+      const fromNum = (attrs["sip.phoneNumber"] || attrs["sip_phoneNumber"] || "").trim();
+      if (to) {
+        try {
+          const result = await doInboundStart({ roomName, to, from: fromNum, twilioCallSid: "" });
+          if (result.status === 201) {
+            call = await findCallByRoomName(roomName);
+            logger.info({ roomName, to, from: fromNum || "(empty)", callId: call?.id }, "[livekit.webhook] inbound: doInboundStart set room metadata (tools/toolConfigs)");
+          }
+        } catch (e) {
+          logger.warn({ err: String(e?.message || e), roomName, to }, "[livekit.webhook] inbound doInboundStart failed");
+        }
+      }
+    }
     if (!call) return res.status(200).json({ ok: true });
 
     const nowMs = Date.now();
     const tsMs = Number(ev?.createdAt) > 0 ? Number(ev.createdAt) : nowMs;
-    const identity = String(ev?.participant?.identity || "").trim();
 
     const prev = (call.metrics && typeof call.metrics === "object" ? call.metrics : {}) || {};
     const lk = prev.livekit && typeof prev.livekit === "object" ? prev.livekit : {};
@@ -319,8 +338,6 @@ app.post("/api/livekit/webhook", express.raw({ type: "application/webhook+json" 
     // Totals we maintain in metrics (seconds, not minutes)
     let billedSecondsTotal = Number(lk.participantBilledSecondsTotal || 0);
     let rawSecondsTotal = Number(lk.participantRawSecondsTotal || 0);
-
-    const eventName = String(ev?.event || "").trim();
 
     if ((eventName === "participant_joined" || eventName === "room_started") && identity) {
       const p = participants[identity] && typeof participants[identity] === "object" ? participants[identity] : {};
@@ -1369,66 +1386,46 @@ app.use("/api/billing", requireAuth, createBillingRouter({ store: USE_DB ? store
 app.use("/api/crm", requireAuth, createCrmRouter({ store: USE_DB ? store : null, USE_DB }));
 
 // --- Internal (used by the LiveKit agent to create/update call records) ---
-// Log every request to inbound/start so we can see if the agent reaches the API (even before auth).
-app.post(
-  "/api/internal/telephony/inbound/start",
-  (req, _res, next) => {
-    console.log("[internal.telephony.inbound.start] request received", {
-      hasSecret: Boolean(req.headers["x-agent-secret"]),
-      bodyKeys: req.body && typeof req.body === "object" ? Object.keys(req.body) : [],
-    });
-    next();
-  },
-  requireAgentSecret,
-  async (req, res) => {
-  const schema = z.object({
-    roomName: z.string().min(1).max(200),
-    to: z.string().min(3).max(32), // trunk phone number (E.164)
-    from: z.string().min(0).max(32).optional(), // caller phone number (E.164)
-    twilioCallSid: z.string().min(0).max(64).optional(),
-  });
-  const parsed = schema.safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: "Validation failed", details: parsed.error.flatten() });
-  if (!USE_DB) return res.status(400).json({ error: "Internal endpoints require Postgres mode" });
+/**
+ * Run inbound/start logic: create call record and set room metadata (enabledTools, toolConfigs, etc.)
+ * so the agent sees the same config as webtest. Used by POST inbound/start and by LiveKit webhook
+ * when a SIP participant joins and no call exists yet (inbound phone flow).
+ * @returns {{ status: number, data?: object, error?: string }}
+ */
+async function doInboundStart({ roomName, to, from, twilioCallSid = "" }) {
+  if (!USE_DB) return { status: 400, error: "Internal endpoints require Postgres mode" };
+  const fromStr = String(from || "").trim();
+  const toStr = String(to || "").trim();
+  const roomNameStr = String(roomName || "").trim();
+  if (!roomNameStr || toStr.length < 3) return { status: 400, error: "roomName and to (E.164) required" };
 
-  const to = parsed.data.to.trim();
-  const from = String(parsed.data.from || "").trim();
-  const twilioCallSid = String(parsed.data.twilioCallSid || "").trim();
-
-  // eslint-disable-next-line no-console
-  console.log("[internal.telephony.inbound.start]", { roomName: parsed.data.roomName, to, from });
-
-  const phoneRow = await store.getPhoneNumberByE164(to);
+  const phoneRow = await store.getPhoneNumberByE164(toStr);
   if (!phoneRow) {
-    // eslint-disable-next-line no-console
-    console.log("[internal.telephony.inbound.start] phone number not found", { to });
-    return res.status(404).json({ error: "Phone number not found" });
+    console.log("[doInboundStart] phone number not found", { to: toStr });
+    return { status: 404, error: "Phone number not found" };
   }
-
-  // Billing gating: PSTN is PAID only (unless TRIAL_ALLOW_PSTN is explicitly enabled).
   const ws = await store.getWorkspace(phoneRow.workspaceId);
-  if (!ws) return res.status(404).json({ error: "Workspace not found" });
+  if (!ws) return { status: 404, error: "Workspace not found" };
   try {
     assertCanUsePstn(ws, getBillingConfig());
   } catch (e) {
-    return res.status(Number(e?.status || 402)).json({ error: e?.message || "Billing gating" });
+    return { status: Number(e?.status || 402), error: e?.message || "Billing gating" };
   }
 
   const agentId = phoneRow.inboundAgentId;
   const callId = `call_${nanoid(12)}`;
   const now = Date.now();
 
-  // Fallback when no inbound agent is set: return 201 with a prompt so the agent speaks and user hears something.
   if (!agentId) {
-    console.warn("[internal.telephony.inbound.start] Inbound agent not configured — returning fallback prompt so agent speaks.", { to, from, phoneNumberId: phoneRow.id, roomName: parsed.data.roomName });
+    console.warn("[doInboundStart] Inbound agent not configured", { to: toStr, from: fromStr, roomName: roomNameStr });
     const fallbackPrompt = "You are a voice assistant. The number you were called on does not have an inbound agent configured. Say exactly once: This number is not configured for inbound calls. Please set the Inbound agent for this phone number in the dashboard.";
     const callRecord = {
       id: callId,
       workspaceId: phoneRow.workspaceId,
       agentId: null,
       agentName: "System",
-      to: from || "unknown",
-      roomName: parsed.data.roomName,
+      to: fromStr || "unknown",
+      roomName: roomNameStr,
       startedAt: now,
       endedAt: null,
       durationSec: null,
@@ -1438,43 +1435,66 @@ app.post(
       recording: null,
       metrics: {
         normalized: { source: "telephony", fallback: true },
-        telephony: {
-          trunkNumber: to,
-          callerNumber: from || "",
-          twilioCallSid: twilioCallSid || undefined,
-        },
+        telephony: { trunkNumber: toStr, callerNumber: fromStr || "", twilioCallSid: twilioCallSid || undefined },
       },
       createdAt: now,
       updatedAt: now,
     };
     await store.createCall(callRecord);
-    return res.status(201).json({
-      callId,
-      agent: { id: null, name: "System" },
-      prompt: fallbackPrompt,
+    const metadata = {
+      call: { id: callId, to: fromStr || "unknown", direction: "inbound" },
+      agent: {
+        id: null,
+        workspaceId: phoneRow.workspaceId,
+        name: "System",
+        prompt: fallbackPrompt,
+        voice: {},
+        enabledTools: ["end_call"],
+        toolConfigs: {},
+        backchannelEnabled: false,
+        backgroundAudio: {},
+        llmModel: "",
+        maxCallSeconds: 60,
+        knowledgeFolderIds: [],
+        defaultDynamicVariables: {},
+        callSettings: {},
+        fallbackVoice: null,
+        postCallDataExtraction: [],
+        postCallExtractionModel: "",
+      },
       welcome: {},
-      voice: {},
-      llmModel: "",
-      maxCallSeconds: 60,
-      knowledgeFolderIds: [],
-      phoneNumber: { id: phoneRow.id, e164: phoneRow.e164 },
-    });
+    };
+    try {
+      await roomService().updateRoomMetadata(roomNameStr, JSON.stringify(metadata));
+    } catch (metaErr) {
+      logger.warn({ err: String(metaErr?.message || metaErr), roomName: roomNameStr }, "[doInboundStart] failed to update room metadata");
+    }
+    return {
+      status: 201,
+      data: {
+        callId,
+        agent: { id: null, name: "System" },
+        prompt: fallbackPrompt,
+        welcome: {},
+        voice: {},
+        llmModel: "",
+        maxCallSeconds: 60,
+        knowledgeFolderIds: [],
+        phoneNumber: { id: phoneRow.id, e164: phoneRow.e164 },
+      },
+    };
   }
 
   const agent = await store.getAgent(phoneRow.workspaceId, agentId);
   if (!agent) {
-    // eslint-disable-next-line no-console
-    console.log("[internal.telephony.inbound.start] inbound agent not found", { agentId, workspaceId: phoneRow.workspaceId });
-    return res.status(404).json({ error: "Inbound agent not found" });
+    console.log("[doInboundStart] inbound agent not found", { agentId, workspaceId: phoneRow.workspaceId });
+    return { status: 404, error: "Inbound agent not found" };
   }
-
   const promptDraft = agent.promptDraft ?? "";
   const promptPublished = agent.promptPublished ?? "";
   const promptUsed = (promptDraft && String(promptDraft).trim()) ? promptDraft : promptPublished;
   if (!promptUsed || String(promptUsed).trim().length === 0) {
-    // eslint-disable-next-line no-console
-    console.log("[internal.telephony.inbound.start] agent prompt empty", { agentId: agent.id });
-    return res.status(400).json({ error: "Agent prompt is empty" });
+    return { status: 400, error: "Agent prompt is empty" };
   }
 
   callsStartedTotal.inc({ source: "telephony" });
@@ -1484,8 +1504,8 @@ app.post(
     workspaceId: phoneRow.workspaceId,
     agentId: agent.id,
     agentName: agent.name,
-    to: from || "unknown",
-    roomName: parsed.data.roomName,
+    to: fromStr || "unknown",
+    roomName: roomNameStr,
     startedAt: now,
     endedAt: null,
     durationSec: null,
@@ -1495,25 +1515,18 @@ app.post(
     recording: null,
     metrics: {
       normalized: { source: "telephony" },
-      telephony: {
-        trunkNumber: to,
-        callerNumber: from || "",
-        twilioCallSid: twilioCallSid || undefined,
-      },
+      telephony: { trunkNumber: toStr, callerNumber: fromStr || "", twilioCallSid: twilioCallSid || undefined },
     },
     createdAt: now,
     updatedAt: now,
   };
-
   await store.createCall(callRecord);
-  // call_started webhook is sent only after the call is answered (when SIP participant joins the room), not on dial.
-  console.log("[internal.telephony.inbound.start] call created, agent will join", { callId, roomName: parsed.data.roomName, to, from, agentId: agent.id });
+  console.log("[doInboundStart] call created, room metadata will be updated", { callId, roomName: roomNameStr, to: toStr, from: fromStr, agentId: agent.id });
 
-  // Update LiveKit room metadata so the Python agent reads prompt, voice, tools, etc. (same shape as webtest).
   const enabledTools = Array.isArray(agent.enabledTools) ? agent.enabledTools : ["end_call"];
   const toolConfigs = agent.toolConfigs && typeof agent.toolConfigs === "object" ? agent.toolConfigs : {};
   const inboundMetadata = {
-    call: { id: callId, to: from || "unknown", direction: "inbound" },
+    call: { id: callId, to: fromStr || "unknown", direction: "inbound" },
     agent: {
       id: agent.id,
       workspaceId: phoneRow.workspaceId,
@@ -1536,52 +1549,87 @@ app.post(
     welcome: agent.welcome ?? {},
   };
   try {
-    const rs = roomService();
-    await rs.updateRoomMetadata(parsed.data.roomName, JSON.stringify(inboundMetadata));
-    console.log("[internal.telephony.inbound.start] room metadata updated for agent config");
+    await roomService().updateRoomMetadata(roomNameStr, JSON.stringify(inboundMetadata));
+    console.log("[doInboundStart] room metadata updated for agent config (enabledTools, toolConfigs)", { roomName: roomNameStr, toolConfigKeys: Object.keys(toolConfigs) });
   } catch (metaErr) {
-    logger.warn({ requestId: req.requestId, err: String(metaErr?.message || metaErr), roomName: parsed.data.roomName }, "[internal.telephony.inbound.start] failed to update room metadata");
+    logger.warn({ err: String(metaErr?.message || metaErr), roomName: roomNameStr }, "[doInboundStart] failed to update room metadata");
   }
-
-  // Start recording (egress) if configured.
   try {
     const e = await startCallEgress({ roomName: callRecord.roomName, callId });
     if (e && e.enabled) {
-      const recording = {
-        kind: "egress_s3",
-        egressId: e.egressId,
-        bucket: e.bucket,
-        key: e.key,
-        status: "recording",
-        url: `/api/calls/${encodeURIComponent(callId)}/recording`,
-      };
-      await store.updateCall(callId, { recording });
+      await store.updateCall(callId, {
+        recording: {
+          kind: "egress_s3",
+          egressId: e.egressId,
+          bucket: e.bucket,
+          key: e.key,
+          status: "recording",
+          url: `/api/calls/${encodeURIComponent(callId)}/recording`,
+        },
+      });
     }
   } catch (e) {
-    logger.warn({ requestId: req.requestId, err: String(e?.message || e) }, "[internal.telephony.inbound.start] failed to start egress");
-    sendAlert("egress_start_failed", { requestId: req.requestId, error: String(e?.message || e) });
+    logger.warn({ err: String(e?.message || e) }, "[doInboundStart] failed to start egress");
   }
 
-  return res.status(201).json({
-    callId,
-    workspaceId: phoneRow.workspaceId,
-    agent: { id: agent.id, name: agent.name, workspaceId: phoneRow.workspaceId },
-    prompt: promptUsed,
-    welcome: agent.welcome ?? {},
-    voice: { ...(agent.voice ?? {}), backgroundAudio: agent.backgroundAudio ?? {} },
-    backgroundAudio: agent.backgroundAudio ?? {},
-    llmModel: String(agent.llmModel || ""),
-    maxCallSeconds: Number(agent.maxCallSeconds || 0),
-    knowledgeFolderIds: Array.isArray(agent.knowledgeFolderIds) ? agent.knowledgeFolderIds : [],
-    enabledTools,
-    toolConfigs,
-    callSettings: agent.callSettings ?? {},
-    backchannelEnabled: Boolean(agent.backchannelEnabled),
-    fallbackVoice: agent.fallbackVoice ?? null,
-    postCallDataExtraction: Array.isArray(agent.postCallDataExtraction) ? agent.postCallDataExtraction : [],
-    postCallExtractionModel: agent.postCallExtractionModel ?? "",
-    phoneNumber: { id: phoneRow.id, e164: phoneRow.e164 },
-  });
+  return {
+    status: 201,
+    data: {
+      callId,
+      workspaceId: phoneRow.workspaceId,
+      agent: { id: agent.id, name: agent.name, workspaceId: phoneRow.workspaceId },
+      prompt: promptUsed,
+      welcome: agent.welcome ?? {},
+      voice: { ...(agent.voice ?? {}), backgroundAudio: agent.backgroundAudio ?? {} },
+      backgroundAudio: agent.backgroundAudio ?? {},
+      llmModel: String(agent.llmModel || ""),
+      maxCallSeconds: Number(agent.maxCallSeconds || 0),
+      knowledgeFolderIds: Array.isArray(agent.knowledgeFolderIds) ? agent.knowledgeFolderIds : [],
+      enabledTools,
+      toolConfigs,
+      callSettings: agent.callSettings ?? {},
+      backchannelEnabled: Boolean(agent.backchannelEnabled),
+      fallbackVoice: agent.fallbackVoice ?? null,
+      postCallDataExtraction: Array.isArray(agent.postCallDataExtraction) ? agent.postCallDataExtraction : [],
+      postCallExtractionModel: agent.postCallExtractionModel ?? "",
+      phoneNumber: { id: phoneRow.id, e164: phoneRow.e164 },
+    },
+  };
+}
+
+app.post(
+  "/api/internal/telephony/inbound/start",
+  (req, _res, next) => {
+    console.log("[internal.telephony.inbound.start] request received", {
+      hasSecret: Boolean(req.headers["x-agent-secret"]),
+      bodyKeys: req.body && typeof req.body === "object" ? Object.keys(req.body) : [],
+    });
+    next();
+  },
+  requireAgentSecret,
+  async (req, res) => {
+    const schema = z.object({
+      roomName: z.string().min(1).max(200),
+      to: z.string().min(3).max(32),
+      from: z.string().min(0).max(32).optional(),
+      twilioCallSid: z.string().min(0).max(64).optional(),
+    });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: "Validation failed", details: parsed.error.flatten() });
+    const to = parsed.data.to.trim();
+    const from = String(parsed.data.from || "").trim();
+    const twilioCallSid = String(parsed.data.twilioCallSid || "").trim();
+    console.log("[internal.telephony.inbound.start]", { roomName: parsed.data.roomName, to, from });
+    const result = await doInboundStart({
+      roomName: parsed.data.roomName,
+      to,
+      from,
+      twilioCallSid,
+    });
+    if (result.error && result.status !== 201) {
+      return res.status(result.status).json({ error: result.error });
+    }
+    return res.status(result.status).json(result.data);
   }
 );
 
