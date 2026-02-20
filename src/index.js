@@ -584,12 +584,15 @@ app.use((req, res, next) => {
 });
 
 // Enforce Origin check for state-changing requests (browser CSRF protection).
-// Skip origin check when the request uses an API key (Bearer rck_...) — API clients
-// (Postman, server-to-server) don't send Origin; the key itself proves intent.
+// Skip origin check when the request uses an API key (Bearer rck_...) or x-agent-secret
+// (LiveKit agent server-to-server); those clients don't send Origin.
 app.use((req, res, next) => {
   if (!isUnsafeMethod(req.method)) return next();
   if (req.method === "OPTIONS") return next();
   if (isAuthPath(req.path) || isWebhookPath(req.path) || isInternalAgentPath(req.path)) return next();
+
+  const agentSecret = String(req.headers["x-agent-secret"] || "").trim();
+  if (agentSecret) return next(); // Agent internal request; no origin required
 
   const authHeader = String(req.headers.authorization || "").trim();
   if (authHeader.toLowerCase().startsWith("bearer ") && authHeader.slice(7).startsWith("rck_")) {
