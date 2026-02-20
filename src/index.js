@@ -45,15 +45,10 @@ const { substituteDynamicVariables } = require("./promptSubstitute");
 const { startCallEgress, stopEgress, getEgressInfo } = require("./egress");
 const { getObject, headObject } = require("./s3");
 const tw = require("./twilio");
-const { getBillingConfig } = require("./billing/config");
-const { assertCanStartWebCall, assertCanBuyNumber, assertCanUsePstn } = require("./billing/gating");
-const { finalizeBillingForCall } = require("./billing/finalize");
 const { sendAgentWebhook } = require("./webhooks");
-const stripeBilling = require("./billing/stripe");
-const { provisionBillingForWorkspace } = require("./billing/provision");
-const { createBillingRouter } = require("./billing/routes");
-const { registerStripeWebhookRoute } = require("./billing/stripeWebhook");
 const { createCrmRouter } = require("./crm/routes");
+
+const DEFAULT_LLM_MODEL = String(process.env.DEFAULT_LLM_MODEL || "gpt-4.1-mini").trim() || "gpt-4.1-mini";
 const contactStore = require("./crm/store");
 
 // LiveKit webhooks receiver (verified with LIVEKIT_API_KEY/SECRET).
@@ -458,9 +453,6 @@ app.post("/api/livekit/webhook", express.raw({ type: "application/webhook+json" 
 const USE_DB = Boolean(process.env.DATABASE_URL);
 const DEFAULT_WORKSPACE_ID = "rapidcallai";
 
-// Stripe webhooks MUST be registered before express.json middleware (we need the raw request body).
-registerStripeWebhookRoute(app, { store: USE_DB ? store : null, stripeBilling });
-
 // Allow larger prompts (still bounded to protect the server).
 app.use(express.json({ limit: "10mb" }));
 // Twilio webhooks POST as application/x-www-form-urlencoded by default.
@@ -757,11 +749,6 @@ async function endTelephonyCallFromWebhook(call, outcome) {
     inProgressCallsGaugeValue = Math.max(0, inProgressCallsGaugeValue - 1);
   } catch {
     // ignore
-  }
-  try {
-    await finalizeBillingForCall({ store, call: updated });
-  } catch (eBilling) {
-    logger.warn({ callId: call.id, err: String(eBilling?.message || eBilling) }, "[livekit.webhook] billing failed");
   }
   const c = await store.getCallById(call.id);
   if (c?.recording?.kind === "egress_s3" && c.recording.egressId) {
@@ -1097,15 +1084,6 @@ async function requireAuth(req, res, next) {
   });
 
   req.user = user;
-  // Best-effort: ensure Stripe/OpenMeter identifiers exist for this workspace.
-  // Never block auth if provisioning fails.
-  try {
-    await provisionBillingForWorkspace({ store, stripeBilling, workspace, user });
-  } catch (e) {
-      logger.warn({ err: String(e?.message || e), requestId: req.requestId }, "[billing.provision] failed");
-      captureException(e, { requestId: req.requestId, area: "billing.provision" });
-  }
-
   req.workspace = await store.getWorkspace(workspace.id);
   req.sessionToken = token;
   return next();
@@ -1379,9 +1357,6 @@ app.post("/api/kb/search", requireAuth, async (req, res) => {
   return res.json({ results: results.slice(0, limit) });
 });
 
-// Billing API routes (Trial credits + Stripe + OpenMeter)
-app.use("/api/billing", requireAuth, createBillingRouter({ store: USE_DB ? store : null, stripeBilling }));
-
 // CRM API routes (Contacts / Leads)
 app.use("/api/crm", requireAuth, createCrmRouter({ store: USE_DB ? store : null, USE_DB }));
 
@@ -1406,11 +1381,6 @@ async function doInboundStart({ roomName, to, from, twilioCallSid = "" }) {
   }
   const ws = await store.getWorkspace(phoneRow.workspaceId);
   if (!ws) return { status: 404, error: "Workspace not found" };
-  try {
-    assertCanUsePstn(ws, getBillingConfig());
-  } catch (e) {
-    return { status: Number(e?.status || 402), error: e?.message || "Billing gating" };
-  }
 
   const agentId = phoneRow.inboundAgentId;
   const callId = `call_${nanoid(12)}`;
@@ -1844,14 +1814,6 @@ app.post("/api/internal/calls/:id/end", requireAgentSecret, async (req, res) => 
 
   // Hang up the phone leg so the carrier actually disconnects (agent said goodbye / end_call tool)
   await disconnectSipParticipantForCall(updated);
-
-  // Billing finalization (trial debit / OpenMeter event). Best-effort.
-  try {
-    await finalizeBillingForCall({ store, call: updated });
-  } catch (e) {
-    logger.warn({ requestId: req.requestId, err: String(e?.message || e) }, "[internal.calls.end] billing finalize failed");
-    sendAlert("billing_finalize_failed", { requestId: req.requestId, error: String(e?.message || e) });
-  }
 
   // Metrics: telephony end
   try {
@@ -2526,7 +2488,6 @@ app.get("/api/agents", requireAuth, async (req, res) => {
 });
 
 app.post("/api/agents", requireAuth, async (req, res) => {
-  const cfg = getBillingConfig();
   const schema = z.object({
     name: z.string().min(1).max(60),
     promptDraft: z.string().max(PROMPT_MAX).optional(),
@@ -2551,7 +2512,7 @@ app.post("/api/agents", requireAuth, async (req, res) => {
     const agent = await store.createAgent({
       ...parsed.data,
       workspaceId: req.workspace.id,
-      llmModel: parsed.data.llmModel ?? cfg.defaultLlmModel,
+      llmModel: parsed.data.llmModel ?? DEFAULT_LLM_MODEL,
       knowledgeFolderIds: parsed.data.knowledgeFolderIds ?? [],
     });
     return res.status(201).json({ agent });
@@ -2942,15 +2903,6 @@ app.post("/api/workspaces/:id/twilio/buy-number", requireAuth, async (req, res) 
   if (id !== req.workspace.id) return res.status(403).json({ error: "Forbidden" });
   let ws = req.workspace;
 
-  // Billing gating: phone number purchase always requires paid + payment method.
-  if (USE_DB) {
-    try {
-      assertCanBuyNumber(ws, getBillingConfig());
-    } catch (e) {
-      return res.status(Number(e?.status || 402)).json({ error: e?.message || "Billing gating" });
-    }
-  }
-
   const schema = z.object({
     phoneNumber: z.string().min(3).max(32),
     label: z.string().max(120).optional(),
@@ -3300,22 +3252,6 @@ app.post("/api/workspaces/:id/twilio/buy-number", requireAuth, async (req, res) 
         livekitOutboundTrunkId: effectiveOutboundTrunkId || outboundTrunkId || null,
       });
 
-      // Keep Stripe phone-number monthly quantity in sync (best-effort).
-      try {
-        const wsLatest = await store.getWorkspace(ws.id);
-        if (wsLatest?.stripeSubscriptionId && wsLatest?.stripePhoneNumbersItemId) {
-          const all = await store.listPhoneNumbers(ws.id);
-          await stripeBilling.updatePhoneNumbersQuantity({
-            subscriptionId: wsLatest.stripeSubscriptionId,
-            phoneNumbersItemId: wsLatest.stripePhoneNumbersItemId,
-            quantity: all.length,
-          });
-        }
-      } catch (e) {
-        logger.warn({ requestId: req.requestId, err: String(e?.message || e) }, "[twilio.buy-number] failed to sync stripe quantity");
-        sendAlert("stripe_quantity_sync_failed", { requestId: req.requestId, error: String(e?.message || e) });
-      }
-
       return res.status(201).json({
         phoneNumber,
         purchased,
@@ -3378,13 +3314,6 @@ app.post("/api/phone-numbers", requireAuth, async (req, res) => {
   const workspaceId = req.workspace.id;
 
   if (USE_DB) {
-    // Billing gating: phone number creation requires paid + payment method.
-    try {
-      assertCanBuyNumber(req.workspace, getBillingConfig());
-    } catch (e) {
-      return res.status(Number(e?.status || 402)).json({ error: e?.message || "Billing gating" });
-    }
-
     try {
       let e164 = String(parsed.data.e164).trim();
       if (!e164.startsWith("+")) e164 = `+${e164}`;
@@ -4385,15 +4314,6 @@ app.post("/api/agents/:id/start", requireAuth, async (req, res) => {
     return res.status(400).json({ error: "Validation failed", details: startParsed.error.flatten() });
   }
 
-  // Trial gating (WEB only)
-  if (USE_DB) {
-    try {
-      assertCanStartWebCall(req.workspace, getBillingConfig());
-    } catch (e) {
-      return res.status(Number(e?.status || 402)).json({ error: e?.message || "Billing gating" });
-    }
-  }
-
   const agent = USE_DB ? await store.getAgent(req.workspace.id, id) : readAgents().find((a) => a.id === id);
   if (!agent) return res.status(404).json({ error: "Agent not found" });
   const promptDraft = agent.promptDraft ?? agent.prompt ?? "";
@@ -4447,7 +4367,7 @@ app.post("/api/agents/:id/start", requireAuth, async (req, res) => {
   );
 
   const backchannelEnabled = Boolean(agent.backchannelEnabled);
-  const llmModel = String(agent.llmModel || "").trim() || getBillingConfig().defaultLlmModel;
+  const llmModel = String(agent.llmModel || "").trim() || DEFAULT_LLM_MODEL;
   const maxCallSeconds = Number(agent.maxCallSeconds || 0);
 
   // IMPORTANT:
@@ -5688,14 +5608,6 @@ app.post("/api/calls/:id/end", requireAuth, async (req, res) => {
       } catch (e) {
         logger.warn({ requestId: req.requestId, err: String(e?.message || e) }, "[calls.end] webhook send failed");
       }
-    }
-
-    // Billing finalization (trial debit / OpenMeter event). Best-effort.
-    try {
-      await finalizeBillingForCall({ store, call: updated });
-    } catch (e) {
-      logger.warn({ requestId: req.requestId, err: String(e?.message || e) }, "[calls.end] billing finalize failed");
-      sendAlert("billing_finalize_failed", { requestId: req.requestId, error: String(e?.message || e) });
     }
 
     // Auto-evaluate in the background if enabled on the agent.
