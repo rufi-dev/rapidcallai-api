@@ -1674,9 +1674,20 @@ app.post(
 
     const promptDraft = agent.promptDraft ?? "";
     const promptPublished = agent.promptPublished ?? "";
-    const promptUsed = (promptDraft && String(promptDraft).trim()) ? promptDraft : promptPublished;
+    let promptUsed = (promptDraft && String(promptDraft).trim()) ? promptDraft : promptPublished;
     if (!promptUsed || String(promptUsed).trim().length === 0) {
       return res.status(400).json({ error: "Agent prompt is empty" });
+    }
+    // Substitute {{Forename}}, {{Job Titles}}, etc. from outbound job metadata (rapidcall_llm_dynamic_variables).
+    const job = await store.getOutboundJobByRoomName(call.workspaceId, roomName);
+    if (job && job.metadata && typeof job.metadata === "object") {
+      const defaults = agent.defaultDynamicVariables && typeof agent.defaultDynamicVariables === "object" ? agent.defaultDynamicVariables : {};
+      const overrides = job.metadata;
+      const vars = { ...defaults };
+      for (const [k, v] of Object.entries(overrides)) {
+        if (typeof v === "string" || (v != null && typeof v === "number") || typeof v === "boolean") vars[k] = String(v);
+      }
+      promptUsed = substituteDynamicVariables(promptUsed, vars);
     }
 
     const enabledTools = Array.isArray(agent.enabledTools) ? agent.enabledTools : ["end_call"];
