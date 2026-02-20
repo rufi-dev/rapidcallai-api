@@ -1634,6 +1634,38 @@ app.post(
     const enabledTools = Array.isArray(agent.enabledTools) ? agent.enabledTools : ["end_call"];
     const toolConfigs = agent.toolConfigs && typeof agent.toolConfigs === "object" ? agent.toolConfigs : {};
 
+    // Update LiveKit room metadata with agent.id and toolConfigs so the agent (and tools) see config even if response is missed.
+    const outboundMetadata = {
+      call: { id: call.id, to: call.to || "unknown", direction: "outbound" },
+      agent: {
+        id: agent.id,
+        workspaceId: call.workspaceId,
+        name: agent.name,
+        prompt: promptUsed,
+        voice: agent.voice ?? {},
+        enabledTools,
+        toolConfigs,
+        backchannelEnabled: Boolean(agent.backchannelEnabled),
+        backgroundAudio: agent.backgroundAudio ?? {},
+        llmModel: String(agent.llmModel || "").trim(),
+        maxCallSeconds: Number(agent.maxCallSeconds || 0),
+        knowledgeFolderIds: Array.isArray(agent.knowledgeFolderIds) ? agent.knowledgeFolderIds : [],
+        defaultDynamicVariables: agent.defaultDynamicVariables ?? {},
+        callSettings: agent.callSettings ?? {},
+        fallbackVoice: agent.fallbackVoice ?? null,
+        postCallDataExtraction: Array.isArray(agent.postCallDataExtraction) ? agent.postCallDataExtraction : [],
+        postCallExtractionModel: agent.postCallExtractionModel ?? "",
+      },
+      welcome: agent.welcome ?? {},
+    };
+    try {
+      const rs = roomService();
+      await rs.updateRoomMetadata(roomName, JSON.stringify(outboundMetadata));
+      console.log("[internal.telephony.outbound.start] room metadata updated (agent.id, toolConfigs)");
+    } catch (metaErr) {
+      logger.warn({ err: String(metaErr?.message || metaErr), roomName }, "[internal.telephony.outbound.start] failed to update room metadata");
+    }
+
     console.log("[internal.telephony.outbound.start] returning config for outbound call", { callId: call.id, roomName, agentId: agent.id });
 
     return res.status(200).json({
