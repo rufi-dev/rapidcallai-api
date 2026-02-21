@@ -1287,8 +1287,21 @@ app.get("/api/billing/checkout-url", requireAuth, async (req, res) => {
   };
   if (ws?.stripeCustomerId) sessionConfig.customer = ws.stripeCustomerId;
   else if (req.user?.email) sessionConfig.customer_email = req.user.email;
-  const session = await stripe.checkout.sessions.create(sessionConfig);
-  return res.json({ url: session.url });
+
+  try {
+    const session = await stripe.checkout.sessions.create(sessionConfig);
+    return res.json({ url: session.url });
+  } catch (err) {
+    const isNoCustomer = err?.code === "resource_missing" || /no such customer/i.test(String(err?.message || ""));
+    if (isNoCustomer && ws?.stripeCustomerId) {
+      await store.updateWorkspace(ws.id, { stripeCustomerId: null, stripeSubscriptionId: null });
+      delete sessionConfig.customer;
+      if (req.user?.email) sessionConfig.customer_email = req.user.email;
+      const session = await stripe.checkout.sessions.create(sessionConfig);
+      return res.json({ url: session.url });
+    }
+    throw err;
+  }
 });
 
 // --- API Keys (workspace-scoped; auth via session or API key) ---
