@@ -1219,7 +1219,22 @@ app.get("/api/billing/summary", requireAuth, async (req, res) => {
   if (!USE_DB) return res.status(400).json({ error: "Billing requires Postgres mode" });
   const ws = await store.getWorkspace(req.workspace.id);
   if (!ws) return res.status(404).json({ error: "Workspace not found" });
-  const plan = ws.billingPlan || null;
+  let plan = ws.billingPlan || null;
+  // If we have a Stripe subscription but no stored plan (e.g. webhook order), derive from Stripe.
+  if (!plan && ws.stripeSubscriptionId) {
+    try {
+      const stripeWebhooks = require("./stripe/webhooks");
+      const stripe = stripeWebhooks.getStripe();
+      if (stripe) {
+        const sub = await stripe.subscriptions.retrieve(ws.stripeSubscriptionId, { expand: ["items.data.price"] });
+        const priceId = sub?.items?.data?.[0]?.price?.id;
+        plan = billingConfig.planFromStripePriceId(priceId) || null;
+        if (plan) await store.updateWorkspace(ws.id, { billingPlan: plan });
+      }
+    } catch (e) {
+      // keep plan null
+    }
+  }
   const platformFees = { starter: 79, pro: 249, scale: 699 };
   const platformFee = plan ? platformFees[plan] ?? null : null;
   const now = new Date();

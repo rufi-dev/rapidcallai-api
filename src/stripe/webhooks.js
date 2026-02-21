@@ -114,7 +114,7 @@ async function endMetronomeContract(workspace, endingBeforeIso) {
 }
 
 /**
- * Handle checkout.session.completed: link workspace to Stripe customer and subscription.
+ * Handle checkout.session.completed: link workspace to Stripe customer and subscription; set plan from subscription price.
  */
 async function handleCheckoutSessionCompleted(session) {
   const workspaceId = session.client_reference_id || session.metadata?.workspace_id;
@@ -126,6 +126,20 @@ async function handleCheckoutSessionCompleted(session) {
   if (session.subscription && !workspace.stripeSubscriptionId) updates.stripeSubscriptionId = session.subscription;
   if (Object.keys(updates).length > 0) {
     await store.updateWorkspace(workspaceId, updates);
+  }
+  // Set billing_plan from subscription price so "Current plan" is not None after redirect.
+  if (session.subscription && !workspace.billingPlan) {
+    try {
+      const stripe = getStripe();
+      if (stripe) {
+        const sub = await stripe.subscriptions.retrieve(session.subscription, { expand: ["items.data.price"] });
+        const priceId = sub?.items?.data?.[0]?.price?.id;
+        const plan = planFromStripePriceId(priceId);
+        if (plan) await store.updateWorkspace(workspaceId, { billingPlan: plan });
+      }
+    } catch (e) {
+      // subscription.created will set plan when it runs
+    }
   }
 }
 
