@@ -1257,12 +1257,16 @@ app.get("/api/billing/checkout-url", requireAuth, async (req, res) => {
   const stripe = stripeWebhooks.getStripe();
   if (!stripe) return res.status(503).json({ error: "Stripe not configured." });
   const ws = await store.getWorkspace(req.workspace.id);
-  const baseUrl = (req.get("x-forwarded-proto") === "https" ? "https" : req.protocol) + "://" + (req.get("x-forwarded-host") || req.get("host") || "localhost");
+  // Redirect after Stripe Checkout must go to the dashboard (frontend), not the API host.
+  const clientOrigin = (process.env.CLIENT_ORIGIN || "").split(",").map((o) => o.trim()).filter(Boolean)[0] || null;
+  const appUrl = clientOrigin ? clientOrigin.replace(/\/$/, "") : null;
+  const fallbackUrl = (req.get("x-forwarded-proto") === "https" ? "https" : req.protocol) + "://" + (req.get("x-forwarded-host") || req.get("host") || "localhost");
+  const baseUrl = appUrl || fallbackUrl;
   const sessionConfig = {
     mode: "subscription",
     line_items: [{ price: priceId, quantity: 1 }],
-    success_url: `${baseUrl}/billing?success=1`,
-    cancel_url: `${baseUrl}/billing?cancel=1`,
+    success_url: `${baseUrl}/app/billing?success=1`,
+    cancel_url: `${baseUrl}/app/billing?cancel=1`,
     client_reference_id: req.workspace.id,
     metadata: { workspace_id: req.workspace.id },
   };
