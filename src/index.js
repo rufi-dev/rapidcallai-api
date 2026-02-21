@@ -450,6 +450,25 @@ app.post("/api/livekit/webhook", express.raw({ type: "application/webhook+json" 
   }
 });
 
+// Stripe webhook (raw body required for signature verification). Must be before express.json.
+app.post(
+  "/api/stripe/webhook",
+  express.raw({ type: "application/json" }),
+  async (req, res) => {
+    const stripeWebhooks = require("./stripe/webhooks");
+    const rawBody = Buffer.isBuffer(req.body) ? req.body : (req.body && typeof req.body === "string" ? Buffer.from(req.body, "utf8") : null);
+    const sig = req.get("stripe-signature") || "";
+    try {
+      await stripeWebhooks.handleWebhook(rawBody, sig);
+      return res.json({ received: true });
+    } catch (e) {
+      if (e.type === "StripeSignatureVerificationError") return res.status(400).send("Invalid signature");
+      logger.warn({ err: String(e?.message || e), requestId: req.requestId }, "[stripe.webhook] error");
+      return res.status(500).json({ error: "Webhook handler failed" });
+    }
+  }
+);
+
 const USE_DB = Boolean(process.env.DATABASE_URL);
 const DEFAULT_WORKSPACE_ID = "rapidcallai";
 
@@ -1194,6 +1213,60 @@ app.get("/api/me", requireAuth, async (req, res) => {
   return res.json({ user: req.user, workspace: req.workspace });
 });
 
+// --- Billing (Stripe + Metronome) ---
+const billingConfig = require("./billing/config");
+app.get("/api/billing/summary", requireAuth, async (req, res) => {
+  if (!USE_DB) return res.status(400).json({ error: "Billing requires Postgres mode" });
+  const ws = await store.getWorkspace(req.workspace.id);
+  if (!ws) return res.status(404).json({ error: "Workspace not found" });
+  const plan = ws.billingPlan || null;
+  const platformFees = { starter: 79, pro: 249, scale: 699 };
+  const platformFee = plan ? platformFees[plan] ?? null : null;
+  const now = new Date();
+  const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1).getTime();
+  const { rows } = await getPool().query(
+    `SELECT COALESCE(SUM((metrics->>'computedTotalCost')::double precision), 0) AS mtd
+     FROM calls WHERE workspace_id=$1 AND ended_at IS NOT NULL AND metrics IS NOT NULL AND (metrics->>'computedTotalCost') IS NOT NULL
+     AND ended_at >= $2`,
+    [req.workspace.id, startOfMonth]
+  );
+  const monthToDateTotal = rows[0]?.mtd != null ? Number(rows[0].mtd) : 0;
+  return res.json({
+    plan,
+    platformFee,
+    monthToDateTotal: Math.round(monthToDateTotal * 100) / 100,
+    nextInvoiceDate: null,
+    stripeCustomerId: ws.stripeCustomerId ?? null,
+    hasActiveSubscription: Boolean(ws.stripeSubscriptionId),
+  });
+});
+
+app.get("/api/billing/checkout-url", requireAuth, async (req, res) => {
+  if (!USE_DB) return res.status(400).json({ error: "Billing requires Postgres mode" });
+  const plan = (req.query.plan || "").toLowerCase();
+  if (!billingConfig.PLANS.includes(plan)) return res.status(400).json({ error: "Invalid plan. Use starter, pro, or scale." });
+  const priceIds = billingConfig.getStripePriceIds();
+  const priceId = priceIds[plan];
+  if (!priceId) return res.status(503).json({ error: "Stripe price not configured for this plan." });
+  const stripeWebhooks = require("./stripe/webhooks");
+  const stripe = stripeWebhooks.getStripe();
+  if (!stripe) return res.status(503).json({ error: "Stripe not configured." });
+  const ws = await store.getWorkspace(req.workspace.id);
+  const baseUrl = (req.get("x-forwarded-proto") === "https" ? "https" : req.protocol) + "://" + (req.get("x-forwarded-host") || req.get("host") || "localhost");
+  const sessionConfig = {
+    mode: "subscription",
+    line_items: [{ price: priceId, quantity: 1 }],
+    success_url: `${baseUrl}/billing?success=1`,
+    cancel_url: `${baseUrl}/billing?cancel=1`,
+    client_reference_id: req.workspace.id,
+    metadata: { workspace_id: req.workspace.id },
+  };
+  if (ws?.stripeCustomerId) sessionConfig.customer = ws.stripeCustomerId;
+  else if (req.user?.email) sessionConfig.customer_email = req.user.email;
+  const session = await stripe.checkout.sessions.create(sessionConfig);
+  return res.json({ url: session.url });
+});
+
 // --- API Keys (workspace-scoped; auth via session or API key) ---
 app.get("/api/api-keys", requireAuth, async (req, res) => {
   if (!USE_DB) return res.status(400).json({ error: "API keys require Postgres mode" });
@@ -1810,7 +1883,25 @@ app.post("/api/internal/calls/:id/end", requireAgentSecret, async (req, res) => 
     }
   }
 
-  const updated = await store.updateCall(id, patch);
+  let updated = await store.updateCall(id, patch);
+
+  // Billing: emit usage to Metronome and attach cost to call
+  if (updated?.workspaceId) {
+    try {
+      const workspace = await store.getWorkspace(updated.workspaceId);
+      const metronomeClient = require("./metronome/client");
+      const billingUsage = require("./billing/usage");
+      const costResult = await billingUsage.emitCallUsageAndComputeCost(updated, workspace, metronomeClient);
+      if (costResult) {
+        const withCost = await store.updateCall(id, {
+          metrics: { ...(updated.metrics || {}), costBreakdown: costResult.costBreakdown, computedTotalCost: costResult.computedTotalCost },
+        });
+        if (withCost) updated = withCost;
+      }
+    } catch (eBilling) {
+      logger.warn({ requestId: req.requestId, err: String(eBilling?.message || eBilling), callId: id }, "[internal.calls.end] billing usage/cost failed");
+    }
+  }
 
   // Hang up the phone leg so the carrier actually disconnects (agent said goodbye / end_call tool)
   await disconnectSipParticipantForCall(updated);
@@ -5594,7 +5685,25 @@ app.post("/api/calls/:id/end", requireAuth, async (req, res) => {
       updatePayload.postCallExtractionResults = extractionResult.postCallExtractionResults;
     }
 
-    const updated = await store.updateCall(id, updatePayload);
+    let updated = await store.updateCall(id, updatePayload);
+
+    // Billing: emit usage to Metronome and attach cost to call for instant UI
+    if (USE_DB && updated?.workspaceId) {
+      try {
+        const workspace = await store.getWorkspace(updated.workspaceId);
+        const metronomeClient = require("./metronome/client");
+        const billingUsage = require("./billing/usage");
+        const costResult = await billingUsage.emitCallUsageAndComputeCost(updated, workspace, metronomeClient);
+        if (costResult) {
+          const withCost = await store.updateCall(id, {
+            metrics: { ...(updated.metrics || {}), costBreakdown: costResult.costBreakdown, computedTotalCost: costResult.computedTotalCost },
+          });
+          if (withCost) updated = withCost;
+        }
+      } catch (eBilling) {
+        logger.warn({ requestId: req.requestId, err: String(eBilling?.message || eBilling), callId: id }, "[calls.end] billing usage/cost failed");
+      }
+    }
 
     if (updated.agentId && updated.workspaceId) {
       try {

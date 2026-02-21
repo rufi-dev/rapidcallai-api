@@ -93,6 +93,9 @@ async function initSchema() {
   await p.query(`ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS twilio_sip_cred_password TEXT NULL;`);
   await p.query(`ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS livekit_outbound_trunk_id TEXT NULL;`);
   await p.query(`ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS livekit_inbound_trunk_id TEXT NULL;`);
+  await p.query(`ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS metronome_customer_id TEXT NULL;`);
+  await p.query(`ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS metronome_contract_id TEXT NULL;`);
+  await p.query(`ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS billing_plan TEXT NULL;`);
 
   await p.query(`
     CREATE TABLE IF NOT EXISTS agents (
@@ -346,6 +349,7 @@ async function initSchema() {
   await p.query(`ALTER TABLE phone_numbers ADD COLUMN IF NOT EXISTS livekit_sip_password TEXT NULL;`);
   await p.query(`ALTER TABLE phone_numbers ADD COLUMN IF NOT EXISTS sip_termination_uri TEXT NULL;`);
   await p.query(`ALTER TABLE phone_numbers ADD COLUMN IF NOT EXISTS sip_outbound_transport TEXT NULL;`);
+  await p.query(`ALTER TABLE phone_numbers ADD COLUMN IF NOT EXISTS source TEXT NULL;`);
 
   await p.query(`CREATE INDEX IF NOT EXISTS phone_numbers_workspace_idx ON phone_numbers(workspace_id, created_at DESC);`);
   await p.query(`CREATE UNIQUE INDEX IF NOT EXISTS phone_numbers_workspace_e164_uniq ON phone_numbers(workspace_id, e164);`);

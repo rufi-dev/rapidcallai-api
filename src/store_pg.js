@@ -141,6 +141,9 @@ function rowToWorkspace(r) {
     twilioSipCredPassword: r.twilio_sip_cred_password ?? null,
     livekitOutboundTrunkId: r.livekit_outbound_trunk_id ?? null,
     livekitInboundTrunkId: r.livekit_inbound_trunk_id ?? null,
+    metronomeCustomerId: r.metronome_customer_id ?? null,
+    metronomeContractId: r.metronome_contract_id ?? null,
+    billingPlan: r.billing_plan ?? null,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   };
@@ -165,6 +168,7 @@ function rowToPhoneNumber(r) {
     outboundAgentId: r.outbound_agent_id ?? null,
     allowedInboundCountries: r.allowed_inbound_countries ?? ["all"],
     allowedOutboundCountries: r.allowed_outbound_countries ?? ["all"],
+    source: r.source ?? "purchased",
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   };
@@ -179,6 +183,13 @@ async function listWorkspaces() {
 async function getWorkspace(id) {
   const p = getPool();
   const { rows } = await p.query(`SELECT * FROM workspaces WHERE id=$1`, [id]);
+  return rows[0] ? rowToWorkspace(rows[0]) : null;
+}
+
+async function getWorkspaceByStripeCustomerId(stripeCustomerId) {
+  if (!stripeCustomerId) return null;
+  const p = getPool();
+  const { rows } = await p.query(`SELECT * FROM workspaces WHERE stripe_customer_id=$1`, [stripeCustomerId]);
   return rows[0] ? rowToWorkspace(rows[0]) : null;
 }
 
@@ -207,10 +218,13 @@ async function createWorkspace({ id, name, userId = null }) {
       has_payment_method,
       is_paid,
       telephony_enabled,
+      metronome_customer_id,
+      metronome_contract_id,
+      billing_plan,
       created_at,
       updated_at
     )
-    VALUES ($1,$2,$3,NULL,true,$4,$5,NULL,NULL,NULL,NULL,NULL,NULL,false,false,false,$6,$7)
+    VALUES ($1,$2,$3,NULL,true,$4,$5,NULL,NULL,NULL,NULL,NULL,NULL,false,false,false,NULL,NULL,NULL,$6,$7)
     RETURNING *
   `,
     [wsId, name, userId, trialCreditUsd, now, now, now]
@@ -247,6 +261,9 @@ async function updateWorkspace(id, patch) {
         twilio_sip_cred_password=COALESCE($21,twilio_sip_cred_password),
         livekit_outbound_trunk_id=COALESCE($22,livekit_outbound_trunk_id),
         livekit_inbound_trunk_id=COALESCE($23,livekit_inbound_trunk_id),
+        metronome_customer_id=COALESCE($24,metronome_customer_id),
+        metronome_contract_id=COALESCE($25,metronome_contract_id),
+        billing_plan=COALESCE($26,billing_plan),
         updated_at=$17
     WHERE id=$1
     RETURNING *
@@ -275,6 +292,9 @@ async function updateWorkspace(id, patch) {
       next.twilioSipCredPassword ?? null,
       next.livekitOutboundTrunkId ?? null,
       next.livekitInboundTrunkId ?? null,
+      next.metronomeCustomerId ?? null,
+      next.metronomeContractId ?? null,
+      next.billingPlan ?? null,
     ]
   );
   return rows[0] ? rowToWorkspace(rows[0]) : null;
@@ -491,15 +511,16 @@ async function createPhoneNumber(input) {
   const allowedIn = Array.isArray(input.allowedInboundCountries) ? input.allowedInboundCountries : ["all"];
   const allowedOut = Array.isArray(input.allowedOutboundCountries) ? input.allowedOutboundCountries : ["all"];
 
+  const source = input.source === "connected" ? "connected" : "purchased";
   const { rows } = await p.query(
     `
     INSERT INTO phone_numbers
       (id, workspace_id, e164, label, provider, status, twilio_number_sid, livekit_inbound_trunk_id, livekit_outbound_trunk_id,
        livekit_sip_username, livekit_sip_password, sip_termination_uri, sip_outbound_transport,
        inbound_agent_id, outbound_agent_id,
-       allowed_inbound_countries, allowed_outbound_countries, created_at, updated_at)
+       allowed_inbound_countries, allowed_outbound_countries, source, created_at, updated_at)
     VALUES
-      ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+      ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
     RETURNING *
   `,
     [
@@ -520,6 +541,7 @@ async function createPhoneNumber(input) {
       input.outboundAgentId ?? null,
       JSON.stringify(allowedIn),
       JSON.stringify(allowedOut),
+      source,
       now,
       now,
     ]
@@ -554,7 +576,8 @@ async function updatePhoneNumber(id, patch) {
         outbound_agent_id=$12,
         allowed_inbound_countries=$13,
         allowed_outbound_countries=$14,
-        updated_at=$15
+        source=COALESCE($15,source),
+        updated_at=$16
     WHERE id=$1
     RETURNING *
   `,
@@ -573,6 +596,7 @@ async function updatePhoneNumber(id, patch) {
       next.outboundAgentId ?? null,
       JSON.stringify(allowedIn),
       JSON.stringify(allowedOut),
+      next.source ?? null,
       next.updatedAt,
     ]
   );
@@ -1543,6 +1567,7 @@ module.exports = {
   // Workspaces + phone numbers
   listWorkspaces,
   getWorkspace,
+  getWorkspaceByStripeCustomerId,
   createWorkspace,
   updateWorkspace,
   debitTrialCreditUsd,
