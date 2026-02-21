@@ -1256,6 +1256,29 @@ app.get("/api/billing/summary", requireAuth, async (req, res) => {
   });
 });
 
+app.get("/api/billing/recent-usage", requireAuth, async (req, res) => {
+  if (!USE_DB) return res.status(400).json({ error: "Billing requires Postgres mode" });
+  const now = new Date();
+  const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1).getTime();
+  const { rows } = await getPool().query(
+    `SELECT id, started_at, duration_sec, metrics->>'computedTotalCost' AS cost, metrics->'costBreakdown' AS cost_breakdown
+     FROM calls
+     WHERE workspace_id=$1 AND ended_at IS NOT NULL AND metrics IS NOT NULL AND (metrics->>'computedTotalCost') IS NOT NULL
+     AND ended_at >= $2
+     ORDER BY started_at DESC
+     LIMIT 100`,
+    [req.workspace.id, startOfMonth]
+  );
+  const calls = rows.map((r) => ({
+    id: r.id,
+    startedAt: r.started_at != null ? (r.started_at instanceof Date ? r.started_at.getTime() : Number(new Date(r.started_at).getTime())) : 0,
+    durationSec: r.duration_sec != null ? Number(r.duration_sec) : null,
+    cost: r.cost != null ? Math.round(Number(r.cost) * 10000) / 10000 : null,
+    costBreakdown: r.cost_breakdown && typeof r.cost_breakdown === "object" ? r.cost_breakdown : null,
+  }));
+  return res.json({ calls });
+});
+
 app.get("/api/billing/checkout-url", requireAuth, async (req, res) => {
   if (!USE_DB) return res.status(400).json({ error: "Billing requires Postgres mode" });
   const plan = (req.query.plan || "").toLowerCase();
