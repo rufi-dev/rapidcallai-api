@@ -1248,6 +1248,11 @@ app.get("/api/billing/checkout-url", requireAuth, async (req, res) => {
   const priceIds = billingConfig.getStripePriceIds();
   const priceId = priceIds[plan];
   if (!priceId) return res.status(503).json({ error: "Stripe price not configured for this plan." });
+  if (!String(priceId).startsWith("price_")) {
+    return res.status(400).json({
+      error: "STRIPE_PRICE_* must be a Stripe Price ID (e.g. price_1ABC...), not the dollar amount. Create a Product and Price in Stripe Dashboard, then set the Price ID in .env.",
+    });
+  }
   const stripeWebhooks = require("./stripe/webhooks");
   const stripe = stripeWebhooks.getStripe();
   if (!stripe) return res.status(503).json({ error: "Stripe not configured." });
